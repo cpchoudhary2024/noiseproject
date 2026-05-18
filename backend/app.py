@@ -2320,10 +2320,10 @@ def health():
     return jsonify({'status': 'ok'})
 
 if __name__ == '__main__':
-    # Default to IPv4 localhost for maximum compatibility.
-    # Some environments/browsers try 127.0.0.1 first and won't fall back to ::1.
-    host = os.environ.get('FLASK_HOST', '127.0.0.1')
-    port = int(os.environ.get('FLASK_PORT', '5001'))
+    # PORT is set by Render/Railway; FLASK_PORT is the local override.
+    # Default host to 0.0.0.0 so cloud platforms can reach the server.
+    host = os.environ.get('FLASK_HOST', '0.0.0.0')
+    port = int(os.environ.get('PORT') or os.environ.get('FLASK_PORT', '5001'))
 
     # Enforce retention at startup as well (covers files generated in prior runs).
     _run_retention_cleanup()
