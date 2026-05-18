@@ -187,6 +187,42 @@ async function _safeJson(response) {
     }
 }
 
+// Wake up the server before uploading. Render free tier sleeps after 15 min
+// and cold-start can take 30-60s — we ping a lightweight endpoint until it
+// responds 2xx, polling every 3 s for up to 90 s.
+function _wakeServer(onProgress) {
+    return new Promise((resolve, reject) => {
+        const startedAt = Date.now();
+        const MAX_WAIT_MS = 90_000;
+
+        function ping() {
+            const elapsed = Math.round((Date.now() - startedAt) / 1000);
+            // First check: silent (no message) — if server is awake, no UI delay
+            if (elapsed > 0) {
+                onProgress(`Waking up server… ${elapsed}s (this only happens after a long idle period)`);
+            }
+            fetch('/api/ping', { method: 'GET', cache: 'no-store' })
+                .then(r => {
+                    if (r.ok) {
+                        resolve();
+                    } else if (Date.now() - startedAt > MAX_WAIT_MS) {
+                        reject(new Error('Server did not wake up after 90 seconds. Please try again in a minute.'));
+                    } else {
+                        setTimeout(ping, 3000);
+                    }
+                })
+                .catch(() => {
+                    if (Date.now() - startedAt > MAX_WAIT_MS) {
+                        reject(new Error('Server did not wake up after 90 seconds. Please try again in a minute.'));
+                    } else {
+                        setTimeout(ping, 3000);
+                    }
+                });
+        }
+        ping();
+    });
+}
+
 function _xhrUpload(url, formData, onProgress, attempt = 1) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
@@ -195,17 +231,31 @@ function _xhrUpload(url, formData, onProgress, attempt = 1) {
             if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100));
         });
         xhr.addEventListener('load', () => {
-            // 502 = server waking from sleep or briefly crashed — retry once after 4 s
-            if (xhr.status === 502 && attempt === 1) {
-                onProgress(-1); // signal caller to show retry message
-                setTimeout(() => {
-                    _xhrUpload(url, formData, onProgress, 2).then(resolve).catch(reject);
-                }, 4000);
+            // 502/503/504 = server still waking or briefly unavailable — wait
+            // until it's healthy then retry the upload from scratch.
+            if ([502, 503, 504].includes(xhr.status) && attempt <= 2) {
+                onProgress(-1);
+                _wakeServer(msg => onProgress(-2, msg))
+                    .then(() => _xhrUpload(url, formData, onProgress, attempt + 1))
+                    .then(resolve)
+                    .catch(reject);
             } else {
                 resolve(xhr);
             }
         });
-        xhr.addEventListener('error', () => reject(new Error('Network error during upload.')));
+        xhr.addEventListener('error', () => {
+            // Network-level failure usually means server is asleep. Wake it
+            // and retry once before giving up.
+            if (attempt <= 2) {
+                onProgress(-1);
+                _wakeServer(msg => onProgress(-2, msg))
+                    .then(() => _xhrUpload(url, formData, onProgress, attempt + 1))
+                    .then(resolve)
+                    .catch(reject);
+            } else {
+                reject(new Error('Network error during upload — the server may be down. Please try again in a minute.'));
+            }
+        });
         xhr.send(formData);
     });
 }
@@ -229,8 +279,9 @@ function _doSingleUpload(file) {
     const formData = new FormData();
     formData.append('file', file);
 
-    _xhrUpload('/api/upload', formData, pct => {
-        if (pct === -1) setStatus('processing', 'Server waking up — retrying…');
+    _xhrUpload('/api/upload', formData, (pct, msg) => {
+        if (pct === -2) setStatus('processing', msg);
+        else if (pct === -1) setStatus('processing', 'Server is sleeping — waking it up…');
         else if (pct < 100) setStatus('processing', `Uploading… ${pct}%`);
         else setStatus('processing', 'Processing file on server…');
     })
@@ -266,8 +317,9 @@ function _doMultiUpload(files) {
     const formData = new FormData();
     files.forEach(f => formData.append('files', f));
 
-    _xhrUpload('/api/upload-multi', formData, pct => {
-        if (pct === -1) setStatus('processing', 'Server waking up — retrying…');
+    _xhrUpload('/api/upload-multi', formData, (pct, msg) => {
+        if (pct === -2) setStatus('processing', msg);
+        else if (pct === -1) setStatus('processing', 'Server is sleeping — waking it up…');
         else if (pct < 100) setStatus('processing', `Uploading ${files.length} file(s)… ${pct}%`);
         else setStatus('processing', 'Merging & processing on server…');
     })
@@ -330,8 +382,9 @@ async function handleAddMoreFiles(e) {
     }
 
     try {
-        const xhr = await _xhrUpload('/api/upload-multi', formData, pct => {
-            if (pct === -1) setStatus('processing', 'Server waking up — retrying…');
+        const xhr = await _xhrUpload('/api/upload-multi', formData, (pct, msg) => {
+            if (pct === -2) setStatus('processing', msg);
+            else if (pct === -1) setStatus('processing', 'Server is sleeping — waking it up…');
             else if (pct < 100) setStatus('processing', `Uploading ${newFiles.length} file(s)… ${pct}%`);
             else setStatus('processing', 'Merging & processing on server…');
         });

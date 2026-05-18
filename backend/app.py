@@ -579,6 +579,13 @@ def read_csv_file(filepath: str) -> pd.DataFrame:
 def index():
     return render_template('index.html')
 
+@app.route('/api/ping', methods=['GET'])
+def ping():
+    """Lightweight health-check used by the frontend to wake the server before
+    uploading a large file. Render free tier sleeps after 15 min of inactivity;
+    the frontend polls this endpoint until it returns 200 before uploading."""
+    return jsonify({'ok': True}), 200
+
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     try:
