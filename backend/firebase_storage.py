@@ -35,6 +35,7 @@ def init() -> bool:
         SUPABASE_KEY  – service_role secret key (not the anon key)
 
     Returns True on success, False if not configured or on error.
+    NOTE: Does NOT make any HTTP requests — safe to call at server startup.
     """
     global _client
 
@@ -48,8 +49,9 @@ def init() -> bool:
     try:
         from supabase import create_client
         _client = create_client(url, key)
-        # Ensure the bucket exists (creates it if it doesn't)
-        _ensure_bucket()
+        # Do NOT call _ensure_bucket() here — it makes an HTTP request
+        # which can block server startup and cause gunicorn health-check failures.
+        # Bucket is verified/created lazily on first upload attempt instead.
         logger.info('[Storage] Supabase Storage ready — bucket: %s', _bucket)
         return True
     except Exception as exc:
@@ -59,14 +61,24 @@ def init() -> bool:
 
 
 def _ensure_bucket():
-    """Create the storage bucket if it does not already exist."""
+    """Create the storage bucket if it does not already exist (lazy, called on first upload)."""
     try:
-        buckets = [b.name for b in _client.storage.list_buckets()]
-        if _bucket not in buckets:
+        buckets = _client.storage.list_buckets()
+        bucket_names = []
+        for b in buckets:
+            # supabase-py 1.x returns dicts; 2.x returns objects with .name
+            if isinstance(b, dict):
+                bucket_names.append(b.get('name', ''))
+            else:
+                bucket_names.append(getattr(b, 'name', ''))
+        if _bucket not in bucket_names:
             _client.storage.create_bucket(_bucket, options={'public': False})
             logger.info('[Storage] Created bucket: %s', _bucket)
     except Exception as exc:
         logger.warning('[Storage] Could not verify/create bucket: %s', exc)
+
+
+_bucket_checked = False   # ensure bucket is checked only once
 
 
 def is_available() -> bool:
@@ -98,21 +110,32 @@ def _remote_path(local_path: str, upload_folder: str, artifacts_dir: str) -> str
 
 def upload(local_path: str, upload_folder: str, artifacts_dir: str) -> bool:
     """Upload a local file to Supabase Storage. Returns True on success."""
+    global _bucket_checked
     if not is_available():
         return False
     remote = _remote_path(local_path, upload_folder, artifacts_dir)
     if not remote:
         logger.warning('[Storage] Cannot map remote path for: %s', local_path)
         return False
+
+    # Lazily verify/create the bucket on first upload
+    if not _bucket_checked:
+        _ensure_bucket()
+        _bucket_checked = True
+
     try:
         with open(local_path, 'rb') as f:
             data = f.read()
-        # upsert=True overwrites if the same filename was uploaded before
-        _client.storage.from_(_bucket).upload(
-            path=remote,
-            file=data,
-            file_options={'upsert': 'true'},
-        )
+        # Try supabase-py 2.x API first (file_options as dict with upsert bool),
+        # fall back to 1.x style (upsert as string) on error.
+        try:
+            _client.storage.from_(_bucket).upload(
+                path=remote,
+                file=data,
+                file_options={'upsert': 'true', 'content-type': 'application/octet-stream'},
+            )
+        except Exception:
+            _client.storage.from_(_bucket).upload(path=remote, file=data)
         logger.info('[Storage] Uploaded  %s  →  %s', os.path.basename(local_path), remote)
         return True
     except Exception as exc:
@@ -146,6 +169,7 @@ def get_download_url(local_path: str, upload_folder: str, artifacts_dir: str,
     """Return a time-limited signed URL for direct browser download (default 12 h).
 
     Returns None if Supabase is unavailable — caller falls back to send_file().
+    Handles both supabase-py 1.x (dict response) and 2.x (object response).
     """
     if not is_available():
         return None
@@ -154,8 +178,13 @@ def get_download_url(local_path: str, upload_folder: str, artifacts_dir: str,
         return None
     try:
         result = _client.storage.from_(_bucket).create_signed_url(remote, expiry_seconds)
-        url = result.get('signedURL') or result.get('signed_url')
-        return url
+        # supabase-py 1.x returns a dict: {'signedURL': '...'}
+        # supabase-py 2.x returns an object with .signed_url attribute
+        if isinstance(result, dict):
+            url = result.get('signedURL') or result.get('signed_url')
+        else:
+            url = getattr(result, 'signed_url', None) or getattr(result, 'signedURL', None)
+        return url or None
     except Exception as exc:
         logger.warning('[Storage] Signed URL failed (%s) — will stream locally.', exc)
         return None

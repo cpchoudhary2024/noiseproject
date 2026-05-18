@@ -23,6 +23,7 @@ from analysis.compliance_matrix import evaluate_compliance
 from analysis.acoustics import energetic_mean_db, compute_ldn_lden
 import io
 import logging
+import threading
 
 import retention
 import firebase_storage
@@ -84,13 +85,16 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 # Never cache static files — ensures browsers always load the latest JS/CSS
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
-# ── Firebase Storage ──────────────────────────────────────────────────────────
-# Initialise at startup; gracefully skipped if env vars are not set.
-firebase_storage.init()
+# ── Supabase Storage ─────────────────────────────────────────────────────────
+# Initialise in a background thread so slow Supabase connections never block
+# server startup (which would cause gunicorn health-check failures on Render).
+threading.Thread(target=firebase_storage.init, daemon=True).start()
 
 def _fb_upload(local_path: str):
-    """Mirror a local file to Firebase Storage (non-blocking best-effort)."""
-    firebase_storage.upload(local_path, UPLOAD_FOLDER, ARTIFACTS_DIR)
+    """Mirror a local file to Supabase in a background thread (non-blocking)."""
+    def _task():
+        firebase_storage.upload(local_path, UPLOAD_FOLDER, ARTIFACTS_DIR)
+    threading.Thread(target=_task, daemon=True).start()
 
 def _fb_download_url(local_path: str) -> str | None:
     """Return a Firebase signed URL for direct browser download, or None."""
