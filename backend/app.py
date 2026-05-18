@@ -23,6 +23,8 @@ from analysis.compliance_matrix import evaluate_compliance
 from analysis.acoustics import energetic_mean_db, compute_ldn_lden
 import io
 import logging
+import threading
+import math
 
 import retention
 
@@ -537,6 +539,71 @@ def read_csv_file(filepath: str) -> pd.DataFrame:
 def index():
     return render_template('index.html')
 
+
+# ── Fast-upload helpers ───────────────────────────────────────────────────────
+
+def _quick_preview_read(filepath, nrows=10):
+    """Read only the first *nrows* rows — never loads the full file into memory."""
+    head = _read_file_head(filepath)
+    if head.startswith(OLE_XLS_SIGNATURE) or head.startswith(ZIP_SIGNATURE):
+        return pd.read_excel(filepath, nrows=nrows, engine='openpyxl')
+    if _looks_like_text(head):
+        lines = _sniff_text_lines(filepath)
+        skiprows = _detect_csv_header_row(lines) or 0
+        return pd.read_csv(
+            filepath, nrows=nrows,
+            skiprows=range(1, skiprows + 1) if skiprows else None,
+            on_bad_lines='skip',
+        )
+    if WLGParser.is_wlg_file(filepath):
+        return parse_wlg_file(filepath).head(nrows)
+    raise ValueError("Unsupported file format")
+
+
+def _fast_row_count(filepath):
+    """Return row count without loading all data. Uses openpyxl metadata for
+    XLSX and newline counting for CSV. Returns None on failure."""
+    head = _read_file_head(filepath)
+    try:
+        if head.startswith(OLE_XLS_SIGNATURE) or head.startswith(ZIP_SIGNATURE):
+            from openpyxl import load_workbook
+            wb = load_workbook(filepath, read_only=True)
+            ws = wb.active
+            max_row = ws.max_row
+            wb.close()
+            if max_row and max_row > 1:
+                return max_row - 1  # subtract header row
+        elif _looks_like_text(head):
+            count = 0
+            with open(filepath, 'rb') as f:
+                for chunk in iter(lambda: f.read(65536), b''):
+                    count += chunk.count(b'\n')
+            return max(0, count - 1)
+    except Exception as e:
+        logger.warning(f"[FAST-COUNT] {e}")
+    return None
+
+
+def _sanitize_for_json(records):
+    """Replace NaN / Infinity / numpy scalars so jsonify never chokes."""
+    cleaned = []
+    for row in records:
+        clean_row = {}
+        for k, v in row.items():
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                clean_row[k] = None
+            elif hasattr(v, 'item'):  # numpy scalar → Python native
+                try:
+                    native = v.item()
+                    clean_row[k] = None if (isinstance(native, float) and (math.isnan(native) or math.isinf(native))) else native
+                except Exception:
+                    clean_row[k] = str(v)
+            else:
+                clean_row[k] = v
+        cleaned.append(clean_row)
+    return cleaned
+
+
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     try:
@@ -555,42 +622,53 @@ def upload_file():
         filename = secure_filename(datetime.now().strftime("%Y%m%d_%H%M%S_") + file.filename)
         filepath = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], filename))
         file.save(filepath)
-        
-        # Read and validate data
+
+        # ── Fast path: read only the first 10 rows for the immediate response ──
+        # The full DataFrame is loaded in a background thread so the HTTP
+        # response returns in seconds instead of 60-90 s for large XLSX files.
         try:
-            df = read_input_file(filepath)
+            quick_df = _quick_preview_read(filepath)
         except Exception as e:
             os.remove(filepath)
             return jsonify({'error': f'Error reading file: {str(e)}'}), 400
-        
-        if df.empty:
+
+        if quick_df is None or quick_df.empty:
             os.remove(filepath)
-            return jsonify({'error': 'File is empty'}), 400
+            return jsonify({'error': 'File is empty or has no readable data'}), 400
 
-        _store_cache_entry(filepath, df=df)
+        # Row count from file metadata (fast — no full read needed)
+        row_count = _fast_row_count(filepath) or len(quick_df)
 
-        # Apply retention after a successful upload to keep disk usage bounded.
-        _run_retention_cleanup(keep_paths=(filepath,))
-
-        # Compute date range for the uploaded file
+        # Date range from the quick sample (start only; end filled in after BG load)
         start_date = end_date = None
         try:
-            time_cols = [c for c in df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
+            time_cols = [c for c in quick_df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
             if time_cols:
-                ts = pd.to_datetime(df[time_cols[0]], errors='coerce', dayfirst=True).dropna()
+                ts = pd.to_datetime(quick_df[time_cols[0]], errors='coerce', dayfirst=True).dropna()
                 if not ts.empty:
                     start_date = ts.min().isoformat()
-                    end_date = ts.max().isoformat()
         except Exception:
             pass
+
+        # Background thread: load full DF and cache it so Analyze is instant
+        def _bg_load(fp=filepath):
+            try:
+                df_full = read_input_file(fp)
+                _store_cache_entry(fp, df=df_full)
+                _run_retention_cleanup(keep_paths=(fp,))
+                logger.info(f"[BG-LOAD] Cached {len(df_full):,} rows for {fp}")
+            except Exception as bg_err:
+                logger.error(f"[BG-LOAD] Failed for {fp}: {bg_err}")
+
+        threading.Thread(target=_bg_load, daemon=True).start()
 
         return jsonify({
             'success': True,
             'filename': filename,
             'filepath': filepath,
-            'rows': len(df),
-            'columns': df.columns.tolist(),
-            'preview': df.head(10).to_dict(orient='records'),
+            'rows': row_count,
+            'columns': quick_df.columns.tolist(),
+            'preview': _sanitize_for_json(quick_df.head(10).to_dict(orient='records')),
             'start_date': start_date,
             'end_date': end_date,
         })
