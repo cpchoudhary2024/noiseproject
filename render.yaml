@@ -2,7 +2,12 @@ services:
   - type: web
     name: noise-analysis-platform
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: >-
+      apt-get install -y --no-install-recommends
+      libgbm1 libnss3 libatk-bridge2.0-0 libgtk-3-0
+      libx11-xcb1 libxcb-dri3-0 libdrm2 libasound2
+      libxss1 libgconf-2-4 fonts-liberation xdg-utils
+      && pip install -r requirements.txt
     startCommand: python backend/app.py
     envVars:
       - key: PYTHON_VERSION

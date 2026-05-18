@@ -1,0 +1,45 @@
+# Virtual environments
+.venv/
+venv/
+env/
+backend/venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+
+# Data files
+*.csv
+*.xlsx
+*.xls
+*.wlg
+*.pdf
+*.docx
+*.doc
+
+# Runtime directories
+uploads/
+artifacts/
+logs/
+*.log
+
+# Large asset folders
+analyzed likely files copy/
+standards_sources/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Build
+*.egg-info/
+dist/
+build/

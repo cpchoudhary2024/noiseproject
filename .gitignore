@@ -105,3 +105,4 @@ yarn-error.log
 *.BAK
 *.orig
 *.rej
+.vercel
