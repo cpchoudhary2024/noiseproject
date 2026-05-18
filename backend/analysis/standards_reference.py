@@ -1,0 +1,341 @@
+"""Authoritative standards & guideline reference data.
+
+This module centralizes externally-sourced guideline values so they can be reused
+consistently across the API, UI, and report generation.
+
+Important:
+- Many standards (e.g., ISO 1996) define *methods* for assessment, not universal
+  legal limits.
+- Legal limits vary by jurisdiction. The values here are published guideline
+  levels and should be presented as such.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class GuidelineSource:
+    key: str
+    title: str
+    year: int
+    publisher: str
+    url: str
+    pdf_url: str | None = None
+
+
+WHO_ENV_NOISE_2018 = GuidelineSource(
+    key="who_2018_env_noise_europe",
+    title=(
+        "Environmental Noise Guidelines for the European Region"
+    ),
+    year=2018,
+    publisher="World Health Organization (WHO), Regional Office for Europe",
+    url="https://www.who.int/publications/i/item/9789289053563",
+    # Direct PDF bitstream (may change over time; keep the publication page above as canonical).
+    pdf_url="https://iris.who.int/server/api/core/bitstreams/f53c45ba-11d3-4502-a424-c1cf49f5a053/content",
+)
+
+
+def who_2018_environmental_noise_guideline_levels() -> dict:
+    """WHO 2018 guideline levels for key environmental noise sources.
+
+    Values are expressed as the guideline development group (GDG) recommendations
+    for long-term average exposure.
+
+    - Transport sources use $L_{den}$ and $L_{night}$.
+    - Leisure noise uses $L_{Aeq,24h}$.
+    - Indoor spaces use $L_{Aeq}$ or $L_{Amax}$ as specified.
+
+    Returns a JSON-serializable dict.
+    """
+
+    return {
+        "source": {
+            "key": WHO_ENV_NOISE_2018.key,
+            "title": WHO_ENV_NOISE_2018.title,
+            "year": WHO_ENV_NOISE_2018.year,
+            "publisher": WHO_ENV_NOISE_2018.publisher,
+            "url": WHO_ENV_NOISE_2018.url,
+            "pdf_url": WHO_ENV_NOISE_2018.pdf_url,
+        },
+        "guidelines": {
+            # Transport sources - Outdoor environmental noise
+            "road_traffic": {
+                "recommendation_strength": "strong",
+                "metrics_db": {"Lden": 53, "Lnight": 45},
+                "notes": "Reduce road traffic noise below 53 dB Lden and 45 dB Lnight.",
+                "health_threshold": "Cardiovascular risk increases above 55 dB Lden; sleep effects begin above 40 dB Lnight",
+            },
+            "railway": {
+                "recommendation_strength": "strong",
+                "metrics_db": {"Lden": 54, "Lnight": 44},
+                "notes": "Reduce railway noise below 54 dB Lden and 44 dB Lnight.",
+            },
+            "aircraft": {
+                "recommendation_strength": "strong",
+                "metrics_db": {"Lden": 45, "Lnight": 40},
+                "notes": "Reduce aircraft noise below 45 dB Lden and 40 dB Lnight. Aircraft noise causes greater annoyance than road/rail noise at same dB level.",
+            },
+            "wind_turbines": {
+                "recommendation_strength": "conditional",
+                "metrics_db": {"Lden": 45},
+                "notes": "Conditionally recommend reducing wind turbine noise below 45 dB Lden. No Lnight recommendation.",
+            },
+            "leisure": {
+                "recommendation_strength": "conditional",
+                "metrics_db": {"LAeq_24h": 70},
+                "notes": "Conditionally recommend reducing yearly average leisure noise to 70 dB LAeq,24h.",
+            },
+            # Indoor spaces (from WHO 1999 Guidelines for Community Noise)
+            "bedroom_sleep": {
+                "recommendation_strength": "strong",
+                "metrics_db": {"LAeq": 30, "LAmax": 45},
+                "notes": "Bedroom average: ≤30 dB LAeq protects sleep quality. Single loud events: ≤45 dB LAmax prevents awakening.",
+                "time_period": "Nighttime (11 PM - 7 AM)",
+            },
+            "living_room": {
+                "recommendation_strength": "strong",
+                "metrics_db": {"LAeq": 35},
+                "notes": "Living room: ≤35 dB LAeq allows comfortable conversation.",
+            },
+            "classroom": {
+                "recommendation_strength": "strong",
+                "metrics_db": {"LAeq": 35},
+                "notes": "Classroom: ≤35 dB LAeq allows effective learning and concentration.",
+            },
+            # General outdoor safe limits
+            "outdoor_daytime": {
+                "recommendation_strength": "guidance",
+                "time_period": "7 AM - 7 PM (12 hours)",
+                "metrics_db": {"recommended": 55},
+                "notes": "General outdoor daytime guideline: below 55 dB recommended.",
+            },
+            "outdoor_evening": {
+                "recommendation_strength": "guidance",
+                "time_period": "7 PM - 11 PM (4 hours)",
+                "metrics_db": {"recommended": 50},
+                "notes": "General outdoor evening guideline: below 50 dB recommended.",
+            },
+            "outdoor_nighttime": {
+                "recommendation_strength": "guidance",
+                "time_period": "11 PM - 7 AM (8 hours)",
+                "metrics_db": {"recommended": 45},
+                "notes": "General outdoor nighttime guideline: below 45 dB recommended.",
+            },
+        },
+        "health_thresholds": {
+            "sleep_effects_loael": {
+                "level": 40,
+                "metric": "Lnight (dB)",
+                "effect": "LOAEL - Lowest Observed Adverse Effect Level for sleep disturbance",
+                "description": "Body movements during sleep begin to increase above 40 dB Lnight",
+            },
+            "sleep_self_reported": {
+                "level": 45,
+                "metric": "Lnight (dB)",
+                "effect": "Self-reported sleep quality begins to decline",
+            },
+            "cardiovascular_threshold": {
+                "level": 55,
+                "metric": "Lden (dB)",
+                "effect": "Cardiovascular health risks begin to increase",
+                "risk_increase": "8% per 10 dB increase for heart disease above 55 dB Lden",
+            },
+            "hypertension_risk": {
+                "level": 55,
+                "metric": "Lden (dB)",
+                "effect": "High blood pressure risk: 5-7% per 10 dB increase above 55 dB Lden",
+            },
+            "stroke_risk": {
+                "level": 55,
+                "metric": "Lden (dB)",
+                "effect": "Stroke risk: 14% per 10 dB increase above 55 dB Lden",
+            },
+            "annoyance_onset": {
+                "level": 50,
+                "metric": "Lden (dB)",
+                "effect": "Noticeable annoyance begins; 6% of population highly annoyed by road traffic",
+            },
+        },
+        "definitions": {
+            "Lden": (
+                "Day-Evening-Night level: 24-hour average with penalties to reflect greater impact during evening/night. "
+                "Calculation: Evening hours (+5 dB penalty) and night hours (+10 dB penalty) are weighted more heavily than daytime. "
+                "Time periods: Day 07:00-19:00 (no penalty), Evening 19:00-23:00 (+5 dB), Night 23:00-07:00 (+10 dB)"
+            ),
+            "Lnight": (
+                "Average sound level during nighttime hours (23:00-07:00). "
+                "No penalty applied; represents the actual average noise level during this sleep-critical period. "
+                "Used for assessing sleep disturbance and chronic health effects."
+            ),
+            "LAeq": (
+                "Equivalent Continuous Level: The steady sound level that contains the same total sound energy "
+                "as the actual fluctuating sound over the measurement period. Energy-averaged (logarithmic) measurement."
+            ),
+            "LAmax": (
+                "Maximum A-weighted sound level recorded during measurement period. "
+                "Important for sleep disturbance (prevents awakening when ≤45 dB in bedroom)."
+            ),
+            "LA90": (
+                "Background level: The sound level exceeded 90% of the time. "
+                "Represents the underlying baseline ambient noise when obvious discrete events are removed."
+            ),
+            "LAeq_24h": "24-hour energy-average sound level (typically for leisure/recreational noise assessment)",
+            "dB_A": (
+                "Decibels A-weighted: Standard for environmental and occupational noise. "
+                "A-weighting filter adjusts measurements to match human hearing perception across frequencies."
+            ),
+            "dB_C": (
+                "Decibels C-weighted: Used for peak/impulsive noise and low-frequency assessment. "
+                "Flatter frequency response than A-weighting; important for measuring loud transient events."
+            ),
+            "LOAEL": (
+                "Lowest Observed Adverse Effect Level: The lowest exposure level at which adverse health effects "
+                "are observed in scientific studies. For sleep, this is 40 dB Lnight."
+            ),
+            "Decibel_scale": (
+                "Logarithmic scale where +3 dB = energy doubles (just noticeable); +10 dB = sounds twice as loud. "
+                "Each 10 dB increase represents 10× more sound energy."
+            ),
+        },
+        "disclaimer": (
+            "These are WHO guideline levels (health-based recommendations), not universal legal limits. "
+            "Applicable regulatory limits depend on jurisdiction, land use, and permitting context. "
+            "Maryland state regulations differ: residential daytime 65 dB(A), nighttime 55 dB(A) (more permissive than WHO)."
+        ),
+    }
+
+
+def occupational_noise_standards() -> dict:
+    """Occupational noise exposure limits from NIOSH, OSHA, EU, and WHO.
+    
+    Occupational standards differ from environmental standards and apply to workplace
+    exposure over a work shift (typically 8 hours). Different exchange rates imply
+    different assumptions about how risk accumulates.
+    
+    Returns a JSON-serializable dict.
+    """
+    return {
+        "standards": {
+            "NIOSH_recommended": {
+                "jurisdiction": "National Institute for Occupational Safety and Health (USA)",
+                "source": "NIOSH Criteria Document (1998)",
+                "standard_8hr_twa": 85,
+                "metric": "dB(A) TWA (Time-Weighted Average)",
+                "exchange_rate": 3,
+                "exchange_rate_meaning": "Every 3 dB increase halves safe exposure time (more protective)",
+                "action_level": 85,
+                "ppe_required_above": 85,
+                "hearing_conservation_above": 85,
+                "notes": "NIOSH recommends 3 dB exchange rate as scientifically more accurate for hearing damage risk",
+            },
+            "OSHA_legal": {
+                "jurisdiction": "Occupational Safety and Health Administration (USA)",
+                "source": "29 CFR 1910.95",
+                "standard_8hr_twa": 90,
+                "metric": "dB(A) TWA",
+                "exchange_rate": 5,
+                "exchange_rate_meaning": "Every 5 dB increase halves safe exposure time (less protective)",
+                "action_level": 85,
+                "ppe_required_above": 85,
+                "hearing_conservation_above": 85,
+                "hearing_protection_required_above": 90,
+                "notes": "OSHA uses 5 dB exchange rate; allows longer exposure at high levels than NIOSH",
+            },
+            "EU_directive": {
+                "jurisdiction": "European Union",
+                "source": "Directive 2003/10/EC",
+                "standard_8hr_twa": 87,
+                "metric": "dB(A) TWA",
+                "exchange_rate": 3,
+                "exchange_rate_meaning": "Every 3 dB increase halves safe exposure time",
+                "action_level": 85,
+                "upper_action_level": 85,
+                "exposure_limit": 87,
+                "peak_limit_dbc": 140,
+                "ppe_required_above": 85,
+                "notes": "EU aligns with NIOSH on 3 dB exchange rate and scientific approach",
+            },
+            "WHO_ISO_reference": {
+                "jurisdiction": "World Health Organization / ISO",
+                "source": "ISO standards, WHO guidance",
+                "standard_8hr_twa": 85,
+                "metric": "dB(A) TWA",
+                "exchange_rate": 3,
+                "exchange_rate_meaning": "Every 3 dB increase halves safe exposure time",
+                "notes": "WHO/ISO align with NIOSH and EU on more protective 3 dB exchange rate",
+            },
+        },
+        "safe_exposure_times": {
+            "note": "Based on NIOSH 3 dB exchange rate (more protective) starting from 85 dB for 8 hours",
+            "durations": {
+                "85 dB": "8 hours",
+                "88 dB": "4 hours",
+                "91 dB": "2 hours",
+                "94 dB": "1 hour",
+                "97 dB": "30 minutes",
+                "100 dB": "15 minutes",
+                "103 dB": "7.5 minutes",
+                "106 dB": "3.75 minutes",
+            },
+            "methodology": "Each 3 dB increase halves the safe exposure time",
+        },
+        "peak_limit": {
+            "limit_dbc": 140,
+            "metric": "dB(C) peak",
+            "applies_to": "Impulsive or impact noise (explosions, gunshots, pile driving, etc.)",
+            "applies_standards": ["OSHA", "EU", "NIOSH"],
+        },
+        "health_effects_occupational": {
+            "at_action_level_85_db": {
+                "level": 85,
+                "effects": [
+                    "Hearing conservation program required",
+                    "Baseline and annual audiograms required",
+                    "Hearing protection program initiated",
+                ],
+            },
+            "at_90_db_8hr": {
+                "level": 90,
+                "effects": [
+                    "OSHA PEL (Permissible Exposure Limit)",
+                    "Significant risk of hearing damage with prolonged exposure",
+                    "Hearing protection mandatory",
+                ],
+            },
+            "above_90_db": {
+                "effects": [
+                    "Substantial risk of permanent hearing damage",
+                    "Engineering controls strongly recommended",
+                    "Hearing protection program mandatory",
+                    "Medical monitoring required",
+                ],
+            },
+        },
+        "key_differences_from_environmental": {
+            "occupational_vs_environmental": [
+                "Occupational limits are higher (85-90 dB) than environmental (45-55 dB Lnight)",
+                "Occupational assumes controlled workplace setting with hearing protection programs",
+                "Environmental standards protect vulnerable populations (children, elderly) continuously",
+                "Occupational: focuses on direct hearing damage; environmental: includes sleep/cardio/annoyance",
+                "Different metrics: occupational uses 8-hour TWA; environmental uses Lden/Lnight",
+            ],
+        },
+        "exchange_rate_explanation": {
+            "3dB_NIOSH_EU_WHO": {
+                "exchange_rate": 3,
+                "reasoning": "Scientifically-based on acoustic energy doubling per 3 dB",
+                "example": "90 dB for 4 hrs ≈ 85 dB for 8 hrs (3 dB/halving rule)",
+                "protective_level": "More protective; less time allowed at high levels",
+            },
+            "5dB_OSHA": {
+                "exchange_rate": 5,
+                "reasoning": "Regulatory compromise balancing protection with practical workplace considerations",
+                "example": "95 dB for 4 hrs ≈ 90 dB for 8 hrs (5 dB/halving rule)",
+                "protective_level": "Less protective; allows longer exposure at high levels",
+                "note": "OSHA exchange rate does not align with acoustic energy principles",
+            },
+        },
+    }

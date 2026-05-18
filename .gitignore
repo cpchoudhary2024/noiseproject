@@ -1,0 +1,107 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+.venv
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings
+*.sublime-project
+*.sublime-workspace
+.code/
+
+
+# Project runtime directories (generated at runtime)
+uploads/
+artifacts/
+logs/
+*.log
+.cache
+.pytest_cache/
+
+# Large data / personal files
+*.csv
+*.xlsx
+*.xls
+*.wlg
+*.pdf
+*.docx
+*.doc
+noise_analysis.db
+*.db
+*.sqlite
+
+# Analyzed files copy
+analyzed likely files copy/
+
+# Standards sources (large PDFs)
+standards_sources/
+
+# Flask
+instance/
+.webassets-cache
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# OS
+Thumbs.db
+.directory
+
+# Testing
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Build / Distribution
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdid/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Temporary files
+*.tmp
+*.bak
+*.BAK
+*.orig
+*.rej
