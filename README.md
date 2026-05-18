@@ -1,3 +1,13 @@
+---
+title: Noise Analysis Platform
+emoji: 📊
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Noise Data Analysis Platform
 
 A comprehensive web-based platform for analyzing noise data with ISO 1996 and EPA standards compliance checking, advanced statistics, and detailed reporting capabilities.

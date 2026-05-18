@@ -2318,34 +2318,32 @@ class ReportGeneratorV2:
     # ============================================================
 
     def _plotly_fig_to_image(self, fig, width_inch=8, height_inch=4):
-        """Convert a Plotly figure to a ReportLab Image for PDF embedding."""
+        """Convert Plotly figure to ReportLab Image."""
         if fig is None:
             return None
         try:
             scale = 1.25 if len(self.df) > 500_000 else 2
-            img_bytes = None
-            for engine in ('kaleido', 'orca'):
+            try:
+                img_bytes = fig.to_image(format="png", scale=scale, engine="kaleido")
+            except Exception:
                 try:
-                    img_bytes = fig.to_image(format='png', scale=scale, engine=engine)
-                    break
-                except Exception as e:
-                    print(f'[Report] {engine} failed: {type(e).__name__}: {e}')
-            if img_bytes is None:
-                import plotly.io as pio
-                img_bytes = pio.to_image(fig, format='png')
-
+                    img_bytes = fig.to_image(format="png", scale=scale, engine="orca")
+                except Exception:
+                    import plotly.io as pio
+                    img_bytes = pio.to_image(fig, format="png")
+            
             img = Image(io.BytesIO(img_bytes))
             aspect = img.imageHeight / img.imageWidth if img.imageWidth > 0 else 1
             img.drawWidth = width_inch * inch
             img.drawHeight = (width_inch * inch) * aspect
+            
             if img.drawHeight > height_inch * inch:
                 img.drawHeight = height_inch * inch
                 img.drawWidth = (height_inch * inch) / aspect
+            
             return img
         except Exception as e:
-            import traceback
-            print(f'[Report] Chart rendering failed: {type(e).__name__}: {e}')
-            traceback.print_exc()
+            print(f"[Report] Chart rendering failed: {str(e)[:100]}")
             return None
 
     def _get_pdf_styles(self):

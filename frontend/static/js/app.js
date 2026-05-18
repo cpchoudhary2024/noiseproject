@@ -187,144 +187,50 @@ async function _safeJson(response) {
     }
 }
 
-// Wake up the server before uploading. Render free tier sleeps after 15 min
-// and cold-start can take 30-60s — we ping a lightweight endpoint until it
-// responds 2xx, polling every 3 s for up to 90 s.
-function _wakeServer(onProgress) {
-    return new Promise((resolve, reject) => {
-        const startedAt = Date.now();
-        const MAX_WAIT_MS = 90_000;
-
-        function ping() {
-            const elapsed = Math.round((Date.now() - startedAt) / 1000);
-            // First check: silent (no message) — if server is awake, no UI delay
-            if (elapsed > 0) {
-                onProgress(`Waking up server… ${elapsed}s (this only happens after a long idle period)`);
-            }
-            fetch('/api/ping', { method: 'GET', cache: 'no-store' })
-                .then(r => {
-                    if (r.ok) {
-                        resolve();
-                    } else if (Date.now() - startedAt > MAX_WAIT_MS) {
-                        reject(new Error('Server did not wake up after 90 seconds. Please try again in a minute.'));
-                    } else {
-                        setTimeout(ping, 3000);
-                    }
-                })
-                .catch(() => {
-                    if (Date.now() - startedAt > MAX_WAIT_MS) {
-                        reject(new Error('Server did not wake up after 90 seconds. Please try again in a minute.'));
-                    } else {
-                        setTimeout(ping, 3000);
-                    }
-                });
-        }
-        ping();
-    });
-}
-
-function _xhrUpload(url, formData, onProgress, attempt = 1) {
-    return new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', url);
-        xhr.upload.addEventListener('progress', e => {
-            if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100));
-        });
-        xhr.addEventListener('load', () => {
-            // 502/503/504 = server still waking or briefly unavailable — wait
-            // until it's healthy then retry the upload from scratch.
-            if ([502, 503, 504].includes(xhr.status) && attempt <= 2) {
-                onProgress(-1);
-                _wakeServer(msg => onProgress(-2, msg))
-                    .then(() => _xhrUpload(url, formData, onProgress, attempt + 1))
-                    .then(resolve)
-                    .catch(reject);
-            } else {
-                resolve(xhr);
-            }
-        });
-        xhr.addEventListener('error', () => {
-            // Network-level failure usually means server is asleep. Wake it
-            // and retry once before giving up.
-            if (attempt <= 2) {
-                onProgress(-1);
-                _wakeServer(msg => onProgress(-2, msg))
-                    .then(() => _xhrUpload(url, formData, onProgress, attempt + 1))
-                    .then(resolve)
-                    .catch(reject);
-            } else {
-                reject(new Error('Network error during upload — the server may be down. Please try again in a minute.'));
-            }
-        });
-        xhr.send(formData);
-    });
-}
-
-async function _xhrSafeJson(xhr) {
-    try {
-        return JSON.parse(xhr.responseText);
-    } catch {
-        if (xhr.status === 413 || (xhr.responseText || '').toLowerCase().includes('request entity too large')) {
-            throw new Error('File too large for the server (limit: 4.5 MB).');
-        }
-        throw new Error(`Server error (HTTP ${xhr.status}). Please try again.`);
-    }
-}
-
 function _doSingleUpload(file) {
     if (errorMessage) errorMessage.style.display = 'none';
     window.mergeGapReport = null;
-    setStatus('processing', 'Uploading… 0%');
+    setStatus('processing', 'Uploading file…');
 
     const formData = new FormData();
     formData.append('file', file);
 
-    _xhrUpload('/api/upload', formData, (pct, msg) => {
-        if (pct === -2) setStatus('processing', msg);
-        else if (pct === -1) setStatus('processing', 'Server is sleeping — waking it up…');
-        else if (pct < 100) setStatus('processing', `Uploading… ${pct}%`);
-        else setStatus('processing', 'Processing file on server…');
-    })
-    .then(xhr => _xhrSafeJson(xhr))
-    .then(data => {
-        if (data.success) {
-            uploadedFilepath = data.filepath;
-            batchFileMeta = [{
-                name: file.name,
-                rows: data.rows,
-                start: data.start_date || null,
-                end: data.end_date || null,
-            }];
-            displayPreview(data);
-            renderBatchFilesPanel();
-            showSection('preview-section');
-            setStatus('idle', 'File uploaded — ' + data.rows.toLocaleString() + ' records');
-        } else {
-            showError(data.error || 'Upload failed');
-            setStatus('error', 'Upload failed');
-        }
-    })
-    .catch(err => {
-        showError('Error uploading file: ' + err.message);
-        setStatus('error', 'Upload error');
-    });
+    fetch('/api/upload', { method: 'POST', body: formData })
+        .then(r => _safeJson(r))
+        .then(data => {
+            if (data.success) {
+                uploadedFilepath = data.filepath;
+                batchFileMeta = [{
+                    name: file.name,
+                    rows: data.rows,
+                    start: data.start_date || null,
+                    end: data.end_date || null,
+                }];
+                displayPreview(data);
+                renderBatchFilesPanel();
+                showSection('preview-section');
+                setStatus('idle', 'File uploaded — ' + data.rows.toLocaleString() + ' records');
+            } else {
+                showError(data.error || 'Upload failed');
+                setStatus('error', 'Upload failed');
+            }
+        })
+        .catch(err => {
+            showError('Error uploading file: ' + err.message);
+            setStatus('error', 'Upload error');
+        });
 }
 
 function _doMultiUpload(files) {
     if (errorMessage) errorMessage.style.display = 'none';
-    setStatus('processing', 'Uploading… 0%');
+    setStatus('processing', `Merging ${files.length} files…`);
 
     const formData = new FormData();
     files.forEach(f => formData.append('files', f));
 
-    _xhrUpload('/api/upload-multi', formData, (pct, msg) => {
-        if (pct === -2) setStatus('processing', msg);
-        else if (pct === -1) setStatus('processing', 'Server is sleeping — waking it up…');
-        else if (pct < 100) setStatus('processing', `Uploading ${files.length} file(s)… ${pct}%`);
-        else setStatus('processing', 'Merging & processing on server…');
-    })
-    .then(xhr => _xhrSafeJson(xhr))
-    .then(data => {
+    fetch('/api/upload-multi', { method: 'POST', body: formData })
+        .then(r => _safeJson(r))
+        .then(data => {
             if (data.success) {
                 uploadedFilepath      = data.filepath;
                 window.mergeGapReport = data.gap_analysis || null;
@@ -373,7 +279,7 @@ async function handleAddMoreFiles(e) {
     if (!newFiles.length) return;
 
     if (errorMessage) errorMessage.style.display = 'none';
-    setStatus('processing', 'Uploading… 0%');
+    setStatus('processing', `Adding ${newFiles.length} file(s) to batch…`);
 
     const formData = new FormData();
     newFiles.forEach(f => formData.append('files', f));
@@ -382,13 +288,8 @@ async function handleAddMoreFiles(e) {
     }
 
     try {
-        const xhr = await _xhrUpload('/api/upload-multi', formData, (pct, msg) => {
-            if (pct === -2) setStatus('processing', msg);
-            else if (pct === -1) setStatus('processing', 'Server is sleeping — waking it up…');
-            else if (pct < 100) setStatus('processing', `Uploading ${newFiles.length} file(s)… ${pct}%`);
-            else setStatus('processing', 'Merging & processing on server…');
-        });
-        const data = await _xhrSafeJson(xhr);
+        const resp = await fetch('/api/upload-multi', { method: 'POST', body: formData });
+        const data = await _safeJson(resp);
 
         if (data.success) {
             uploadedFilepath      = data.filepath;
