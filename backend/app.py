@@ -25,6 +25,7 @@ import io
 import logging
 
 import retention
+import firebase_storage
 
 # Setup logging for cache debugging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
@@ -82,6 +83,31 @@ app.config['ARTIFACTS_CHARTS_DIR'] = ARTIFACTS_CHARTS_DIR
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 # Never cache static files — ensures browsers always load the latest JS/CSS
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+
+# ── Firebase Storage ──────────────────────────────────────────────────────────
+# Initialise at startup; gracefully skipped if env vars are not set.
+firebase_storage.init()
+
+def _fb_upload(local_path: str):
+    """Mirror a local file to Firebase Storage (non-blocking best-effort)."""
+    firebase_storage.upload(local_path, UPLOAD_FOLDER, ARTIFACTS_DIR)
+
+def _fb_download_url(local_path: str) -> str | None:
+    """Return a Firebase signed URL for direct browser download, or None."""
+    return firebase_storage.get_download_url(local_path, UPLOAD_FOLDER, ARTIFACTS_DIR)
+
+def _ensure_local_file(local_path: str) -> bool:
+    """Restore a file from Firebase if it is missing on the local filesystem.
+
+    Render's ephemeral /tmp is wiped on every restart / sleep cycle.
+    This function transparently re-downloads any previously uploaded file
+    so the rest of the application code never has to know about it.
+    Returns True if the file is (or was made) available locally.
+    """
+    if os.path.exists(local_path):
+        return True
+    logger.info('[Restore] %s not found locally — attempting Firebase restore.', local_path)
+    return firebase_storage.download(local_path, UPLOAD_FOLDER, ARTIFACTS_DIR)
 
 # Simple in-memory cache to avoid re-reading and re-analyzing the same file.
 _DATA_CACHE = {}
@@ -226,13 +252,20 @@ def _resolve_uploaded_filepath(filepath: str) -> str:
     Backwards compatible:
     - If basename: check uploads/raw first, then uploads root.
     - If absolute/relative path provided: normalize to absolute.
+
+    Also transparently restores the file from Firebase Storage when the
+    local ephemeral filesystem has been wiped (Render sleep/restart).
     """
     if os.path.basename(filepath) == filepath:
         raw_candidate = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], filepath))
-        if os.path.exists(raw_candidate):
+        if os.path.exists(raw_candidate) or _ensure_local_file(raw_candidate):
             return raw_candidate
-        return os.path.abspath(os.path.join(app.config['UPLOAD_FOLDER'], filepath))
-    return os.path.abspath(filepath)
+        root_candidate = os.path.abspath(os.path.join(app.config['UPLOAD_FOLDER'], filepath))
+        _ensure_local_file(root_candidate)
+        return root_candidate
+    resolved = os.path.abspath(filepath)
+    _ensure_local_file(resolved)
+    return resolved
 
 
 def _run_retention_cleanup(*, keep_paths=()):
@@ -574,6 +607,9 @@ def upload_file():
 
         _store_cache_entry(filepath, df=df)
 
+        # Mirror to Firebase so the file survives server restarts.
+        _fb_upload(filepath)
+
         # Apply retention after a successful upload to keep disk usage bounded.
         _run_retention_cleanup(keep_paths=(filepath,))
 
@@ -819,6 +855,10 @@ def upload_multi():
 
         # Cache
         _store_cache_entry(merged_path, df=merged_df)
+
+        # Mirror merged file to Firebase for persistence across restarts.
+        _fb_upload(merged_path)
+
         _run_retention_cleanup(keep_paths=(merged_path,))
 
         # Gap analysis
@@ -1098,8 +1138,15 @@ def generate_report():
         # Apply retention after generating a report to keep only the newest artifacts.
         _run_retention_cleanup(keep_paths=(filepath, report_path))
 
+        # Mirror report to Firebase and serve via signed URL when available.
+        # Falls back to streaming from local disk if Firebase is not configured.
+        _fb_upload(report_path)
+        signed_url = _fb_download_url(report_path)
+        if signed_url:
+            from flask import redirect as flask_redirect
+            return flask_redirect(signed_url)
         return send_file(report_path, as_attachment=True, download_name=os.path.basename(report_path), mimetype=mimetype)
-    
+
     except Exception as e:
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
@@ -2314,6 +2361,11 @@ def compare_report():
 
         doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
         _run_retention_cleanup(keep_paths=(report_path,))
+        _fb_upload(report_path)
+        signed_url = _fb_download_url(report_path)
+        if signed_url:
+            from flask import redirect as flask_redirect
+            return flask_redirect(signed_url)
         return send_file(report_path, as_attachment=True, download_name=report_filename, mimetype='application/pdf')
 
     except Exception as e:

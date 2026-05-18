@@ -1,8 +1,3 @@
-import matplotlib
-matplotlib.use('Agg')  # must be set before any pyplot import; safe to call at module level
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -2323,22 +2318,22 @@ class ReportGeneratorV2:
     # ============================================================
 
     def _plotly_fig_to_image(self, fig, width_inch=8, height_inch=4):
-        """Convert Plotly figure to ReportLab Image.
-
-        Tries kaleido/orca first (high-fidelity), then falls back to a
-        matplotlib re-render so charts always appear in the PDF even on
-        servers where Chromium/kaleido is unavailable (e.g. Render free tier).
-        """
+        """Convert a Plotly figure to a ReportLab Image for PDF embedding."""
         if fig is None:
             return None
-
-        img_bytes = self._try_plotly_export(fig)
-        if img_bytes is None:
-            img_bytes = self._matplotlib_fallback(fig, width_inch, height_inch)
-        if img_bytes is None:
-            return None
-
         try:
+            scale = 1.25 if len(self.df) > 500_000 else 2
+            img_bytes = None
+            for engine in ('kaleido', 'orca'):
+                try:
+                    img_bytes = fig.to_image(format='png', scale=scale, engine=engine)
+                    break
+                except Exception as e:
+                    print(f'[Report] {engine} failed: {type(e).__name__}: {e}')
+            if img_bytes is None:
+                import plotly.io as pio
+                img_bytes = pio.to_image(fig, format='png')
+
             img = Image(io.BytesIO(img_bytes))
             aspect = img.imageHeight / img.imageWidth if img.imageWidth > 0 else 1
             img.drawWidth = width_inch * inch
@@ -2348,222 +2343,9 @@ class ReportGeneratorV2:
                 img.drawWidth = (height_inch * inch) / aspect
             return img
         except Exception as e:
-            print(f"[Report] ReportLab image wrap failed: {type(e).__name__}: {e}")
-            return None
-
-    def _try_plotly_export(self, fig):
-        """Attempt kaleido → orca → plotly.io. Returns PNG bytes or None."""
-        scale = 1.25 if len(self.df) > 500_000 else 2
-        for engine in ("kaleido", "orca"):
-            try:
-                return fig.to_image(format="png", scale=scale, engine=engine)
-            except Exception as e:
-                print(f"[Report] {engine} engine failed: {type(e).__name__}: {e}")
-        try:
-            import plotly.io as pio
-            return pio.to_image(fig, format="png")
-        except Exception as e:
-            print(f"[Report] plotly.io fallback failed: {type(e).__name__}: {e}")
-        return None
-
-    def _matplotlib_fallback(self, fig, width_inch, height_inch):
-        """Render a Plotly figure to PNG using matplotlib (no browser required).
-
-        Extracts trace data directly from the Plotly figure object and draws
-        equivalent charts with matplotlib/Agg. Handles scatter/line, box,
-        heatmap, and polar (scatterpolar) trace types.
-        """
-        BG   = '#f8f9fa'
-        PALETTE = ['#3D5A80', '#EE6C4D', '#98C1D9', '#E0FBFC', '#293241',
-                   '#F4A261', '#2A9D8F', '#E9C46A', '#264653', '#A8DADC']
-
-        try:
-            layout = fig.layout
-            traces = fig.data
-            if not traces:
-                return None
-
-            # Detect chart family
-            types = {t.type for t in traces}
-            is_heatmap = 'heatmap' in types
-            is_polar   = 'scatterpolar' in types or 'barpolar' in types
-
-            if is_polar:
-                mfig, ax = plt.subplots(figsize=(width_inch, height_inch),
-                                        subplot_kw={'projection': 'polar'})
-            else:
-                mfig, ax = plt.subplots(figsize=(width_inch, height_inch))
-
-            mfig.patch.set_facecolor(BG)
-            if not is_polar:
-                ax.set_facecolor(BG)
-
-            # ── title ─────────────────────────────────────────────────
-            title_obj = getattr(layout, 'title', None)
-            title_text = ''
-            if title_obj and hasattr(title_obj, 'text') and title_obj.text:
-                title_text = title_obj.text
-            if title_text:
-                mfig.suptitle(title_text, fontsize=10, fontweight='bold',
-                              color='#3D5A80', y=1.01)
-
-            # ── heatmap ───────────────────────────────────────────────
-            if is_heatmap:
-                tr = next(t for t in traces if t.type == 'heatmap')
-                z = np.array([[v if v is not None else np.nan for v in row]
-                              for row in (tr.z or [])])
-                if z.size == 0:
-                    plt.close(mfig); return None
-                im = ax.imshow(z, aspect='auto', cmap='RdYlGn_r', origin='upper')
-                mfig.colorbar(im, ax=ax, label='dB(A)', pad=0.02)
-                x_labels = list(tr.x or [])
-                y_labels = list(tr.y or [])
-                if x_labels:
-                    step = max(1, len(x_labels) // 10)
-                    ax.set_xticks(range(0, len(x_labels), step))
-                    ax.set_xticklabels([str(x_labels[i]) for i in range(0, len(x_labels), step)],
-                                       rotation=45, ha='right', fontsize=7)
-                if y_labels:
-                    ax.set_yticks(range(len(y_labels)))
-                    ax.set_yticklabels([str(v) for v in y_labels], fontsize=7)
-
-            # ── polar / radar ─────────────────────────────────────────
-            elif is_polar:
-                for i, tr in enumerate(traces):
-                    color = PALETTE[i % len(PALETTE)]
-                    theta_raw = list(getattr(tr, 'theta', None) or [])
-                    r_raw     = list(getattr(tr, 'r',     None) or [])
-                    if not theta_raw or not r_raw:
-                        continue
-                    # Convert hour labels to radians
-                    try:
-                        theta_rad = [float(t) / 24 * 2 * np.pi for t in theta_raw]
-                    except (TypeError, ValueError):
-                        theta_rad = np.linspace(0, 2 * np.pi, len(theta_raw), endpoint=False).tolist()
-                    r_vals = []
-                    for v in r_raw:
-                        try: r_vals.append(float(v))
-                        except (TypeError, ValueError): r_vals.append(0.0)
-                    theta_rad.append(theta_rad[0])
-                    r_vals.append(r_vals[0])
-                    label = getattr(tr, 'name', None) or f'Series {i+1}'
-                    ax.plot(theta_rad, r_vals, color=color, linewidth=1.8, label=label)
-                    ax.fill(theta_rad, r_vals, color=color, alpha=0.08)
-                ax.set_theta_direction(-1)
-                ax.set_theta_offset(np.pi / 2)
-                hour_ticks = np.linspace(0, 2 * np.pi, 24, endpoint=False)
-                ax.set_xticks(hour_ticks)
-                ax.set_xticklabels([f'{h:02d}h' for h in range(24)], fontsize=6)
-                ax.grid(True, alpha=0.3)
-                handles, labels_ = ax.get_legend_handles_labels()
-                if handles:
-                    ax.legend(fontsize=7, loc='upper right',
-                              bbox_to_anchor=(1.35, 1.1), framealpha=0.7)
-
-            # ── scatter / line / bar / box ────────────────────────────
-            else:
-                for i, tr in enumerate(traces):
-                    color = PALETTE[i % len(PALETTE)]
-                    label = getattr(tr, 'name', None) or f'Series {i+1}'
-
-                    if tr.type in ('scatter', 'scattergl'):
-                        x_raw = list(tr.x or [])
-                        y_raw = [v if v is not None else np.nan for v in (tr.y or [])]
-                        if not x_raw or not y_raw:
-                            continue
-                        mode  = getattr(tr, 'mode', 'lines') or 'lines'
-                        fill  = getattr(tr, 'fill', None)
-                        line_ = getattr(tr, 'line', None)
-                        dash  = getattr(line_, 'dash', 'solid') or 'solid'
-                        lw    = min(float(getattr(line_, 'width', 1.5) or 1.5), 3.0)
-                        ls    = {'dot': ':', 'dash': '--', 'dashdot': '-.', 'solid': '-'}.get(dash, '-')
-                        # Detect fill/band traces (envelope) — draw as shaded area
-                        if fill and fill.startswith('to'):
-                            ax.fill_between(x_raw, y_raw, alpha=0.12, color=color)
-                        else:
-                            if 'lines' in mode:
-                                ax.plot(x_raw, y_raw, color=color, linewidth=lw,
-                                        linestyle=ls, label=label, alpha=0.9)
-                            if 'markers' in mode and 'lines' not in mode:
-                                ax.scatter(x_raw, y_raw, color=color, s=6, label=label)
-
-                    elif tr.type == 'bar':
-                        x_raw = list(tr.x or [])
-                        y_raw = [v if v is not None else 0 for v in (tr.y or [])]
-                        if x_raw and y_raw:
-                            ax.bar(x_raw, y_raw, color=color, alpha=0.8, label=label)
-                            plt.xticks(rotation=45, ha='right', fontsize=7)
-
-                    elif tr.type in ('box', 'violin'):
-                        y_all = list(tr.y or [])
-                        x_cat = list(tr.x or [])
-                        y_all = [v for v in y_all if v is not None]
-                        if not y_all:
-                            continue
-                        if x_cat:
-                            x_cat = [v for v in x_cat if v is not None]
-                            groups: dict = {}
-                            for xi, yi in zip(x_cat, y_all):
-                                groups.setdefault(str(xi), []).append(float(yi))
-                            positions = sorted(groups.keys(),
-                                               key=lambda k: int(k) if k.isdigit() else k)
-                            arrays   = [groups[p] for p in positions]
-                            bp = ax.boxplot(arrays, labels=positions, patch_artist=True,
-                                            widths=0.6, medianprops=dict(color='#EE6C4D', linewidth=2))
-                            for patch in bp['boxes']:
-                                patch.set_facecolor(color)
-                                patch.set_alpha(0.55)
-                            plt.xticks(rotation=45, ha='right', fontsize=7)
-                        else:
-                            bp = ax.boxplot([y_all], labels=[label], patch_artist=True,
-                                            medianprops=dict(color='#EE6C4D', linewidth=2))
-                            bp['boxes'][0].set_facecolor(color)
-                            bp['boxes'][0].set_alpha(0.55)
-
-                # ── axis labels ───────────────────────────────────────
-                xaxis = getattr(layout, 'xaxis', None)
-                yaxis = getattr(layout, 'yaxis', None)
-                xlabel = ''
-                ylabel = ''
-                if xaxis and getattr(xaxis, 'title', None):
-                    xlabel = getattr(xaxis.title, 'text', '') or ''
-                if yaxis and getattr(yaxis, 'title', None):
-                    ylabel = getattr(yaxis.title, 'text', '') or ''
-                if xlabel:
-                    ax.set_xlabel(xlabel, fontsize=9)
-                if ylabel:
-                    ax.set_ylabel(ylabel, fontsize=9)
-
-                ax.tick_params(labelsize=8)
-                ax.grid(True, alpha=0.25, linewidth=0.5)
-                # Auto-rotate x-tick labels if they are dates or long strings
-                try:
-                    mfig.autofmt_xdate(rotation=30, ha='right')
-                except Exception:
-                    pass
-
-                handles, labels_ = ax.get_legend_handles_labels()
-                if handles and len(handles) <= 8:
-                    ax.legend(fontsize=7, loc='best', framealpha=0.7)
-
-            plt.tight_layout(pad=0.8)
-            buf = io.BytesIO()
-            mfig.savefig(buf, format='png', dpi=150, bbox_inches='tight',
-                         facecolor=BG)
-            buf.seek(0)
-            img_bytes = buf.read()
-            plt.close(mfig)
-            print(f"[Report] matplotlib fallback succeeded ({len(img_bytes)//1024} KB)")
-            return img_bytes
-
-        except Exception as e:
             import traceback
-            print(f"[Report] matplotlib fallback failed: {type(e).__name__}: {e}")
+            print(f'[Report] Chart rendering failed: {type(e).__name__}: {e}')
             traceback.print_exc()
-            try:
-                plt.close('all')
-            except Exception:
-                pass
             return None
 
     def _get_pdf_styles(self):
