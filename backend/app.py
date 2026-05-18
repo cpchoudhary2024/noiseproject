@@ -265,12 +265,17 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def read_excel_file(filepath):
-    """Read Excel file with content-based engine detection (.xls vs .xlsx)."""
+    """Read Excel file with content-based engine detection (.xls vs .xlsx).
+
+    Uses calamine (Rust-based) for .xlsx — same data types as openpyxl but
+    4-6x faster because it does not parse styles/formatting/formulas.
+    Falls back to xlrd for legacy .xls files.
+    """
     head = _read_file_head(filepath, size=16)
     if head.startswith(OLE_XLS_SIGNATURE):
         return pd.read_excel(filepath, engine='xlrd')
     if head.startswith(ZIP_SIGNATURE):
-        return pd.read_excel(filepath, engine='openpyxl')
+        return pd.read_excel(filepath, engine='calamine')
     raise ValueError(
         "Unsupported or corrupt Excel file. The file does not look like a real .xls or .xlsx. "
         "If you renamed the file extension, please re-save it as a true .xlsx or .csv."

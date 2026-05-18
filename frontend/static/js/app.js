@@ -187,50 +187,80 @@ async function _safeJson(response) {
     }
 }
 
+function _xhrUpload(url, formData, onProgress) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url);
+        xhr.upload.addEventListener('progress', e => {
+            if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100));
+        });
+        xhr.addEventListener('load', () => resolve(xhr));
+        xhr.addEventListener('error', () => reject(new Error('Network error during upload.')));
+        xhr.send(formData);
+    });
+}
+
+async function _xhrSafeJson(xhr) {
+    try {
+        return JSON.parse(xhr.responseText);
+    } catch {
+        if (xhr.status === 413 || (xhr.responseText || '').toLowerCase().includes('request entity too large')) {
+            throw new Error('File too large for the server (limit: 4.5 MB).');
+        }
+        throw new Error(`Server error (HTTP ${xhr.status}). Please try again.`);
+    }
+}
+
 function _doSingleUpload(file) {
     if (errorMessage) errorMessage.style.display = 'none';
     window.mergeGapReport = null;
-    setStatus('processing', 'Uploading file…');
+    setStatus('processing', 'Uploading… 0%');
 
     const formData = new FormData();
     formData.append('file', file);
 
-    fetch('/api/upload', { method: 'POST', body: formData })
-        .then(r => _safeJson(r))
-        .then(data => {
-            if (data.success) {
-                uploadedFilepath = data.filepath;
-                batchFileMeta = [{
-                    name: file.name,
-                    rows: data.rows,
-                    start: data.start_date || null,
-                    end: data.end_date || null,
-                }];
-                displayPreview(data);
-                renderBatchFilesPanel();
-                showSection('preview-section');
-                setStatus('idle', 'File uploaded — ' + data.rows.toLocaleString() + ' records');
-            } else {
-                showError(data.error || 'Upload failed');
-                setStatus('error', 'Upload failed');
-            }
-        })
-        .catch(err => {
-            showError('Error uploading file: ' + err.message);
-            setStatus('error', 'Upload error');
-        });
+    _xhrUpload('/api/upload', formData, pct => {
+        if (pct < 100) setStatus('processing', `Uploading… ${pct}%`);
+        else setStatus('processing', 'Processing file on server…');
+    })
+    .then(xhr => _xhrSafeJson(xhr))
+    .then(data => {
+        if (data.success) {
+            uploadedFilepath = data.filepath;
+            batchFileMeta = [{
+                name: file.name,
+                rows: data.rows,
+                start: data.start_date || null,
+                end: data.end_date || null,
+            }];
+            displayPreview(data);
+            renderBatchFilesPanel();
+            showSection('preview-section');
+            setStatus('idle', 'File uploaded — ' + data.rows.toLocaleString() + ' records');
+        } else {
+            showError(data.error || 'Upload failed');
+            setStatus('error', 'Upload failed');
+        }
+    })
+    .catch(err => {
+        showError('Error uploading file: ' + err.message);
+        setStatus('error', 'Upload error');
+    });
 }
 
 function _doMultiUpload(files) {
     if (errorMessage) errorMessage.style.display = 'none';
-    setStatus('processing', `Merging ${files.length} files…`);
+    setStatus('processing', 'Uploading… 0%');
 
     const formData = new FormData();
     files.forEach(f => formData.append('files', f));
 
-    fetch('/api/upload-multi', { method: 'POST', body: formData })
-        .then(r => _safeJson(r))
-        .then(data => {
+    _xhrUpload('/api/upload-multi', formData, pct => {
+        if (pct < 100) setStatus('processing', `Uploading ${files.length} file(s)… ${pct}%`);
+        else setStatus('processing', 'Merging & processing on server…');
+    })
+    .then(xhr => _xhrSafeJson(xhr))
+    .then(data => {
             if (data.success) {
                 uploadedFilepath      = data.filepath;
                 window.mergeGapReport = data.gap_analysis || null;
@@ -279,7 +309,7 @@ async function handleAddMoreFiles(e) {
     if (!newFiles.length) return;
 
     if (errorMessage) errorMessage.style.display = 'none';
-    setStatus('processing', `Adding ${newFiles.length} file(s) to batch…`);
+    setStatus('processing', 'Uploading… 0%');
 
     const formData = new FormData();
     newFiles.forEach(f => formData.append('files', f));
@@ -288,8 +318,11 @@ async function handleAddMoreFiles(e) {
     }
 
     try {
-        const resp = await fetch('/api/upload-multi', { method: 'POST', body: formData });
-        const data = await _safeJson(resp);
+        const xhr = await _xhrUpload('/api/upload-multi', formData, pct => {
+            if (pct < 100) setStatus('processing', `Uploading ${newFiles.length} file(s)… ${pct}%`);
+            else setStatus('processing', 'Merging & processing on server…');
+        });
+        const data = await _xhrSafeJson(xhr);
 
         if (data.success) {
             uploadedFilepath      = data.filepath;
