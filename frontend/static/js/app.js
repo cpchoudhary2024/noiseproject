@@ -175,6 +175,18 @@ function uploadStagedFiles() {
 
 // ── Actual Upload Network Calls ───────────────────────────────────────────────
 
+async function _safeJson(response) {
+    const text = await response.text();
+    try {
+        return JSON.parse(text);
+    } catch {
+        if (response.status === 413 || text.toLowerCase().includes('request entity too large') || text.toLowerCase().includes('payload too large')) {
+            throw new Error('File too large for the server (limit: 4.5 MB). Please split your data into smaller files and upload them separately.');
+        }
+        throw new Error(`Server returned an unexpected response (HTTP ${response.status}). Check your connection and try again.`);
+    }
+}
+
 function _doSingleUpload(file) {
     if (errorMessage) errorMessage.style.display = 'none';
     window.mergeGapReport = null;
@@ -184,7 +196,7 @@ function _doSingleUpload(file) {
     formData.append('file', file);
 
     fetch('/api/upload', { method: 'POST', body: formData })
-        .then(r => r.json())
+        .then(r => _safeJson(r))
         .then(data => {
             if (data.success) {
                 uploadedFilepath = data.filepath;
@@ -217,7 +229,7 @@ function _doMultiUpload(files) {
     files.forEach(f => formData.append('files', f));
 
     fetch('/api/upload-multi', { method: 'POST', body: formData })
-        .then(r => r.json())
+        .then(r => _safeJson(r))
         .then(data => {
             if (data.success) {
                 uploadedFilepath      = data.filepath;
@@ -277,7 +289,7 @@ async function handleAddMoreFiles(e) {
 
     try {
         const resp = await fetch('/api/upload-multi', { method: 'POST', body: formData });
-        const data = await resp.json();
+        const data = await _safeJson(resp);
 
         if (data.success) {
             uploadedFilepath      = data.filepath;
