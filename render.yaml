@@ -2,13 +2,8 @@ services:
   - type: web
     name: noise-analysis-platform
     runtime: python
-    buildCommand: >-
-      apt-get install -y --no-install-recommends
-      libgbm1 libnss3 libatk-bridge2.0-0 libgtk-3-0
-      libx11-xcb1 libxcb-dri3-0 libdrm2 libasound2
-      libxss1 libgconf-2-4 fonts-liberation xdg-utils
-      && pip install -r requirements.txt
-    startCommand: python backend/app.py
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 300 --workers 1 --threads 2 backend.app:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0

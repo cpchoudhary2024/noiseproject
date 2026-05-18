@@ -1,3 +1,8 @@
+import matplotlib
+matplotlib.use('Agg')  # must be set before any pyplot import; safe to call at module level
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -2368,11 +2373,6 @@ class ReportGeneratorV2:
         equivalent charts with matplotlib/Agg. Handles scatter/line, box,
         heatmap, and polar (scatterpolar) trace types.
         """
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        import matplotlib.ticker as mticker
-
         BG   = '#f8f9fa'
         PALETTE = ['#3D5A80', '#EE6C4D', '#98C1D9', '#E0FBFC', '#293241',
                    '#F4A261', '#2A9D8F', '#E9C46A', '#264653', '#A8DADC']

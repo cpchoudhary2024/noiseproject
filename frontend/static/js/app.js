@@ -187,14 +187,24 @@ async function _safeJson(response) {
     }
 }
 
-function _xhrUpload(url, formData, onProgress) {
+function _xhrUpload(url, formData, onProgress, attempt = 1) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', url);
         xhr.upload.addEventListener('progress', e => {
             if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100));
         });
-        xhr.addEventListener('load', () => resolve(xhr));
+        xhr.addEventListener('load', () => {
+            // 502 = server waking from sleep or briefly crashed — retry once after 4 s
+            if (xhr.status === 502 && attempt === 1) {
+                onProgress(-1); // signal caller to show retry message
+                setTimeout(() => {
+                    _xhrUpload(url, formData, onProgress, 2).then(resolve).catch(reject);
+                }, 4000);
+            } else {
+                resolve(xhr);
+            }
+        });
         xhr.addEventListener('error', () => reject(new Error('Network error during upload.')));
         xhr.send(formData);
     });
@@ -220,7 +230,8 @@ function _doSingleUpload(file) {
     formData.append('file', file);
 
     _xhrUpload('/api/upload', formData, pct => {
-        if (pct < 100) setStatus('processing', `Uploading… ${pct}%`);
+        if (pct === -1) setStatus('processing', 'Server waking up — retrying…');
+        else if (pct < 100) setStatus('processing', `Uploading… ${pct}%`);
         else setStatus('processing', 'Processing file on server…');
     })
     .then(xhr => _xhrSafeJson(xhr))
@@ -256,7 +267,8 @@ function _doMultiUpload(files) {
     files.forEach(f => formData.append('files', f));
 
     _xhrUpload('/api/upload-multi', formData, pct => {
-        if (pct < 100) setStatus('processing', `Uploading ${files.length} file(s)… ${pct}%`);
+        if (pct === -1) setStatus('processing', 'Server waking up — retrying…');
+        else if (pct < 100) setStatus('processing', `Uploading ${files.length} file(s)… ${pct}%`);
         else setStatus('processing', 'Merging & processing on server…');
     })
     .then(xhr => _xhrSafeJson(xhr))
@@ -319,7 +331,8 @@ async function handleAddMoreFiles(e) {
 
     try {
         const xhr = await _xhrUpload('/api/upload-multi', formData, pct => {
-            if (pct < 100) setStatus('processing', `Uploading ${newFiles.length} file(s)… ${pct}%`);
+            if (pct === -1) setStatus('processing', 'Server waking up — retrying…');
+            else if (pct < 100) setStatus('processing', `Uploading ${newFiles.length} file(s)… ${pct}%`);
             else setStatus('processing', 'Merging & processing on server…');
         });
         const data = await _xhrSafeJson(xhr);
