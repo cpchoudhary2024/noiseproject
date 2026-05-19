@@ -10,6 +10,8 @@ pinned: false
 
 # Noise Data Analysis Platform
 
+**Live app:** https://cpchoudhary2024-noise-analysis-platform.hf.space
+
 A comprehensive web-based platform for analyzing noise data with ISO 1996 and EPA standards compliance checking, advanced statistics, and detailed reporting capabilities.
 
 ## Features
