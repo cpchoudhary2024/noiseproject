@@ -25,12 +25,28 @@ import io
 import logging
 import threading
 import math
+import uuid
 
 import retention
 
 # Setup logging for cache debugging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
+# ── Server-side progress store ────────────────────────────────────────────────
+# Maps job_id -> {pct: int, msg: str}. Frontend polls /api/progress/<job_id>.
+_progress_store: dict = {}
+_progress_lock = threading.Lock()
+
+def _set_progress(job_id: str, pct: int, msg: str):
+    if not job_id:
+        return
+    with _progress_lock:
+        _progress_store[job_id] = {'pct': int(pct), 'msg': msg}
+        if len(_progress_store) > 200:
+            oldest = list(_progress_store.keys())[:-100]
+            for k in oldest:
+                del _progress_store[k]
 
 
 OLE_XLS_SIGNATURE = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"  # Excel 97-2003 .xls (OLE CF)
@@ -622,53 +638,42 @@ def upload_file():
         filename = secure_filename(datetime.now().strftime("%Y%m%d_%H%M%S_") + file.filename)
         filepath = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], filename))
         file.save(filepath)
-
-        # ── Fast path: read only the first 10 rows for the immediate response ──
-        # The full DataFrame is loaded in a background thread so the HTTP
-        # response returns in seconds instead of 60-90 s for large XLSX files.
+        
+        # Read and validate data
         try:
-            quick_df = _quick_preview_read(filepath)
+            df = read_input_file(filepath)
         except Exception as e:
             os.remove(filepath)
             return jsonify({'error': f'Error reading file: {str(e)}'}), 400
-
-        if quick_df is None or quick_df.empty:
+        
+        if df.empty:
             os.remove(filepath)
-            return jsonify({'error': 'File is empty or has no readable data'}), 400
+            return jsonify({'error': 'File is empty'}), 400
 
-        # Row count from file metadata (fast — no full read needed)
-        row_count = _fast_row_count(filepath) or len(quick_df)
+        _store_cache_entry(filepath, df=df)
 
-        # Date range from the quick sample (start only; end filled in after BG load)
+        # Apply retention after a successful upload to keep disk usage bounded.
+        _run_retention_cleanup(keep_paths=(filepath,))
+
+        # Compute date range for the uploaded file
         start_date = end_date = None
         try:
-            time_cols = [c for c in quick_df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
+            time_cols = [c for c in df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
             if time_cols:
-                ts = pd.to_datetime(quick_df[time_cols[0]], errors='coerce', dayfirst=True).dropna()
+                ts = pd.to_datetime(df[time_cols[0]], errors='coerce', dayfirst=True).dropna()
                 if not ts.empty:
                     start_date = ts.min().isoformat()
+                    end_date = ts.max().isoformat()
         except Exception:
             pass
-
-        # Background thread: load full DF and cache it so Analyze is instant
-        def _bg_load(fp=filepath):
-            try:
-                df_full = read_input_file(fp)
-                _store_cache_entry(fp, df=df_full)
-                _run_retention_cleanup(keep_paths=(fp,))
-                logger.info(f"[BG-LOAD] Cached {len(df_full):,} rows for {fp}")
-            except Exception as bg_err:
-                logger.error(f"[BG-LOAD] Failed for {fp}: {bg_err}")
-
-        threading.Thread(target=_bg_load, daemon=True).start()
 
         return jsonify({
             'success': True,
             'filename': filename,
             'filepath': filepath,
-            'rows': row_count,
-            'columns': quick_df.columns.tolist(),
-            'preview': _sanitize_for_json(quick_df.head(10).to_dict(orient='records')),
+            'rows': len(df),
+            'columns': df.columns.tolist(),
+            'preview': df.head(10).to_dict(orient='records'),
             'start_date': start_date,
             'end_date': end_date,
         })
@@ -681,20 +686,24 @@ def analyze_data():
     try:
         data = request.json
         filepath = (data or {}).get('filepath')
+        job_id   = str((data or {}).get('job_id', '') or '')
+
+        _set_progress(job_id, 5, 'Resolving file…')
 
         if not filepath:
             return jsonify({'error': 'No filepath provided'}), 400
 
         filepath = _resolve_uploaded_filepath(filepath)
-        
+
         if not os.path.exists(filepath):
             return jsonify({
                 'error': 'File not found',
                 'filepath': filepath,
                 'hint': 'Re-upload the file and try again. If the server was restarted, the previous filepath may no longer exist.'
             }), 404
-        
+
         # Read data (cached)
+        _set_progress(job_id, 15, 'Loading data…')
         df = _get_cached_df(filepath)
 
         # Apply temporal filtration if the user defined exclusions / bounds.
@@ -708,20 +717,24 @@ def analyze_data():
         cache_entry = _get_cache_entry(filepath)
         if (not filters) and cache_entry and cache_entry.get('analysis') and cache_entry.get('standards'):
             logger.info(f"[ANALYZE] Using CACHED analysis for {filepath}")
+            _set_progress(job_id, 50, 'Loaded from cache…')
             analysis_results = cache_entry['analysis']
             standards_results = cache_entry['standards']
         else:
             logger.info(f"[ANALYZE] Computing FRESH analysis for {filepath}")
+            _set_progress(job_id, 30, 'Computing statistics…')
             analyzer = NoiseAnalyzer(df)
             analysis_results = analyzer.comprehensive_analysis()
 
+            _set_progress(job_id, 55, 'Checking standards…')
             standards_analyzer = StandardsAnalyzer(df)
             standards_results = standards_analyzer.analyze()
 
             if not filters:
                 _store_cache_entry(filepath, df=df, analysis=analysis_results, standards=standards_results)
-        
+
         # ── Forensic gap analysis ──────────────────────────────────────────────
+        _set_progress(job_id, 65, 'Detecting data gaps…')
         gap_data: dict = {}
         try:
             time_candidates = [c for c in df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
@@ -732,6 +745,7 @@ def analyze_data():
             logger.warning(f"[ANALYZE] Gap detection skipped: {gap_err}")
 
         # ── Compliance matrix check ────────────────────────────────────────────
+        _set_progress(job_id, 75, 'Evaluating compliance…')
         compliance_matrix: list[dict] = []
         try:
             env = analysis_results.get('environmental_metrics', {})
@@ -756,6 +770,7 @@ def analyze_data():
             logger.warning(f"[ANALYZE] Compliance matrix skipped: {cm_err}")
 
         # Plain-English summary — computed from stats, no AI
+        _set_progress(job_id, 88, 'Building health summary…')
         plain_english_summary = ''
         try:
             env_pe = analysis_results.get('environmental_metrics', {})
@@ -794,6 +809,7 @@ def analyze_data():
         except Exception as _pe_err:
             logger.warning(f"[ANALYZE] Plain-English summary failed: {_pe_err}")
 
+        _set_progress(job_id, 100, 'Complete')
         return jsonify({
             'success': True,
             'analysis': analysis_results,
@@ -1060,12 +1076,14 @@ def get_standards_reference():
 @app.route('/api/generate-report', methods=['POST'])
 def generate_report():
     try:
-        # Read data (cached)
         data = request.json
         filepath = (data or {}).get('filepath')
-        report_type = (data or {}).get('report_type') or (data or {}).get('type') or 'comprehensive'
+        report_type   = (data or {}).get('report_type') or (data or {}).get('type') or 'comprehensive'
         report_format = ((data or {}).get('format') or 'pdf').lower()
-        
+        job_id        = str((data or {}).get('job_id', '') or '')
+
+        _set_progress(job_id, 5, 'Resolving file…')
+
         if not filepath:
             return jsonify({'error': 'No filepath provided'}), 400
 
@@ -1077,8 +1095,9 @@ def generate_report():
                 'filepath': filepath,
                 'hint': 'Re-upload the file and try again. If the server was restarted, the previous filepath may no longer exist.'
             }), 404
-        
+
         # Read data (cached) then apply any user-defined temporal filters
+        _set_progress(job_id, 15, 'Loading data…')
         df = _get_cached_df(filepath)
         filters = (data or {}).get('filters')
         if filters:
@@ -1092,12 +1111,16 @@ def generate_report():
         hourly_cached = entry.get('hourly_summary')
 
         if filters or analysis_cached is None or standards_cached is None:
+            _set_progress(job_id, 30, 'Computing statistics…')
             analyzer = NoiseAnalyzer(df)
             analysis_cached = analyzer.comprehensive_analysis()
+            _set_progress(job_id, 45, 'Checking standards…')
             standards_analyzer = StandardsAnalyzer(df)
             standards_cached = standards_analyzer.analyze()
             if not filters:
                 _store_cache_entry(filepath, df=df, analysis=analysis_cached, standards=standards_cached)
+        else:
+            _set_progress(job_id, 45, 'Using cached analysis…')
 
         report_generator = None
         if daily_cached is None or hourly_cached is None:
@@ -1118,16 +1141,13 @@ def generate_report():
                     daily_summary=daily_cached,
                     hourly_summary=hourly_cached,
                 )
-        
+
         # Device ID and merge provenance from the client
         device_id              = str((data or {}).get('device_id', '') or '').strip()
         source_files           = list((data or {}).get('source_files', []) or [])
         merge_gap_report       = (data or {}).get('merge_gap_report') or None
         custom_section_heading = str((data or {}).get('custom_section_heading', '') or '').strip()
         custom_section_body    = str((data or {}).get('custom_section_body', '') or '').strip()
-
-        # Use ReportGeneratorV2 for publication-grade 8-section reports
-        # NOTE: All summaries (daily, hourly) are COMPUTED from uploaded data, NOT loaded from external CSVs
 
         def _make_generator():
             return ReportGeneratorV2(
@@ -1140,6 +1160,7 @@ def generate_report():
                 custom_section_body=custom_section_body,
             )
 
+        _set_progress(job_id, 60, 'Generating document…')
         if report_format == 'docx':
             # Create Word report
             word_gen = WordReportGenerator(
@@ -1169,8 +1190,10 @@ def generate_report():
             mimetype = 'application/pdf'
 
         # Apply retention after generating a report to keep only the newest artifacts.
+        _set_progress(job_id, 95, 'Saving report…')
         _run_retention_cleanup(keep_paths=(filepath, report_path))
 
+        _set_progress(job_id, 100, 'Complete')
         return send_file(report_path, as_attachment=True, download_name=os.path.basename(report_path), mimetype=mimetype)
     
     except Exception as e:
@@ -2391,6 +2414,13 @@ def compare_report():
 
     except Exception as e:
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/progress/<job_id>', methods=['GET'])
+def get_progress(job_id):
+    with _progress_lock:
+        p = _progress_store.get(job_id, {'pct': 0, 'msg': 'Starting…'})
+    return jsonify(p)
 
 
 @app.route('/health', methods=['GET'])

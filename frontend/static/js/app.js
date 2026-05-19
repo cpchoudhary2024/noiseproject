@@ -187,20 +187,19 @@ async function _safeJson(response) {
     }
 }
 
-// Simulated progress ticker for server-side operations with no streaming.
-// Ticks 0→95% with easing; call .done() when the response arrives.
-function _simProgress(label) {
-    let pct = 0;
+// Real progress poller — hits /api/progress/<jobId> every 400 ms and shows
+// the actual percentage the backend has reported at real code checkpoints.
+function _pollProgress(jobId, label) {
     let stopped = false;
-    const id = setInterval(() => {
+    const iv = setInterval(async () => {
         if (stopped) return;
-        const step = pct < 40 ? 3.5 : pct < 70 ? 1.8 : pct < 88 ? 0.6 : 0;
-        if (step > 0) {
-            pct = Math.min(95, pct + step + Math.random() * step * 0.4);
-            setStatus('processing', `${label} ${Math.round(pct)}%`);
-        }
-    }, 250);
-    return { done() { stopped = true; clearInterval(id); } };
+        try {
+            const r = await fetch(`/api/progress/${jobId}`);
+            const d = await r.json();
+            if (!stopped) setStatus('processing', `${label} ${d.pct}%`);
+        } catch { /* network blip — just wait for next tick */ }
+    }, 400);
+    return { done() { stopped = true; clearInterval(iv); } };
 }
 
 // XHR-based upload with real byte-level progress events.
@@ -450,15 +449,17 @@ function runAnalysis() {
         return;
     }
     
+    const _analysisJobId = Math.random().toString(36).slice(2, 10);
     setStatus('processing', 'Running analysis… 0%');
     showSection('analysis-section');
-    const _analysisTicker = _simProgress('Running analysis…');
+    const _analysisTicker = _pollProgress(_analysisJobId, 'Running analysis…');
 
     fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             filepath: uploadedFilepath,
+            job_id: _analysisJobId,
             filters: (currentFilters && (currentFilters.exclusions.length || currentFilters.bound_start || currentFilters.bound_end)) ? currentFilters : null,
         })
     })
@@ -2205,8 +2206,9 @@ function generateReport(reportType, format = 'html') {
     const customSectionHeading = (document.getElementById('customSectionHeading')?.value || '').trim();
     const customSectionBody    = (document.getElementById('customSectionBody')?.value || '').trim();
 
+    const _reportJobId = Math.random().toString(36).slice(2, 10);
     setStatus('processing', `Generating ${format.toUpperCase()} report… 0%`);
-    const _reportTicker = _simProgress(`Generating ${format.toUpperCase()} report…`);
+    const _reportTicker = _pollProgress(_reportJobId, `Generating ${format.toUpperCase()} report…`);
 
     fetch('/api/generate-report', {
         method: 'POST',
@@ -2215,6 +2217,7 @@ function generateReport(reportType, format = 'html') {
             filepath: uploadedFilepath,
             report_type: reportType,
             format: format,
+            job_id: _reportJobId,
             filters: (currentFilters && (currentFilters.exclusions.length || currentFilters.bound_start || currentFilters.bound_end)) ? currentFilters : null,
             device_id: deviceId,
             source_files: sourceFiles,
