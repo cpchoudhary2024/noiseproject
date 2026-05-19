@@ -2125,7 +2125,29 @@ function displayPlainEnglishSummary(text) {
         card.style.background      = '#F0FDF4';
     }
 
-    textEl.textContent = text;
+    // Render structured paragraphs and bullets from \n\n-separated text
+    const htmlParts = [];
+    for (const para of text.split('\n\n')) {
+        const lines = para.split('\n');
+        const bulletLines = lines.filter(l => l.trim().startsWith('•'));
+        const headerLines = lines.filter(l => !l.trim().startsWith('•'));
+        const headerText  = headerLines.join(' ').trim();
+        if (headerText) {
+            const isStrong = headerText.startsWith('WHO ') || headerText.startsWith('Overall Concern');
+            const escaped  = headerText.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            htmlParts.push(isStrong
+                ? `<p style="margin:8px 0 4px"><strong>${escaped}</strong></p>`
+                : `<p style="margin:8px 0 4px">${escaped}</p>`);
+        }
+        if (bulletLines.length) {
+            const items = bulletLines.map(l => {
+                const content = l.trim().replace(/^•\s*/, '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                return `<li style="margin-bottom:4px">${content}</li>`;
+            }).join('');
+            htmlParts.push(`<ul style="margin:4px 0 8px 20px;padding:0">${items}</ul>`);
+        }
+    }
+    textEl.innerHTML = htmlParts.join('\n');
     card.style.display = 'block';
 }
 

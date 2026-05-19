@@ -100,16 +100,13 @@ class ReportGeneratorV2:
         n_days: int = 0,
     ) -> str:
         """
-        Generate a one-paragraph plain-English summary from acoustic statistics.
+        Returns a structured multi-paragraph plain-English summary.
 
-        All thresholds are sourced exclusively from:
-          - WHO Environmental Noise Guidelines for the European Region (2018), Tables 1–3
-            https://iris.who.int/bitstream/handle/10665/279952/9789289053563-eng.pdf
-          - WHO Guidelines for Community Noise (Berglund et al., 1999)
+        Sections are separated by double newlines (\\n\\n).
+        Bullet points use the '  • ' prefix so renderers can convert them to <li>.
 
-        WHO 2018 strong-recommendation thresholds used:
-          Road traffic: Lden ≤ 53 dB(A), Lnight ≤ 45 dB(A)
-          LOAEL (first sleep effects): Lnight = 40 dB(A)
+        All thresholds sourced from WHO Environmental Noise Guidelines 2018 (Tables 1-3)
+        and WHO Guidelines for Community Noise (Berglund et al., 1999).
         """
         def _f(v, d=1):
             try:
@@ -117,245 +114,253 @@ class ReportGeneratorV2:
             except Exception:
                 return None
 
-        # ── 1. Noise level context (everyday analogies) ──────────────────────
-        # Analogies based on ISO 226 reference levels and established acoustic
-        # literature (Berglund et al. 1999, WHO 2018 explanatory notes)
-        try:
-            laeq_v = float(laeq) if laeq is not None and np.isfinite(float(laeq)) else None
-        except Exception:
-            laeq_v = None
+        def _v(val):
+            try:
+                return float(val) if val is not None and np.isfinite(float(val)) else None
+            except Exception:
+                return None
 
+        laeq_v = _v(laeq)
         if laeq_v is None:
-            return "A plain-English summary could not be generated because the average noise level (LAeq) could not be computed — check that the dataset contains valid numeric measurements."
+            return (
+                "A plain-English summary could not be generated because the average noise level "
+                "(LAeq) could not be computed. Please check that the dataset contains valid "
+                "numeric measurements."
+            )
 
-        if laeq_v < 40:
-            level_desc = "very quiet — comparable to a rural area at night or a library reading room"
-        elif laeq_v < 50:
-            level_desc = "quiet — comparable to a calm residential street at night or soft rainfall"
-        elif laeq_v < 55:
-            level_desc = "moderate — comparable to a typical residential neighbourhood during the day"
-        elif laeq_v < 65:
-            level_desc = "elevated — comparable to a busy urban street or a bustling café"
-        elif laeq_v < 75:
-            level_desc = "high — comparable to heavy road traffic or a passing freight train"
-        else:
-            level_desc = "very high — comparable to a construction zone or an expressway at close range"
-
-        # ── 2. Date / duration context ───────────────────────────────────────
+        # ── 1. Opening paragraph ─────────────────────────────────────────────
         date_ctx = ""
         if start_date and end_date:
             date_ctx = f" from {start_date} to {end_date}"
         elif duration_label:
             date_ctx = f" over {duration_label}"
 
-        day_word = f"{n_days} day{'s' if n_days != 1 else ''}" if n_days > 0 else duration_label or "the measurement period"
+        day_word = (f"{n_days} day{'s' if n_days != 1 else ''}" if n_days > 0
+                    else duration_label or "the measurement period")
 
         completeness_note = ""
         if data_completeness_pct is not None:
             try:
                 cp = float(data_completeness_pct)
                 if cp < 90:
-                    completeness_note = f" Data completeness was {cp:.0f}% — some gaps exist and averages may slightly underestimate or overestimate true exposure."
+                    completeness_note = (
+                        f" Data completeness was {cp:.0f}%, meaning gaps exist in the record; "
+                        f"averages may slightly under- or over-estimate true exposure."
+                    )
                 else:
                     completeness_note = f" Data completeness was {cp:.0f}%."
             except Exception:
                 pass
 
-        # ── 3. Day / night context ───────────────────────────────────────────
-        # Note on time periods:
-        # WHO Lden uses three sub-periods: day 07:00–19:00, evening 19:00–23:00 (+5 dB penalty),
-        # night 23:00–07:00 (+10 dB penalty) — per EU Directive 2002/49/EC and WHO 2018.
-        # WHO Lnight covers 23:00–07:00.
-        # Maryland COMAR uses daytime 07:00–22:00 / nighttime 22:00–07:00.
-        # The LAeq_day / LAeq_night values here use Maryland's 07:00–22:00 split.
-        # WHO compliance in section 4 uses correctly-computed Lden and Lnight.
-        day_night_ctx = ""
+        para1 = (
+            f"This dataset covers {day_word} of continuous outdoor noise monitoring{date_ctx}."
+            f"{completeness_note}"
+        )
+
+        # ── 2. Noise level paragraph ─────────────────────────────────────────
+        # Level labels and analogies from ISO 226 reference levels and
+        # Berglund et al. (1999) / WHO 2018 explanatory notes.
+        if laeq_v < 40:
+            level_label   = "very quiet"
+            level_analogy = "comparable to a rural area at night or a library reading room"
+        elif laeq_v < 50:
+            level_label   = "quiet"
+            level_analogy = "comparable to a calm residential street at night or soft rainfall"
+        elif laeq_v < 55:
+            level_label   = "moderate"
+            level_analogy = "comparable to a typical residential neighbourhood during the day"
+        elif laeq_v < 65:
+            level_label   = "elevated"
+            level_analogy = "comparable to a busy urban street or a bustling café"
+        elif laeq_v < 75:
+            level_label   = "high"
+            level_analogy = "comparable to heavy road traffic or a passing freight train"
+        else:
+            level_label   = "very high"
+            level_analogy = "comparable to a construction zone or an expressway at close range"
+
+        level_sentence = (
+            f"The overall 24-hour energy-average level (LAeq) was {_f(laeq_v)} dB(A), "
+            f"placing the acoustic environment in the {level_label} range, {level_analogy}."
+        )
+
+        # Day / night breakdown — written as separate sentences, no em-hyphens
+        # Time periods follow Maryland COMAR (day 07:00-22:00, night 22:00-07:00).
+        day_night_sentence = ""
         try:
-            if laeq_day is not None and laeq_night is not None:
-                dv = float(laeq_day)
-                nv = float(laeq_night)
-                if np.isfinite(dv) and np.isfinite(nv):
-                    diff = dv - nv
-                    if diff > 5:
-                        day_night_ctx = (
-                            f" Daytime levels (07:00–22:00, Maryland COMAR period) averaged {_f(dv)} dB(A) and "
-                            f"nighttime levels (22:00–07:00) averaged {_f(nv)} dB(A) — a {_f(abs(diff))} dB "
-                            f"difference, indicating activity-driven or traffic-related noise."
-                        )
-                    elif diff < -3:
-                        day_night_ctx = (
-                            f" Daytime levels (07:00–22:00) averaged {_f(dv)} dB(A) and nighttime levels "
-                            f"(22:00–07:00) averaged {_f(nv)} dB(A) — unusually, nighttime is louder than "
-                            f"daytime, suggesting a nocturnal noise source."
-                        )
-                    else:
-                        day_night_ctx = (
-                            f" Daytime levels (07:00–22:00) averaged {_f(dv)} dB(A) and nighttime levels "
-                            f"(22:00–07:00) averaged {_f(nv)} dB(A) — similar day and night levels suggest "
-                            f"a relatively constant noise source."
-                        )
+            dv = _v(laeq_day)
+            nv = _v(laeq_night)
+            if dv is not None and nv is not None:
+                diff = dv - nv
+                if diff > 5:
+                    day_night_sentence = (
+                        f" Daytime levels (07:00–22:00) averaged {_f(dv)} dB(A) and nighttime "
+                        f"levels (22:00–07:00) averaged {_f(nv)} dB(A). The {_f(abs(diff))} dB "
+                        f"day-to-night difference is consistent with activity-driven or "
+                        f"traffic-related noise sources."
+                    )
+                elif diff < -3:
+                    day_night_sentence = (
+                        f" Daytime levels (07:00–22:00) averaged {_f(dv)} dB(A) and nighttime "
+                        f"levels (22:00–07:00) averaged {_f(nv)} dB(A). Nighttime is louder than "
+                        f"daytime by {_f(abs(diff))} dB, which suggests a nocturnal noise source."
+                    )
+                else:
+                    day_night_sentence = (
+                        f" Daytime levels (07:00–22:00) averaged {_f(dv)} dB(A) and nighttime "
+                        f"levels (22:00–07:00) averaged {_f(nv)} dB(A). The similar day and night "
+                        f"readings are consistent with a continuous or steady-state noise source."
+                    )
         except Exception:
             pass
 
-        # ── 4. WHO 2018 compliance ─────────────────────────────────────────────
-        # WHO 2018 road-traffic strong recommendation: Lden ≤ 53 dB(A), Lnight ≤ 45 dB(A)
-        # WHO 2018 LOAEL (first adverse sleep effect): Lnight = 40 dB(A)
+        peak_sentence = ""
+        if _v(laeq_max) is not None:
+            peak_sentence = f" The highest single recorded level was {_f(_v(laeq_max))} dB(A)."
+
+        para2 = level_sentence + day_night_sentence + peak_sentence
+
+        # ── 3. Variability paragraph ─────────────────────────────────────────
+        para3 = ""
+        try:
+            l10_v = _v(l10)
+            l90_v = _v(l90)
+            if l10_v is not None and l90_v is not None:
+                spread = l10_v - l90_v
+                if spread > 20:
+                    para3 = (
+                        f"The noise environment was highly variable. Levels exceeded 10% of the "
+                        f"time (L10 = {_f(l10_v)} dB(A)) were {_f(spread)} dB above the quiet-hour "
+                        f"background (L90 = {_f(l90_v)} dB(A)), pointing to frequent loud transient "
+                        f"events such as passing vehicles or heavy machinery."
+                    )
+                elif spread > 12:
+                    para3 = (
+                        f"The noise environment showed moderate variability "
+                        f"(L10 = {_f(l10_v)} dB(A), L90 = {_f(l90_v)} dB(A), spread = {_f(spread)} dB), "
+                        f"suggesting intermittent noise sources alongside a steady background level."
+                    )
+                else:
+                    para3 = (
+                        f"The noise environment was relatively stable, with an L10-to-L90 spread "
+                        f"of only {_f(spread)} dB (L10 = {_f(l10_v)} dB(A), L90 = {_f(l90_v)} dB(A)), "
+                        f"consistent with a continuous or steady noise source."
+                    )
+        except Exception:
+            pass
+
+        # ── 4. WHO compliance bullet points ─────────────────────────────────
         WHO_LDEN_LIMIT   = 53.0   # WHO 2018, Table 1
         WHO_LNIGHT_LIMIT = 45.0   # WHO 2018, Table 1
         WHO_LOAEL_NIGHT  = 40.0   # WHO 2018, Section 4.1
 
-        compliance_parts = []
         concern_level = "LOW"
+        bullets = []
 
-        try:
-            if lden is not None and np.isfinite(float(lden)):
-                lden_v = float(lden)
-                if lden_v > WHO_LDEN_LIMIT:
-                    excess = lden_v - WHO_LDEN_LIMIT
-                    compliance_parts.append(
-                        f"The 24-hour weighted average (Lden) of {_f(lden_v)} dB(A) "
-                        f"exceeds the WHO 2018 road-traffic health guideline of {WHO_LDEN_LIMIT} dB(A) by {_f(excess)} dB"
-                    )
-                    concern_level = "HIGH" if excess >= 8 else "MODERATE-HIGH"
-                else:
-                    compliance_parts.append(
-                        f"The 24-hour weighted average (Lden) of {_f(lden_v)} dB(A) "
-                        f"is within the WHO 2018 road-traffic health guideline of {WHO_LDEN_LIMIT} dB(A)"
-                    )
-        except Exception:
-            pass
+        lden_v = _v(lden)
+        if lden_v is not None:
+            if lden_v > WHO_LDEN_LIMIT:
+                excess = lden_v - WHO_LDEN_LIMIT
+                bullets.append(
+                    f"24-hour weighted average (Lden): {_f(lden_v)} dB(A). "
+                    f"Exceeds the WHO 2018 road-traffic guideline of {WHO_LDEN_LIMIT} dB(A) "
+                    f"by {_f(excess)} dB."
+                )
+                concern_level = "HIGH" if excess >= 8 else "MODERATE-HIGH"
+            else:
+                bullets.append(
+                    f"24-hour weighted average (Lden): {_f(lden_v)} dB(A). "
+                    f"Within the WHO 2018 road-traffic guideline of {WHO_LDEN_LIMIT} dB(A)."
+                )
 
-        try:
-            if lnight is not None and np.isfinite(float(lnight)):
-                lnight_v = float(lnight)
-                if lnight_v > WHO_LNIGHT_LIMIT:
-                    excess = lnight_v - WHO_LNIGHT_LIMIT
-                    compliance_parts.append(
-                        f"the nighttime level (Lnight) of {_f(lnight_v)} dB(A) "
-                        f"exceeds the WHO 2018 sleep-protection limit of {WHO_LNIGHT_LIMIT} dB(A) by {_f(excess)} dB"
-                    )
-                    if concern_level == "LOW":
-                        concern_level = "MODERATE-HIGH"
-                    elif concern_level == "MODERATE":
-                        concern_level = "HIGH"
-                elif lnight_v > WHO_LOAEL_NIGHT:
-                    compliance_parts.append(
-                        f"the nighttime level (Lnight) of {_f(lnight_v)} dB(A) "
-                        f"is within the WHO 2018 limit of {WHO_LNIGHT_LIMIT} dB(A) but above the WHO "
-                        f"lowest-observed-adverse-effect level (LOAEL) of {WHO_LOAEL_NIGHT} dB(A), "
-                        f"at which initial sleep movement effects begin"
-                    )
-                    if concern_level == "LOW":
-                        concern_level = "MODERATE"
-                else:
-                    compliance_parts.append(
-                        f"the nighttime level (Lnight) of {_f(lnight_v)} dB(A) "
-                        f"is below the WHO 2018 LOAEL of {WHO_LOAEL_NIGHT} dB(A) — no sleep effects expected"
-                    )
-        except Exception:
-            pass
+        lnight_v = _v(lnight)
+        if lnight_v is not None:
+            if lnight_v > WHO_LNIGHT_LIMIT:
+                excess = lnight_v - WHO_LNIGHT_LIMIT
+                bullets.append(
+                    f"Nighttime level (Lnight): {_f(lnight_v)} dB(A). "
+                    f"Exceeds the WHO 2018 sleep-protection limit of {WHO_LNIGHT_LIMIT} dB(A) "
+                    f"by {_f(excess)} dB."
+                )
+                if concern_level == "LOW":
+                    concern_level = "MODERATE-HIGH"
+            elif lnight_v > WHO_LOAEL_NIGHT:
+                bullets.append(
+                    f"Nighttime level (Lnight): {_f(lnight_v)} dB(A). "
+                    f"Within the WHO 2018 limit of {WHO_LNIGHT_LIMIT} dB(A) but above the "
+                    f"lowest-observed-adverse-effect level (LOAEL) of {WHO_LOAEL_NIGHT} dB(A), "
+                    f"at which initial sleep disturbance effects begin."
+                )
+                if concern_level == "LOW":
+                    concern_level = "MODERATE"
+            else:
+                bullets.append(
+                    f"Nighttime level (Lnight): {_f(lnight_v)} dB(A). "
+                    f"Below the WHO 2018 LOAEL of {WHO_LOAEL_NIGHT} dB(A). "
+                    f"No sleep effects are expected at this level."
+                )
 
-        # Fallback when Lden/Lnight not available — use LAeq as approximation with caveat
-        if not compliance_parts:
+        if not bullets:
             if laeq_v > 65:
                 concern_level = "HIGH"
-                compliance_parts.append(
-                    f"the average noise level of {_f(laeq_v)} dB(A) suggests exceedance of WHO health guidelines "
-                    f"(Lden/Lnight metrics were not computable — likely no timestamp data available)"
+                bullets.append(
+                    f"Average level of {_f(laeq_v)} dB(A) suggests likely exceedance of WHO health "
+                    f"guidelines. Note: Lden/Lnight could not be computed as no timestamp data was available."
                 )
             elif laeq_v > 53:
                 concern_level = "MODERATE"
-                compliance_parts.append(
-                    f"the average noise level of {_f(laeq_v)} dB(A) is in a range that may exceed WHO Lden guidelines "
-                    f"(Lden/Lnight metrics were not computable from this dataset)"
+                bullets.append(
+                    f"Average level of {_f(laeq_v)} dB(A) falls in a range that may exceed WHO Lden "
+                    f"guidelines. Note: Lden/Lnight could not be computed from this dataset."
                 )
             else:
                 concern_level = "LOW"
-                compliance_parts.append(
-                    f"the average noise level of {_f(laeq_v)} dB(A) is below the WHO Lden threshold of 53 dB(A)"
+                bullets.append(
+                    f"Average level of {_f(laeq_v)} dB(A) is below the WHO Lden "
+                    f"threshold of {WHO_LDEN_LIMIT} dB(A)."
                 )
 
-        # Normalise concern level
-        if concern_level in ("MODERATE-HIGH",):
+        if concern_level == "MODERATE-HIGH":
             concern_level = "HIGH"
 
-        # ── 5. Variability note ───────────────────────────────────────────────
-        variability_note = ""
-        try:
-            if l10 is not None and l90 is not None:
-                l10_v = float(l10)
-                l90_v = float(l90)
-                if np.isfinite(l10_v) and np.isfinite(l90_v):
-                    spread = l10_v - l90_v
-                    if spread > 20:
-                        variability_note = (
-                            f" The noise environment is highly variable: levels exceeded 10% of the time (L10 = {_f(l10_v)} dB(A)) "
-                            f"were {_f(spread)} dB higher than the background level (L90 = {_f(l90_v)} dB(A)), "
-                            f"indicating frequent loud transient events such as passing vehicles or machinery."
-                        )
-                    elif spread > 12:
-                        variability_note = (
-                            f" Moderate variability was observed (L10 = {_f(l10_v)} dB(A), L90 = {_f(l90_v)} dB(A), "
-                            f"spread = {_f(spread)} dB), suggesting intermittent noise sources alongside a background level."
-                        )
-                    else:
-                        variability_note = (
-                            f" The noise environment is relatively stable (L10–L90 spread = {_f(spread)} dB), "
-                            f"consistent with a continuous or steady noise source."
-                        )
-        except Exception:
-            pass
+        bullet_lines = "\n".join(f"  • {b}" for b in bullets)
+        para4 = f"WHO 2018 Health Guideline Compliance:\n{bullet_lines}"
 
-        # ── 6. Peak note ─────────────────────────────────────────────────────
-        peak_note = ""
-        try:
-            if laeq_max is not None and np.isfinite(float(laeq_max)):
-                peak_note = f" The highest single recorded level was {_f(float(laeq_max))} dB(A)."
-        except Exception:
-            pass
-
-        # ── 7. Concern-level recommendation ──────────────────────────────────
+        # ── 5. Concern-level paragraph ───────────────────────────────────────
         concern_map = {
             "LOW": (
-                "LOW",
                 "The acoustic environment is generally within WHO health-based guidelines. "
                 "No immediate action is indicated, but periodic re-monitoring is advisable."
             ),
             "MODERATE": (
-                "MODERATE",
-                "Noise levels are within WHO guidelines but above the LOAEL for nighttime sleep effects. "
-                "Continued monitoring is recommended, particularly for sensitive occupants such as children or elderly residents."
+                "Noise levels are within WHO guidelines but above the LOAEL for nighttime sleep "
+                "effects. Continued monitoring is recommended, particularly for sensitive occupants "
+                "such as children or elderly residents."
             ),
             "HIGH": (
-                "HIGH",
-                "WHO 2018 health-based guidelines are exceeded. Based on WHO evidence, prolonged exposure at this level "
-                "is associated with increased risk of cardiovascular effects (hypertension, ischaemic heart disease) "
-                "and impaired sleep quality. Professional acoustic assessment and noise-reduction measures are recommended."
+                "WHO 2018 health-based guidelines are exceeded. Based on WHO evidence, prolonged "
+                "exposure at these levels is associated with increased risk of cardiovascular effects "
+                "(hypertension, ischaemic heart disease) and impaired sleep quality. Professional "
+                "acoustic assessment and noise-reduction measures are recommended."
             ),
             "SERIOUS": (
-                "SERIOUS",
-                "Noise levels significantly exceed WHO guidelines. WHO 2018 identifies strong cardiovascular and "
-                "sleep health risks at these levels. Immediate professional acoustic assessment is strongly recommended."
+                "Noise levels significantly exceed WHO guidelines. WHO 2018 identifies strong "
+                "cardiovascular and sleep health risks at these levels. Immediate professional "
+                "acoustic assessment is strongly recommended."
             ),
         }
-
         if concern_level not in concern_map:
             concern_level = "HIGH" if laeq_v > 55 else "MODERATE"
 
-        concern_tag, concern_rec = concern_map[concern_level]
+        para5 = f"Overall Concern Level: {concern_level}. {concern_map[concern_level]}"
 
-        # ── Assemble paragraph ───────────────────────────────────────────────
-        compliance_sentence = "; ".join(compliance_parts) + "."
-        compliance_sentence = compliance_sentence[:1].upper() + compliance_sentence[1:]
-
-        summary = (
-            f"This dataset captures {day_word} of continuous outdoor noise monitoring{date_ctx}.{completeness_note} "
-            f"The overall energy-average noise level (LAeq) was {_f(laeq_v)} dB(A) — {level_desc}.{day_night_ctx}"
-            f"{variability_note}{peak_note} "
-            f"{compliance_sentence} "
-            f"Overall concern level: {concern_tag}. {concern_rec}"
-        )
-        return " ".join(summary.split())
+        # ── Assemble with paragraph separators ──────────────────────────────
+        parts = [para1, para2]
+        if para3:
+            parts.append(para3)
+        parts.append(para4)
+        parts.append(para5)
+        return "\n\n".join(parts)
 
     def _compute_summaries(self):
         """
@@ -555,9 +560,10 @@ class ReportGeneratorV2:
         # Concern level colour for summary box
         concern_color = '#1e3a5f'
         concern_bg    = '#EFF6FF'
-        if 'concern level: HIGH' in summary_text or 'concern level: SERIOUS' in summary_text:
+        _st_lower = summary_text.lower()
+        if 'concern level: high' in _st_lower or 'concern level: serious' in _st_lower:
             concern_color = '#991b1b'; concern_bg = '#FEF2F2'
-        elif 'concern level: MODERATE' in summary_text:
+        elif 'concern level: moderate' in _st_lower:
             concern_color = '#92400e'; concern_bg = '#FFFBEB'
 
         # Compliance results for table
@@ -579,6 +585,28 @@ class ReportGeneratorV2:
 
         def _esc(s):
             return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+        def _summary_to_html(text: str) -> str:
+            """Convert the structured summary string to HTML paragraphs and bullet lists."""
+            html_parts = []
+            for para in text.split('\n\n'):
+                lines = para.split('\n')
+                bullet_lines = [l for l in lines if l.strip().startswith('•')]
+                header_lines = [l for l in lines if not l.strip().startswith('•')]
+                header_text  = ' '.join(header_lines).strip()
+                if header_text:
+                    # Section titles (WHO compliance, Overall Concern) → bold
+                    if header_text.startswith('WHO ') or header_text.startswith('Overall Concern'):
+                        html_parts.append(f"<p style='margin:8px 0 4px'><strong>{_esc(header_text)}</strong></p>")
+                    else:
+                        html_parts.append(f"<p style='margin:8px 0 4px'>{_esc(header_text)}</p>")
+                if bullet_lines:
+                    items = ''.join(
+                        f"<li style='margin-bottom:4px'>{_esc(l.strip().lstrip('•').strip())}</li>"
+                        for l in bullet_lines
+                    )
+                    html_parts.append(f"<ul style='margin:4px 0 8px 20px;padding:0'>{items}</ul>")
+            return '\n'.join(html_parts)
 
         # ── Compliance table rows HTML ──
         comp_rows_html = ""
@@ -710,7 +738,7 @@ class ReportGeneratorV2:
             "    <div class='card'>",
             "      <h2>Section 1: Non-Technical Summary — Noise Exposure &amp; Health Assessment</h2>",
             f"      <div class='summary-box' style='background:{concern_bg};border:1px solid {concern_color};color:#1f2937'>",
-            f"        {_esc(summary_text)}",
+            f"        {_summary_to_html(summary_text)}",
             "      </div>",
             "    </div>",
 
@@ -756,6 +784,11 @@ class ReportGeneratorV2:
             "      </table>",
             "    </div>",
         ]
+
+        # ── Top Peak Noise Events ──
+        _noise_events_html = self._top_noise_events_html(ts, leq_col)
+        if _noise_events_html:
+            html_parts.append(_noise_events_html)
 
         # ── Optional custom section ──
         if self.custom_section_heading or self.custom_section_body:
@@ -1130,24 +1163,232 @@ class ReportGeneratorV2:
             n_days=n_days_v,
         )
 
+        # Determine box colour by concern level
+        _sl = summary_text.lower()
+        if 'concern level: high' in _sl or 'concern level: serious' in _sl:
+            _box_bg, _box_border = '#FEF2F2', '#991b1b'
+        elif 'concern level: moderate' in _sl:
+            _box_bg, _box_border = '#FFFBEB', '#92400e'
+        else:
+            _box_bg, _box_border = '#EFF6FF', '#3D5A80'
+
         summary_box_style = ParagraphStyle(
             'SummaryBox',
             parent=styles['BodyText'],
             fontSize=9,
             leading=13,
-            backColor=colors.HexColor('#EFF6FF'),
+            backColor=colors.HexColor(_box_bg),
             borderPadding=(8, 10, 8, 10),
-            borderColor=colors.HexColor('#3D5A80'),
+            borderColor=colors.HexColor(_box_border),
             borderWidth=1,
             borderRadius=4,
         )
-        story.append(Paragraph("<b>Non-Technical Summary: Noise Exposure &amp; Health Assessment</b>", styles['h2']))
-        story.append(Paragraph(escape(summary_text), summary_box_style))
+        bullet_style = ParagraphStyle(
+            'SummaryBullet',
+            parent=summary_box_style,
+            leftIndent=12,
+            bulletIndent=0,
+        )
+
+        story.append(Paragraph(
+            "<b>Non-Technical Summary: Noise Exposure &amp; Health Assessment</b>", styles['h2']
+        ))
+
+        # Render each structured paragraph as separate ReportLab Paragraphs
+        for para_block in summary_text.split('\n\n'):
+            lines = para_block.split('\n')
+            header_lines  = [l for l in lines if not l.strip().startswith('•')]
+            bullet_lines  = [l for l in lines if l.strip().startswith('•')]
+            header_joined = ' '.join(header_lines).strip()
+            if header_joined:
+                if header_joined.startswith('WHO ') or header_joined.startswith('Overall Concern'):
+                    story.append(Paragraph(f"<b>{escape(header_joined)}</b>", summary_box_style))
+                else:
+                    story.append(Paragraph(escape(header_joined), summary_box_style))
+            for bl in bullet_lines:
+                text_part = bl.strip().lstrip('•').strip()
+                story.append(Paragraph(f"• {escape(text_part)}", bullet_style))
+
         story.append(Spacer(1, 0.12 * inch))
+
+        # ── Top 10 Peak Noise Events ──────────────────────────────────────────
+        self._add_top_noise_events(story, styles, ts=ts, leq_col=leq_col)
 
     # ============================================================
     # SECTION 2: DATA QUALITY & COMPLETENESS
     # ============================================================
+
+    # ── Top 10 Peak Noise Events ──────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_top_noise_events(ts: pd.Series, leq: pd.Series, top_n: int = 10, gap_minutes: int = 5) -> list[dict]:
+        """Detect discrete noise events and return the top N by peak level.
+
+        An event is a contiguous run of readings at or above the 90th percentile
+        (L10 threshold). Events separated by >= gap_minutes of quiet are treated
+        as distinct. Returns a list of dicts sorted by peak level descending.
+        """
+        ts   = ts.dropna()
+        leq  = leq.reindex(ts.index).dropna()
+        ts   = ts.reindex(leq.index)
+        if len(ts) < 2:
+            return []
+
+        df_tmp = pd.DataFrame({'ts': ts.values, 'leq': leq.values}).sort_values('ts').reset_index(drop=True)
+
+        threshold = float(np.percentile(df_tmp['leq'], 90))
+        above = df_tmp['leq'] >= threshold
+        if not above.any():
+            return []
+
+        gap = pd.Timedelta(minutes=gap_minutes)
+        events, cur_start, cur_levels, cur_times = [], None, [], []
+
+        for i, row in df_tmp.iterrows():
+            in_event = cur_start is not None
+            if above.iloc[i]:
+                if not in_event:
+                    cur_start, cur_levels, cur_times = row['ts'], [row['leq']], [row['ts']]
+                else:
+                    time_since_last = row['ts'] - cur_times[-1]
+                    if time_since_last > gap:
+                        events.append({'start': cur_start, 'end': cur_times[-1],
+                                       'peak': max(cur_levels),
+                                       'duration_s': (cur_times[-1] - cur_start).total_seconds()})
+                        cur_start, cur_levels, cur_times = row['ts'], [row['leq']], [row['ts']]
+                    else:
+                        cur_levels.append(row['leq'])
+                        cur_times.append(row['ts'])
+            else:
+                if in_event:
+                    time_since_last = row['ts'] - cur_times[-1]
+                    if time_since_last > gap:
+                        events.append({'start': cur_start, 'end': cur_times[-1],
+                                       'peak': max(cur_levels),
+                                       'duration_s': (cur_times[-1] - cur_start).total_seconds()})
+                        cur_start, cur_levels, cur_times = None, [], []
+
+        if cur_start is not None and cur_times:
+            events.append({'start': cur_start, 'end': cur_times[-1],
+                           'peak': max(cur_levels),
+                           'duration_s': (cur_times[-1] - cur_start).total_seconds()})
+
+        events.sort(key=lambda e: e['peak'], reverse=True)
+        return events[:top_n]
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        seconds = int(round(seconds))
+        if seconds < 60:
+            return f"{seconds}s" if seconds > 0 else "<1s"
+        m, s = divmod(seconds, 60)
+        h, m = divmod(m, 60)
+        if h > 0:
+            return f"{h}h {m:02d}m"
+        return f"{m}m {s:02d}s"
+
+    def _add_top_noise_events(self, story, styles, *, ts: pd.Series, leq_col: str | None):
+        from reportlab.platypus import Table, TableStyle
+        from reportlab.lib import colors as rl_colors
+
+        leq = self._get_numeric_series(leq_col)
+        if ts.dropna().empty or leq.dropna().empty:
+            return
+
+        events = self._compute_top_noise_events(ts, leq)
+        if not events:
+            return
+
+        story.append(Spacer(1, 0.1 * inch))
+        story.append(Paragraph("<b>Top Peak Noise Events</b>", styles['h2']))
+        story.append(Paragraph(
+            "The table below lists the highest-level discrete noise events detected during the "
+            "monitoring period. An event is a contiguous period where levels exceeded the 90th "
+            "percentile (L10 threshold), with events separated by at least 5 minutes of quiet. "
+            "Duration is shown only for events lasting more than 60 seconds.",
+            styles['BodyText']
+        ))
+        story.append(Spacer(1, 0.06 * inch))
+
+        header = ['#', 'Date', 'Day', 'Start Time', 'Peak Level', 'Duration']
+        rows   = [header]
+        for i, ev in enumerate(events, 1):
+            dt_start  = pd.Timestamp(ev['start'])
+            dur_s     = ev['duration_s']
+            dur_str   = self._fmt_duration(dur_s) if dur_s >= 60 else 'Brief (<1 min)'
+            rows.append([
+                str(i),
+                dt_start.strftime('%d %b %Y'),
+                dt_start.strftime('%A'),
+                dt_start.strftime('%H:%M:%S'),
+                f"{ev['peak']:.1f} dB(A)",
+                dur_str,
+            ])
+
+        col_widths = [0.3*inch, 1.0*inch, 0.9*inch, 0.9*inch, 1.0*inch, 0.9*inch]
+        tbl = Table(rows, colWidths=col_widths)
+        tbl.setStyle(TableStyle([
+            ('BACKGROUND',  (0, 0), (-1, 0), rl_colors.HexColor('#1e3a5f')),
+            ('TEXTCOLOR',   (0, 0), (-1, 0), rl_colors.white),
+            ('FONTNAME',    (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE',    (0, 0), (-1, -1), 8),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor('#F0F4F8')]),
+            ('GRID',        (0, 0), (-1, -1), 0.4, rl_colors.HexColor('#CBD5E1')),
+            ('ALIGN',       (0, 0), (0, -1), 'CENTER'),
+            ('ALIGN',       (4, 0), (5, -1), 'CENTER'),
+            ('TOPPADDING',  (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 0.15 * inch))
+
+    # ── Top noise events for HTML report ──────────────────────────────────────
+
+    def _top_noise_events_html(self, ts: pd.Series, leq_col: str | None) -> str:
+        """Return an HTML table of top noise events for the HTML report, or '' if unavailable."""
+        leq = self._get_numeric_series(leq_col)
+        if ts.dropna().empty or leq.dropna().empty:
+            return ''
+        events = self._compute_top_noise_events(ts, leq)
+        if not events:
+            return ''
+
+        rows_html = ''
+        for i, ev in enumerate(events, 1):
+            dt  = pd.Timestamp(ev['start'])
+            dur = self._fmt_duration(ev['duration_s']) if ev['duration_s'] >= 60 else 'Brief (&lt;1 min)'
+            bg  = '#fff' if i % 2 == 0 else '#f8fafc'
+            rows_html += (
+                f"<tr style='background:{bg}'>"
+                f"<td style='text-align:center'>{i}</td>"
+                f"<td>{dt.strftime('%d %b %Y')}</td>"
+                f"<td>{dt.strftime('%A')}</td>"
+                f"<td>{dt.strftime('%H:%M:%S')}</td>"
+                f"<td style='text-align:center;font-weight:600'>{ev['peak']:.1f} dB(A)</td>"
+                f"<td style='text-align:center'>{dur}</td>"
+                f"</tr>"
+            )
+
+        return (
+            "<div class='card'>"
+            "<h2>Top Peak Noise Events</h2>"
+            "<p style='font-size:12px;color:#4b5563;margin-bottom:8px'>"
+            "Highest-level discrete events detected during the monitoring period. "
+            "An event is a contiguous period with levels at or above the 90th percentile (L10), "
+            "separated by at least 5 minutes of quiet. Duration shown only for events &gt;60 seconds."
+            "</p>"
+            "<table style='width:100%;border-collapse:collapse;font-size:13px'>"
+            "<thead><tr style='background:#1e3a5f;color:#fff'>"
+            "<th style='padding:7px 6px'>#</th>"
+            "<th style='padding:7px 6px;text-align:left'>Date</th>"
+            "<th style='padding:7px 6px;text-align:left'>Day</th>"
+            "<th style='padding:7px 6px;text-align:left'>Start Time</th>"
+            "<th style='padding:7px 6px'>Peak Level</th>"
+            "<th style='padding:7px 6px'>Duration</th>"
+            "</tr></thead>"
+            f"<tbody>{rows_html}</tbody>"
+            "</table></div>"
+        )
 
     def _add_section_2_data_quality(self, story, styles, *, ts: pd.Series):
         story.append(Paragraph("Section 2: Data Quality & Completeness (QA/QC)", styles['h1']))
