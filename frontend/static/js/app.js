@@ -187,17 +187,56 @@ async function _safeJson(response) {
     }
 }
 
+// Simulated progress ticker for server-side operations with no streaming.
+// Ticks 0→95% with easing; call .done() when the response arrives.
+function _simProgress(label) {
+    let pct = 0;
+    let stopped = false;
+    const id = setInterval(() => {
+        if (stopped) return;
+        const step = pct < 40 ? 3.5 : pct < 70 ? 1.8 : pct < 88 ? 0.6 : 0;
+        if (step > 0) {
+            pct = Math.min(95, pct + step + Math.random() * step * 0.4);
+            setStatus('processing', `${label} ${Math.round(pct)}%`);
+        }
+    }, 250);
+    return { done() { stopped = true; clearInterval(id); } };
+}
+
+// XHR-based upload with real byte-level progress events.
+function _xhrUpload(url, formData, { onProgress, onSuccess, onError }) {
+    const xhr = new XMLHttpRequest();
+    xhr.upload.addEventListener('progress', e => {
+        if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100));
+    });
+    xhr.addEventListener('load', () => {
+        const text = xhr.responseText;
+        try {
+            onSuccess(JSON.parse(text));
+        } catch {
+            if (xhr.status === 413 || text.toLowerCase().includes('request entity too large') || text.toLowerCase().includes('payload too large')) {
+                onError(new Error('File too large for the server (limit: 4.5 MB). Please split your data into smaller files.'));
+            } else {
+                onError(new Error(`Server returned an unexpected response (HTTP ${xhr.status}). Check your connection and try again.`));
+            }
+        }
+    });
+    xhr.addEventListener('error', () => onError(new Error('Network error during upload')));
+    xhr.open('POST', url);
+    xhr.send(formData);
+}
+
 function _doSingleUpload(file) {
     if (errorMessage) errorMessage.style.display = 'none';
     window.mergeGapReport = null;
-    setStatus('processing', 'Uploading file…');
+    setStatus('processing', 'Uploading file… 0%');
 
     const formData = new FormData();
     formData.append('file', file);
 
-    fetch('/api/upload', { method: 'POST', body: formData })
-        .then(r => _safeJson(r))
-        .then(data => {
+    _xhrUpload('/api/upload', formData, {
+        onProgress: pct => setStatus('processing', `Uploading file… ${pct}%`),
+        onSuccess: data => {
             if (data.success) {
                 uploadedFilepath = data.filepath;
                 batchFileMeta = [{
@@ -214,23 +253,24 @@ function _doSingleUpload(file) {
                 showError(data.error || 'Upload failed');
                 setStatus('error', 'Upload failed');
             }
-        })
-        .catch(err => {
+        },
+        onError: err => {
             showError('Error uploading file: ' + err.message);
             setStatus('error', 'Upload error');
-        });
+        }
+    });
 }
 
 function _doMultiUpload(files) {
     if (errorMessage) errorMessage.style.display = 'none';
-    setStatus('processing', `Merging ${files.length} files…`);
+    setStatus('processing', `Merging ${files.length} files… 0%`);
 
     const formData = new FormData();
     files.forEach(f => formData.append('files', f));
 
-    fetch('/api/upload-multi', { method: 'POST', body: formData })
-        .then(r => _safeJson(r))
-        .then(data => {
+    _xhrUpload('/api/upload-multi', formData, {
+        onProgress: pct => setStatus('processing', `Merging ${files.length} files… ${pct}%`),
+        onSuccess: data => {
             if (data.success) {
                 uploadedFilepath      = data.filepath;
                 window.mergeGapReport = data.gap_analysis || null;
@@ -255,11 +295,12 @@ function _doMultiUpload(files) {
                 showError(data.error || 'Multi-file merge failed');
                 setStatus('error', 'Merge failed');
             }
-        })
-        .catch(err => {
+        },
+        onError: err => {
             showError('Error merging files: ' + err.message);
             setStatus('error', 'Upload error');
-        });
+        }
+    });
 }
 
 // Aliases for backward compatibility
@@ -273,50 +314,49 @@ function addMoreFiles() {
     if (input) input.click();
 }
 
-async function handleAddMoreFiles(e) {
+function handleAddMoreFiles(e) {
     const newFiles = Array.from(e.target.files || []);
     e.target.value = '';
     if (!newFiles.length) return;
 
     if (errorMessage) errorMessage.style.display = 'none';
-    setStatus('processing', `Adding ${newFiles.length} file(s) to batch…`);
+    setStatus('processing', `Adding ${newFiles.length} file(s)… 0%`);
 
     const formData = new FormData();
     newFiles.forEach(f => formData.append('files', f));
-    if (uploadedFilepath) {
-        formData.append('existing_filepath', uploadedFilepath);
-    }
+    if (uploadedFilepath) formData.append('existing_filepath', uploadedFilepath);
 
-    try {
-        const resp = await fetch('/api/upload-multi', { method: 'POST', body: formData });
-        const data = await _safeJson(resp);
-
-        if (data.success) {
-            uploadedFilepath      = data.filepath;
-            window.mergeGapReport = data.gap_analysis || null;
-            batchFileMeta = (data.file_details || []).map(f => ({
-                name: f.name,
-                rows: f.rows,
-                start: f.start || null,
-                end: f.end || null,
-            }));
-            displayPreview(data);
-            renderBatchFilesPanel();
-            showSection('preview-section');
-            const gapCount = data.gap_analysis?.gap_count || 0;
-            const uptime   = data.gap_analysis?.uptime_pct ?? 100;
-            setStatus('idle',
-                `Batch updated — ${data.rows.toLocaleString()} total records across ${data.file_count} file(s)` +
-                (gapCount ? ` · ${gapCount} gap(s) detected` : ` · uptime ${uptime}%`)
-            );
-        } else {
-            showError(data.error || 'Failed to add files to batch');
-            setStatus('error', 'Merge failed');
+    _xhrUpload('/api/upload-multi', formData, {
+        onProgress: pct => setStatus('processing', `Adding ${newFiles.length} file(s)… ${pct}%`),
+        onSuccess: data => {
+            if (data.success) {
+                uploadedFilepath      = data.filepath;
+                window.mergeGapReport = data.gap_analysis || null;
+                batchFileMeta = (data.file_details || []).map(f => ({
+                    name: f.name,
+                    rows: f.rows,
+                    start: f.start || null,
+                    end: f.end || null,
+                }));
+                displayPreview(data);
+                renderBatchFilesPanel();
+                showSection('preview-section');
+                const gapCount = data.gap_analysis?.gap_count || 0;
+                const uptime   = data.gap_analysis?.uptime_pct ?? 100;
+                setStatus('idle',
+                    `Batch updated — ${data.rows.toLocaleString()} total records across ${data.file_count} file(s)` +
+                    (gapCount ? ` · ${gapCount} gap(s) detected` : ` · uptime ${uptime}%`)
+                );
+            } else {
+                showError(data.error || 'Failed to add files to batch');
+                setStatus('error', 'Merge failed');
+            }
+        },
+        onError: err => {
+            showError('Error adding files: ' + err.message);
+            setStatus('error', 'Upload error');
         }
-    } catch (err) {
-        showError('Error adding files: ' + err.message);
-        setStatus('error', 'Upload error');
-    }
+    });
 }
 
 // ── Batch Files Panel ─────────────────────────────────────────────────────────
@@ -410,9 +450,10 @@ function runAnalysis() {
         return;
     }
     
-    setStatus('processing', 'Running analysis...');
+    setStatus('processing', 'Running analysis… 0%');
     showSection('analysis-section');
-    
+    const _analysisTicker = _simProgress('Running analysis…');
+
     fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -423,6 +464,7 @@ function runAnalysis() {
     })
     .then(response => response.json())
     .then(data => {
+        _analysisTicker.done();
         if (data.success) {
             currentAnalysis = data.analysis;
             currentStandards = data.standards;
@@ -447,6 +489,7 @@ function runAnalysis() {
         }
     })
     .catch(error => {
+        _analysisTicker.done();
         showError('Error running analysis: ' + error.message);
         setStatus('error', 'Analysis error');
         console.error('Analysis request failed:', error);
@@ -2162,7 +2205,8 @@ function generateReport(reportType, format = 'html') {
     const customSectionHeading = (document.getElementById('customSectionHeading')?.value || '').trim();
     const customSectionBody    = (document.getElementById('customSectionBody')?.value || '').trim();
 
-    setStatus('processing', `Generating ${format.toUpperCase()} report...`);
+    setStatus('processing', `Generating ${format.toUpperCase()} report… 0%`);
+    const _reportTicker = _simProgress(`Generating ${format.toUpperCase()} report…`);
 
     fetch('/api/generate-report', {
         method: 'POST',
@@ -2180,6 +2224,7 @@ function generateReport(reportType, format = 'html') {
         })
     })
     .then(response => {
+        _reportTicker.done();
         if (response.ok) {
             const contentDisposition = response.headers.get('content-disposition');
             let filename = `noise_report_${reportType}_${new Date().toISOString().split('T')[0]}.${format === 'docx' ? 'docx' : format}`;
@@ -2206,6 +2251,7 @@ function generateReport(reportType, format = 'html') {
         showNotification(`${format.toUpperCase()} report generated successfully!`);
     })
     .catch(error => {
+        _reportTicker.done();
         showError('Error generating report: ' + error.message);
         setStatus('error', 'Report generation failed');
     });
