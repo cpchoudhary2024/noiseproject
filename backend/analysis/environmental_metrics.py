@@ -6,6 +6,13 @@ Calculates advanced environmental analysis metrics for noise data
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from analysis.acoustics import energetic_mean_db
+
+
+def _emean(series):
+    """Energy-average (LAeq) of dB values; NaN if empty. Accepts Series/ndarray/list."""
+    v = energetic_mean_db(pd.to_numeric(pd.Series(series).to_numpy().ravel(), errors='coerce'))
+    return float(v) if v is not None else float('nan')
 
 
 class EnvironmentalMetricsCalculator:
@@ -122,15 +129,15 @@ class EnvironmentalMetricsCalculator:
         night_data = self.df[((self.df['hour'] >= 22) | (self.df['hour'] < 7))][noise_col]
         
         metrics['day'] = {
-            'mean': float(day_data.mean()),
+            'mean': _emean(day_data),  # LAeq (energy average)
             'std': float(day_data.std()),
             'max': float(day_data.max()),
             'min': float(day_data.min()),
             'count': len(day_data)
         }
-        
+
         metrics['night'] = {
-            'mean': float(night_data.mean()),
+            'mean': _emean(night_data),  # LAeq (energy average)
             'std': float(night_data.std()),
             'max': float(night_data.max()),
             'min': float(night_data.min()),
@@ -148,14 +155,14 @@ class EnvironmentalMetricsCalculator:
             weekend = self.df[self.df['is_weekend']][noise_col]
             
             metrics['weekday'] = {
-                'mean': float(weekday.mean()),
+                'mean': _emean(weekday),  # LAeq (energy average)
                 'std': float(weekday.std()),
                 'max': float(weekday.max()),
                 'min': float(weekday.min())
             }
-            
+
             metrics['weekend'] = {
-                'mean': float(weekend.mean()),
+                'mean': _emean(weekend),  # LAeq (energy average)
                 'std': float(weekend.std()),
                 'max': float(weekend.max()),
                 'min': float(weekend.min())
@@ -168,7 +175,7 @@ class EnvironmentalMetricsCalculator:
         
         # Peak hours (find top 3 hours with highest average)
         if 'hour' in self.df.columns:
-            hourly_mean = self.df.groupby('hour')[noise_col].mean()
+            hourly_mean = self.df.groupby('hour')[noise_col].apply(_emean)  # LAeq per hour
             top_3_hours = hourly_mean.nlargest(3)
             
             metrics['peak_hours'] = [
@@ -269,7 +276,7 @@ class EnvironmentalMetricsCalculator:
         
         # Per-day trend if we have multiple days
         if self.time_column and 'date' in self.df.columns:
-            daily_mean = self.df.groupby('date')[noise_col].mean()
+            daily_mean = self.df.groupby('date')[noise_col].apply(_emean)  # LAeq per day
             if len(daily_mean) > 1:
                 x_days = np.arange(len(daily_mean))
                 m_day, b_day = np.polyfit(x_days, daily_mean.values, 1)

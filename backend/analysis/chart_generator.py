@@ -6,6 +6,13 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime
 import io
+from analysis.acoustics import energetic_mean_db
+
+
+def _emean(series):
+    """Energy-average (LAeq) of dB values; NaN if empty. Accepts Series/ndarray/list."""
+    v = energetic_mean_db(pd.to_numeric(pd.Series(series).to_numpy().ravel(), errors='coerce'))
+    return float(v) if v is not None else float('nan')
 
 
 class AdvancedChartGenerator:
@@ -276,7 +283,7 @@ class AdvancedChartGenerator:
         data = self.df[noise_col].dropna()
         
         # Calculate metrics (normalized to 0-100 scale for radar)
-        mean_noise = data.mean()
+        mean_noise = _emean(data)  # LAeq (energy average)
         max_noise = data.max()
         percentile_5 = data.quantile(0.05)
         percentile_95 = data.quantile(0.95)
@@ -330,8 +337,9 @@ class AdvancedChartGenerator:
         for idx, col in enumerate(self.noise_columns[:4]):
             data = self.df[col].dropna()
             
+            _laeq = _emean(data)  # LAeq (energy average) for the "Mean" spoke
             metrics = {
-                'Mean': min((data.mean() / max_expected) * 100, 100),
+                'Mean': min((_laeq / max_expected) * 100, 100),
                 'Peak': min((data.max() / max_expected) * 100, 100),
                 'Min': min((data.min() / max_expected) * 100, 100),
                 'Std Dev': min((data.std() / 20) * 100, 100),
@@ -537,10 +545,11 @@ class AdvancedChartGenerator:
 
         df[self.time_col] = pd.to_datetime(df[self.time_col], errors='coerce')
         df['hour'] = df[self.time_col].dt.hour
-        hourly_mean = df.groupby('hour')[noise_col].apply(lambda s: pd.to_numeric(s, errors='coerce').dropna().mean()).reindex(range(24))
-        # If there are no per-hour values (all NaN), try a fallback using overall mean
+        # Diurnal hourly level = LAeq (energy average) per hour, not arithmetic.
+        hourly_mean = df.groupby('hour')[noise_col].apply(_emean).reindex(range(24))
+        # If there are no per-hour values (all NaN), try a fallback using overall LAeq
         if hourly_mean.dropna().empty:
-            overall_mean = pd.to_numeric(df[noise_col], errors='coerce').dropna().mean()
+            overall_mean = _emean(df[noise_col])
             if pd.isna(overall_mean):
                 return None
             hourly_mean = hourly_mean.fillna(overall_mean)

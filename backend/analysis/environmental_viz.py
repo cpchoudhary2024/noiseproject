@@ -11,6 +11,20 @@ from datetime import datetime, timedelta
 import plotly.io as pio
 
 
+def _energy_mean_db(series) -> float:
+    """Energy (logarithmic) average of dB values: 10*log10(mean(10^(L/10))).
+
+    The correct way to average sound levels — a plain arithmetic mean of dB
+    understates the true equivalent level. Accepts a Series, ndarray, or list;
+    returns NaN for empty input.
+    """
+    arr = pd.to_numeric(pd.Series(series).to_numpy().ravel(), errors='coerce')
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float('nan')
+    return float(10.0 * np.log10(np.mean(np.power(10.0, arr / 10.0))))
+
+
 class EnvironmentalVisualizationEngine:
     """Advanced visualization engine for environmental noise analysis"""
     
@@ -64,10 +78,10 @@ class EnvironmentalVisualizationEngine:
         if not self.time_col or noise_col not in self.df.columns:
             return None
         
-        # Create hourly aggregates (use 'h' for newer pandas versions)
-        hourly = self.df.groupby(self.df[self.time_col].dt.floor('h')).agg({
-            noise_col: ['count', 'mean', 'max']
-        }).reset_index()
+        # Create hourly aggregates (use 'h' for newer pandas versions).
+        # The hourly level is plotted as LAeq, so it must be energy-averaged.
+        _grp = self.df.groupby(self.df[self.time_col].dt.floor('h'))[noise_col]
+        hourly = _grp.agg(count='count', mean=_energy_mean_db, max='max').reset_index()
         hourly.columns = ['time', 'count', 'mean', 'max']
         
         # Calculate exceedances for each standard
@@ -174,12 +188,12 @@ class EnvironmentalVisualizationEngine:
             x_title = "Date"
             y_title = "Hour of Day"
         else:
-            # Day x Week heatmap
+            # Day x Week heatmap — energy-average (LAeq) per cell, not arithmetic.
             pivot = self.df.pivot_table(
                 values=noise_col,
                 index='date',
                 columns='week',
-                aggfunc='mean'
+                aggfunc=_energy_mean_db
             )
             title = "Daily Noise Pattern (Day × Week)"
             x_title = "Week Number"
@@ -277,7 +291,8 @@ class EnvironmentalVisualizationEngine:
 
             bx.append(f'{hour:02d}:00')
             b_q1.append(q1); b_med.append(med); b_q3.append(q3)
-            b_lf.append(lf); b_uf.append(uf); b_mean.append(float(hv.mean()))
+            # Box mean marker = LAeq (energy average), the meaningful central level for noise.
+            b_lf.append(lf); b_uf.append(uf); b_mean.append(_energy_mean_db(hv))
 
             outliers = hv[(hv < lo_w) | (hv > hi_w)]
             if outliers.size:
@@ -363,10 +378,11 @@ class EnvironmentalVisualizationEngine:
             row=1, col=1
         )
         
-        # Statistics
+        # Statistics — "Mean" shown as LAeq (energy average), the correct central level.
+        _laeq = _energy_mean_db(data)
         stats_text = f"""
         <b>Statistical Summary</b><br>
-        Mean: {data.mean():.1f} dB<br>
+        Mean (LAeq): {_laeq:.1f} dB<br>
         Median: {data.median():.1f} dB<br>
         Std Dev: {data.std():.1f} dB<br>
         Min: {data.min():.1f} dB<br>
@@ -379,8 +395,8 @@ class EnvironmentalVisualizationEngine:
         fig.add_trace(
             go.Indicator(
                 mode="number+gauge",
-                value=data.mean(),
-                title={"text": "Mean Level"},
+                value=_laeq,
+                title={"text": "Mean Level (LAeq)"},
                 domain={'x': [0, 1], 'y': [0, 1]},
                 gauge={
                     'axis': {'range': [data.min()-5, data.max()+5]},
@@ -478,7 +494,7 @@ class EnvironmentalVisualizationEngine:
         if not compliance:
             # Fallback: create simple dashboard with current data
             if noise_col and noise_col in self.df.columns:
-                current_level = self.df[noise_col].mean()
+                current_level = _energy_mean_db(self.df[noise_col])
             else:
                 current_level = 67.0
             current_level = float(current_level) if not pd.isna(current_level) else 67.0
@@ -493,9 +509,9 @@ class EnvironmentalVisualizationEngine:
             if primary_col:
                 current_level = compliance.get(primary_col, {}).get('current_leq')
                 if current_level is None:
-                    # Fallback to raw column mean if the key is missing.
+                    # Fallback to raw column LAeq (energy average) if the key is missing.
                     if primary_col in self.df.columns:
-                        current_level = float(self.df[primary_col].dropna().mean())
+                        current_level = float(_energy_mean_db(self.df[primary_col]))
                     else:
                         current_level = 67.0
             else:

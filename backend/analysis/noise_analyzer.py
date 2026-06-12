@@ -310,7 +310,7 @@ class NoiseAnalyzer:
             peaks_dict[col] = {
                 'number_of_peaks': int(len(peaks)),
                 'peak_values': [round(float(data.iloc[p]), 2) for p in peaks[-5:]],  # Top 5 peaks
-                'average_peak': round(float(data[data > data.quantile(0.9)].mean()), 2),
+                'average_peak': round(float(energetic_mean_db(data[data > data.quantile(0.9)]) or data[data > data.quantile(0.9)].mean()), 2),
                 'max_peak': round(float(data.max()), 2),
                 'peak_frequency': round(float(len(peaks) / len(data)) * 1000, 2)  # Peaks per 1000 measurements
             }

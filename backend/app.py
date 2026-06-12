@@ -240,18 +240,42 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
 
 
 def _resolve_uploaded_filepath(filepath: str) -> str:
-    """Resolve a client-provided filepath (absolute path or basename).
+    """Resolve a client-provided filepath, constrained to server-managed folders.
 
-    Backwards compatible:
-    - If basename: check uploads/raw first, then uploads root.
-    - If absolute/relative path provided: normalize to absolute.
+    Security: the client only ever supplies paths the server itself handed out
+    (under uploads/ or artifacts/). A bare basename is looked up inside the
+    upload folders; a full path is honoured ONLY if it normalises to a location
+    inside an allowed root. Anything else (``/etc/passwd``, ``../../secret``) is
+    rejected by falling back to a basename lookup in uploads/raw, which will not
+    exist and yields a clean 404 — preventing arbitrary file read / path traversal.
     """
+    filepath = str(filepath or '')
+
+    # Roots the client is permitted to reference.
+    allowed_roots = [
+        os.path.abspath(app.config['RAW_UPLOAD_FOLDER']),
+        os.path.abspath(app.config['UPLOAD_FOLDER']),
+        os.path.abspath(ARTIFACTS_REPORTS_DIR),
+        os.path.abspath(ARTIFACTS_CHARTS_DIR),
+    ]
+
+    def _within_allowed(p: str) -> bool:
+        ap = os.path.abspath(p)
+        return any(ap == root or ap.startswith(root + os.sep) for root in allowed_roots)
+
+    # Bare basename → look up inside the upload folders only.
     if os.path.basename(filepath) == filepath:
         raw_candidate = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], filepath))
         if os.path.exists(raw_candidate):
             return raw_candidate
         return os.path.abspath(os.path.join(app.config['UPLOAD_FOLDER'], filepath))
-    return os.path.abspath(filepath)
+
+    # Full/relative path → honour only if it resolves inside an allowed root.
+    if _within_allowed(filepath):
+        return os.path.abspath(filepath)
+
+    # Reject traversal: treat as a basename inside uploads/raw (non-existent → 404).
+    return os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], os.path.basename(filepath)))
 
 
 def _run_retention_cleanup(*, keep_paths=()):
