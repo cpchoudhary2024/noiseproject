@@ -21,6 +21,7 @@ from analysis.wlg_parser import parse_wlg_file, WLGParser
 from analysis.gap_detector import detect_gaps, gap_report_to_dict, merge_dataframes
 from analysis.compliance_matrix import evaluate_compliance
 from analysis.acoustics import energetic_mean_db, compute_ldn_lden
+from analysis.timestamp_utils import assess_timestamp_integrity, primary_time_column
 import io
 import logging
 import threading
@@ -687,6 +688,7 @@ def analyze_data():
         data = request.json
         filepath = (data or {}).get('filepath')
         job_id   = str((data or {}).get('job_id', '') or '')
+        environment = str((data or {}).get('environment', 'outdoor') or 'outdoor').strip().lower()
 
         _set_progress(job_id, 5, 'Resolving file…')
 
@@ -733,6 +735,17 @@ def analyze_data():
             if not filters:
                 _store_cache_entry(filepath, df=df, analysis=analysis_results, standards=standards_results)
 
+        # ── Timestamp integrity guard ──────────────────────────────────────────
+        # Detect corrupted / dateless timestamps so the client can warn the user
+        # and suppress time-dependent metrics instead of showing fabricated values.
+        timestamp_integrity: dict = {"status": "ok", "time_metrics_valid": True}
+        try:
+            _tcol = primary_time_column(df)
+            if _tcol is not None:
+                timestamp_integrity = assess_timestamp_integrity(df[_tcol]).to_dict()
+        except Exception as ts_err:
+            logger.warning(f"[ANALYZE] Timestamp integrity check skipped: {ts_err}")
+
         # ── Forensic gap analysis ──────────────────────────────────────────────
         _set_progress(job_id, 65, 'Detecting data gaps…')
         gap_data: dict = {}
@@ -765,9 +778,42 @@ def analyze_data():
                 laeq_day    = laeq_day,
                 laeq_night  = laeq_night,
                 lamax       = float(stat_first.get('max') or 0) or None,
+                environment = environment,
             )
         except Exception as cm_err:
             logger.warning(f"[ANALYZE] Compliance matrix skipped: {cm_err}")
+
+        # ── At-a-glance key findings (participant-friendly headline numbers) ────
+        key_findings: dict = {}
+        try:
+            stats_all = analysis_results.get('statistics', {})
+            cols = list(stats_all.keys())
+            prim = next((c for c in cols if 'leq' in ''.join(ch for ch in c.lower() if ch.isalnum())),
+                        cols[0] if cols else None)
+            if prim is not None:
+                leq_series = pd.to_numeric(df[prim], errors='coerce').dropna()
+                if not leq_series.empty:
+                    key_findings['avg_laeq'] = energetic_mean_db(leq_series)
+                    key_findings['peak'] = float(leq_series.max())
+                    key_findings['pct_within_guideline'] = round(100.0 * float((leq_series <= 53.0).mean()), 0)
+                    key_findings['n_days'] = int(len(pd.to_datetime(
+                        df[next((c for c in df.columns if any(t in c.lower()
+                                 for t in ['timestamp', 'datetime', 'time', 'date'])), prim)],
+                        errors='coerce').dropna().dt.normalize().unique())) if cols else 0
+                    # Loudest / quietest hour by energy average
+                    tcands = [c for c in df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
+                    if tcands:
+                        tser = pd.to_datetime(df[tcands[0]], errors='coerce')
+                        tmp = pd.DataFrame({'h': tser.dt.hour, 'v': pd.to_numeric(df[prim], errors='coerce')}).dropna()
+                        if not tmp.empty:
+                            hourly = tmp.groupby('h')['v'].apply(lambda s: energetic_mean_db(s)).dropna()
+                            if not hourly.empty:
+                                key_findings['loudest_hour'] = int(hourly.idxmax())
+                                key_findings['loudest_hour_db'] = round(float(hourly.max()), 1)
+                                key_findings['quietest_hour'] = int(hourly.idxmin())
+                                key_findings['quietest_hour_db'] = round(float(hourly.min()), 1)
+        except Exception as kf_err:
+            logger.warning(f"[ANALYZE] Key findings skipped: {kf_err}")
 
         # Plain-English summary — computed from stats, no AI
         _set_progress(job_id, 88, 'Building health summary…')
@@ -817,6 +863,8 @@ def analyze_data():
             'gap_analysis': gap_data,
             'compliance_matrix': compliance_matrix,
             'plain_english_summary': plain_english_summary,
+            'timestamp_integrity': timestamp_integrity,
+            'key_findings': key_findings,
             'filepath': filepath
         })
 
@@ -955,6 +1003,7 @@ def compliance_check():
     try:
         data = request.json or {}
         filepath = data.get('filepath')
+        environment = str(data.get('environment', 'outdoor') or 'outdoor').strip().lower()
         if not filepath:
             return jsonify({'error': 'No filepath provided'}), 400
 
@@ -979,6 +1028,7 @@ def compliance_check():
             laeq_day   = env_f.get('LAeq_day'),
             laeq_night = env_f.get('LAeq_night') or env_f.get('Lnight'),
             lamax      = float(stat_f.get('max') or 0) or None,
+            environment = environment,
         )
 
         return jsonify({'success': True, 'compliance_matrix': matrix})
@@ -1148,6 +1198,7 @@ def generate_report():
         merge_gap_report       = (data or {}).get('merge_gap_report') or None
         custom_section_heading = str((data or {}).get('custom_section_heading', '') or '').strip()
         custom_section_body    = str((data or {}).get('custom_section_body', '') or '').strip()
+        environment            = str((data or {}).get('environment', 'outdoor') or 'outdoor').strip().lower()
 
         def _make_generator():
             return ReportGeneratorV2(
@@ -1158,6 +1209,7 @@ def generate_report():
                 merge_gap_report=merge_gap_report,
                 custom_section_heading=custom_section_heading,
                 custom_section_body=custom_section_body,
+                environment=environment,
             )
 
         _set_progress(job_id, 60, 'Generating document…')
@@ -2333,7 +2385,7 @@ def compare_report():
         )
 
         try:
-            img_bytes = diurnal_fig.to_image(format='png', scale=2, engine='kaleido')
+            img_bytes = diurnal_fig.to_image(format='png', scale=2)
             import io as _io
             from reportlab.platypus import Image as RLImage
             img_obj = RLImage(_io.BytesIO(img_bytes), width=9.5 * inch, height=4.0 * inch)
@@ -2373,7 +2425,7 @@ def compare_report():
             plot_bgcolor='#f8fafc', paper_bgcolor='white'
         )
         try:
-            img_bytes = bar_fig.to_image(format='png', scale=2, engine='kaleido')
+            img_bytes = bar_fig.to_image(format='png', scale=2)
             img_obj = RLImage(_io.BytesIO(img_bytes), width=9.5 * inch, height=3.8 * inch)
             story.append(img_obj)
         except Exception:

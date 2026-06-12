@@ -257,22 +257,50 @@ class EnvironmentalVisualizationEngine:
         hour_labels = [f'{h:02d}:00' for h in range(24)]
         fig = go.Figure()
 
+        # Precompute per-hour box statistics server-side so the payload stays tiny.
+        # Shipping every raw reading (millions on long datasets) freezes the browser;
+        # Plotly renders an identical box from q1/median/q3/fences arrays instead.
+        bx, b_q1, b_med, b_q3, b_lf, b_uf, b_mean = [], [], [], [], [], [], []
+        out_x, out_y = [], []
+        OUTLIER_CAP = 40  # per hour, for display only
+
         for hour in range(24):
-            hour_values = pd.to_numeric(df.loc[df['hour'] == hour, noise_col], errors='coerce').dropna()
-            if hour_values.empty:
+            hv = pd.to_numeric(df.loc[df['hour'] == hour, noise_col], errors='coerce').dropna().to_numpy()
+            if hv.size == 0:
                 continue
-            # Convert to plain Python list to avoid Plotly binary (bdata) encoding.
-            y_vals = [float(v) for v in hour_values.tolist()]
+            q1, med, q3 = (float(np.percentile(hv, p)) for p in (25, 50, 75))
+            iqr = q3 - q1
+            lo_w, hi_w = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            within = hv[(hv >= lo_w) & (hv <= hi_w)]
+            lf = float(within.min()) if within.size else float(hv.min())
+            uf = float(within.max()) if within.size else float(hv.max())
+
+            bx.append(f'{hour:02d}:00')
+            b_q1.append(q1); b_med.append(med); b_q3.append(q3)
+            b_lf.append(lf); b_uf.append(uf); b_mean.append(float(hv.mean()))
+
+            outliers = hv[(hv < lo_w) | (hv > hi_w)]
+            if outliers.size:
+                # Cap displayed outliers; show the most extreme ones.
+                extreme = outliers[np.argsort(-np.abs(outliers - med))][:OUTLIER_CAP]
+                out_x.extend([f'{hour:02d}:00'] * len(extreme))
+                out_y.extend(float(v) for v in extreme)
+
+        if bx:
             fig.add_trace(go.Box(
-                y=y_vals,
-                x=[f'{hour:02d}:00'] * len(y_vals),
-                name=f'{hour:02d}:00',
-                boxpoints='outliers',
-                quartilemethod='linear',
+                x=bx, lowerfence=b_lf, q1=b_q1, median=b_med, q3=b_q3, upperfence=b_uf, mean=b_mean,
+                name='Hourly LEQ',
                 marker=dict(color='#3D5A80'),
                 line=dict(color='#293241', width=1.5),
                 fillcolor='rgba(61, 90, 128, 0.35)',
-                hovertemplate='Hour %{x}<br>LEQ: %{y:.1f} dB(A)<extra></extra>',
+                hovertemplate='Hour %{x}<br>Median: %{median:.1f} dB(A)<extra></extra>',
+                showlegend=False,
+            ))
+        if out_y:
+            fig.add_trace(go.Scatter(
+                x=out_x, y=out_y, mode='markers', name='Outliers',
+                marker=dict(color='rgba(41,50,65,0.55)', size=4, symbol='circle-open'),
+                hovertemplate='Hour %{x}<br>Outlier: %{y:.1f} dB(A)<extra></extra>',
                 showlegend=False,
             ))
 

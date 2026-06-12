@@ -23,6 +23,31 @@ class NoiseAnalyzer:
         self.df = df.copy()
         self.noise_columns = self._identify_noise_columns()
         self.validate_data()
+        self._ts_cache = None       # memoized parsed primary timestamp series
+        self._ts_cache_col = None
+
+    def _parsed_timestamps(self, time_col: str | None = None) -> pd.Series:
+        """Parse the primary timestamp column once and reuse it.
+
+        Parsing a multi-million-row column is expensive; several analysis methods
+        need it, so we memoize the result on the instance.
+        """
+        if time_col is None:
+            cands = [c for c in self.df.columns
+                     if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
+            time_col = cands[0] if cands else None
+        if time_col is None:
+            return pd.Series(dtype='datetime64[ns]')
+        if self._ts_cache is not None and self._ts_cache_col == time_col:
+            return self._ts_cache
+        try:
+            from analysis.timestamp_utils import parse_timestamps_robust
+            parsed, _ = parse_timestamps_robust(self.df[time_col])
+        except Exception:
+            parsed = pd.to_datetime(self.df[time_col], errors='coerce', dayfirst=True, cache=True)
+        self._ts_cache = parsed
+        self._ts_cache_col = time_col
+        return parsed
     
     def _identify_noise_columns(self):
         """Identify columns containing noise measurements (dB values).
@@ -137,7 +162,7 @@ class NoiseAnalyzer:
         if time_cols:
             time_col = time_cols[0]
             try:
-                ts = pd.to_datetime(self.df[time_col], errors='coerce', dayfirst=True, cache=True)
+                ts = self._parsed_timestamps(time_col)
                 ts = ts.dropna()
                 if not ts.empty:
                     return {
@@ -231,7 +256,7 @@ class NoiseAnalyzer:
             return {}
 
         time_col = time_cols[0]
-        ts = pd.to_datetime(self.df[time_col], errors='coerce', dayfirst=True, cache=True)
+        ts = self._parsed_timestamps(time_col)
         if ts.notna().sum() == 0:
             return {}
 
@@ -455,7 +480,7 @@ class NoiseAnalyzer:
         ]
         if time_cols:
             time_col = time_cols[0]
-            ts = pd.to_datetime(self.df[time_col], errors="coerce", dayfirst=True, cache=True)
+            ts = self._parsed_timestamps(time_col)
             if ts.notna().sum() > 0:
                 # Only compute Lden/Lnight metrics for LEQ-like columns.
                 for col in leq_cols:

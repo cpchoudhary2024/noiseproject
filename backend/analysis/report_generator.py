@@ -868,19 +868,7 @@ class ReportGenerator:
         if fig is None:
             return None
         try:
-            # Try using kaleido for better quality
-            try:
-                img_bytes = fig.to_image(format="png", scale=2, engine="kaleido") # Higher scale for better quality
-            except Exception as kaleido_error:
-                # Fallback: use orca if kaleido unavailable
-                print(f"[PDF] Kaleido unavailable ({str(kaleido_error)[:50]}...), trying orca...")
-                try:
-                    img_bytes = fig.to_image(format="png", scale=2, engine="orca")
-                except Exception as orca_error:
-                    # Fallback: static image generation
-                    print(f"[PDF] Orca unavailable, generating static image...")
-                    import plotly.io as pio
-                    img_bytes = pio.to_image(fig, format="png")
+            img_bytes = fig.to_image(format="png", scale=2)
             
             img = Image(io.BytesIO(img_bytes))
             

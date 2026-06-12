@@ -88,6 +88,20 @@ def _is_in_range(hour: int, start: int, end: int) -> bool:
     return hour >= start or hour < end
 
 
+def _mask_in_range(hours: pd.Series, start: int, end: int) -> pd.Series:
+    """Vectorized half-open hour-range membership (start inclusive, end exclusive).
+
+    Equivalent to ``hours.map(lambda h: _is_in_range(h, start, end))`` but runs as
+    a single numpy boolean op — critical on multi-million-row series.
+    """
+    if start == end:
+        return pd.Series(True, index=hours.index)
+    if start < end:
+        return (hours >= start) & (hours < end)
+    # wraps midnight
+    return (hours >= start) | (hours < end)
+
+
 def compute_ldn_lden(
     timestamps: pd.Series,
     levels_db: pd.Series,
@@ -116,20 +130,18 @@ def compute_ldn_lden(
     hours = ts.dt.hour.astype(int)
 
     # Ldn masks (typically: day 07-22, night 22-07)
-    day_mask_ldn = hours.map(lambda h: _is_in_range(int(h), ldn_def.day_start, ldn_def.day_end))
-    night_mask_ldn = hours.map(lambda h: _is_in_range(int(h), int(ldn_def.night_start), int(ldn_def.night_end)))
+    day_mask_ldn = _mask_in_range(hours, ldn_def.day_start, ldn_def.day_end)
+    night_mask_ldn = _mask_in_range(hours, int(ldn_def.night_start), int(ldn_def.night_end))
 
     laeq_24h = energetic_mean_db(y)
 
     # Lden/Lnight masks (EU definition typically: day 07-19, evening 19-23, night 23-07)
-    day_mask_lden = hours.map(lambda h: _is_in_range(int(h), int(lden_def.day_start), int(lden_def.day_end)))
+    day_mask_lden = _mask_in_range(hours, int(lden_def.day_start), int(lden_def.day_end))
     if lden_def.evening_start is not None and lden_def.evening_end is not None:
-        evening_mask = hours.map(
-            lambda h: _is_in_range(int(h), int(lden_def.evening_start), int(lden_def.evening_end))
-        )
+        evening_mask = _mask_in_range(hours, int(lden_def.evening_start), int(lden_def.evening_end))
     else:
         evening_mask = pd.Series(False, index=y.index)
-    night_mask_lden = hours.map(lambda h: _is_in_range(int(h), int(lden_def.night_start), int(lden_def.night_end)))
+    night_mask_lden = _mask_in_range(hours, int(lden_def.night_start), int(lden_def.night_end))
 
     laeq_day_lden = energetic_mean_db(y[day_mask_lden])
     laeq_evening_lden = energetic_mean_db(y[evening_mask])

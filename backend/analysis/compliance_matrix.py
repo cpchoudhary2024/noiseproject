@@ -55,6 +55,13 @@ class StandardRow:
     source: str        # Exact citation
     tooltip: str       # Plain-English definition pulled verbatim from the document
     category: str      # "who_env" | "who_indoor" | "maryland"
+    # Source-specific guidelines (aircraft, railway) were derived from studies that
+    # attributed noise exclusively to one source. A source-blind sound level meter
+    # measures total combined energy and cannot attribute it, so these rows are
+    # reported as *indicative reference* comparisons rather than pass/fail compliance.
+    source_specific: bool = False
+    # Indoor guidelines (bedroom) are only valid against an indoor-placed sensor.
+    indoor_only: bool = False
 
 
 # Ordered from most health-relevant to regulatory
@@ -101,9 +108,12 @@ MATRIX: list[StandardRow] = [
             "Aircraft limits are stricter than road traffic (45 dB vs. 53 dB Lden) "
             "because aircraft noise is intermittent and unpredictable, causing "
             "approximately twice as much annoyance per dB. "
-            "At 50 dB Lden, 20% of residents near airports report being highly annoyed."
+            "At 50 dB Lden, 20% of residents near airports report being highly annoyed. "
+            "INDICATIVE ONLY: the sensor measures total acoustic energy and cannot "
+            "confirm that aircraft is the source."
         ),
         category="who_env",
+        source_specific=True,
     ),
     StandardRow(
         standard="WHO 2018 — Aircraft Noise",
@@ -114,9 +124,11 @@ MATRIX: list[StandardRow] = [
             "Set at 40 dB — matching the WHO LOAEL for sleep effects — because "
             "a single aircraft event during deep sleep can cause measurable "
             "cardiovascular arousal (elevated heart rate, cortisol release) "
-            "without the resident being consciously aware of it."
+            "without the resident being consciously aware of it. "
+            "INDICATIVE ONLY: the sensor cannot confirm aircraft as the source."
         ),
         category="who_env",
+        source_specific=True,
     ),
 
     # ── WHO 2018 — Railway ────────────────────────────────────────────────────
@@ -130,9 +142,11 @@ MATRIX: list[StandardRow] = [
             "traffic (53 dB) because the dose–response relationship for railway "
             "annoyance is somewhat lower per dB than for road traffic. "
             "The WHO notes high uncertainty at this threshold due to limited "
-            "longitudinal evidence at that time."
+            "longitudinal evidence at that time. "
+            "INDICATIVE ONLY: the sensor cannot confirm railway as the source."
         ),
         category="who_env",
+        source_specific=True,
     ),
     StandardRow(
         standard="WHO 2018 — Railway",
@@ -143,9 +157,11 @@ MATRIX: list[StandardRow] = [
             "Railway Lnight limit of 44 dB(A) — slightly stricter than road traffic "
             "(45 dB) because railway events tend to be discrete, loud, and very "
             "noticeable during quiet nighttime background. The WHO designated this "
-            "as a Conditional recommendation reflecting evidence gaps."
+            "as a Conditional recommendation reflecting evidence gaps. "
+            "INDICATIVE ONLY: the sensor cannot confirm railway as the source."
         ),
         category="who_env",
+        source_specific=True,
     ),
 
     # ── WHO Indoor — Bedroom ─────────────────────────────────────────────────
@@ -158,9 +174,12 @@ MATRIX: list[StandardRow] = [
             "Indoor bedroom average level to protect sleep quality. "
             "30 dB(A) represents a near-quiet environment essential for restorative "
             "sleep. Exceeding this causes measurable increases in body movement "
-            "and reduced sleep depth even when the resident does not wake up."
+            "and reduced sleep depth even when the resident does not wake up. "
+            "Applies only to a sensor placed INSIDE the bedroom; outdoor levels are "
+            "typically 15–25 dB higher than the corresponding indoor level (windows closed)."
         ),
         category="who_indoor",
+        indoor_only=True,
     ),
     StandardRow(
         standard="WHO Indoor — Bedroom (single event)",
@@ -171,9 +190,11 @@ MATRIX: list[StandardRow] = [
             "A single noise event above 45 dB(A) inside the bedroom is sufficient "
             "to cause sleep arousal — the WHO threshold to prevent awakening. "
             "Even if the nightly average is low, one loud truck or aircraft can "
-            "interrupt a full sleep cycle and prevent recovery to deep sleep stages."
+            "interrupt a full sleep cycle and prevent recovery to deep sleep stages. "
+            "Applies only to a sensor placed INSIDE the bedroom."
         ),
         category="who_indoor",
+        indoor_only=True,
     ),
 
     # ── Maryland COMAR — Residential ─────────────────────────────────────────
@@ -214,27 +235,46 @@ def evaluate_compliance(
     laeq_day: float | None = None,
     laeq_night: float | None = None,
     lamax: float | None = None,
+    environment: str = "outdoor",
 ) -> list[dict]:
     """
-    Build the Pass/Fail compliance results for all applicable standards.
+    Build the compliance results for all applicable standards.
 
     Only rows where a measured value is available are returned.
     The caller supplies whichever metrics they can compute from the dataset.
+
+    Parameters
+    ----------
+    environment : str
+        Sensor placement, ``"outdoor"`` (default) or ``"indoor"``. Indoor-only
+        WHO bedroom guidelines (30 dB LAeq / 45 dB LAmax) are only emitted when
+        ``environment == "indoor"``; comparing an outdoor mic against an indoor
+        bedroom limit is not physically valid (15–25 dB facade attenuation).
+
+    Result ``kind`` field
+    ---------------------
+    ``"compliance"`` rows carry a PASS/FAIL verdict against a directly applicable
+    limit (road traffic, Maryland, indoor bedroom when indoor). ``"indicative"``
+    rows compare total measured energy against a *source-specific* reference
+    (aircraft, railway) that a source-blind meter cannot attribute — these report
+    ABOVE/BELOW the reference rather than a compliance verdict.
     """
 
     def _valid(v: float | None) -> bool:
         return v is not None and isinstance(v, (int, float)) and math.isfinite(v)
 
+    is_indoor = str(environment or "outdoor").strip().lower() == "indoor"
+
     # Map each StandardRow to the measured value most appropriate for it
     metric_map: list[tuple[StandardRow, float | None]] = [
         (MATRIX[0], lden),          # WHO Road Lden
         (MATRIX[1], lnight),        # WHO Road Lnight
-        (MATRIX[2], lden),          # WHO Aircraft Lden
-        (MATRIX[3], lnight),        # WHO Aircraft Lnight
-        (MATRIX[4], lden),          # WHO Railway Lden
-        (MATRIX[5], lnight),        # WHO Railway Lnight
-        (MATRIX[6], laeq),          # WHO Bedroom LAeq  (use overall laeq as proxy)
-        (MATRIX[7], lamax),         # WHO Bedroom LAmax
+        (MATRIX[2], lden),          # WHO Aircraft Lden   (indicative)
+        (MATRIX[3], lnight),        # WHO Aircraft Lnight (indicative)
+        (MATRIX[4], lden),          # WHO Railway Lden    (indicative)
+        (MATRIX[5], lnight),        # WHO Railway Lnight  (indicative)
+        (MATRIX[6], laeq),          # WHO Bedroom LAeq    (indoor only)
+        (MATRIX[7], lamax),         # WHO Bedroom LAmax   (indoor only)
         (MATRIX[8], laeq_day),      # Maryland Residential Day
         (MATRIX[9], laeq_night),    # Maryland Residential Night
     ]
@@ -243,19 +283,32 @@ def evaluate_compliance(
     for row, measured in metric_map:
         if not _valid(measured):
             continue
+        # Indoor bedroom guidelines are not valid against an outdoor placement.
+        if row.indoor_only and not is_indoor:
+            continue
         assert measured is not None
-        status = "PASS" if measured <= row.limit_db else "FAIL"
+
         delta = round(float(measured) - row.limit_db, 1)
+        if row.source_specific:
+            # Source-specific reference — report relation, not a compliance verdict.
+            kind = "indicative"
+            status = "ABOVE" if measured > row.limit_db else "BELOW"
+        else:
+            kind = "compliance"
+            status = "PASS" if measured <= row.limit_db else "FAIL"
+
         results.append({
-            "standard":     row.standard,
-            "metric":       row.metric,
-            "measured_db":  round(float(measured), 1),
-            "limit_db":     row.limit_db,
-            "status":       status,
-            "delta_db":     delta,
-            "source":       row.source,
-            "tooltip":      row.tooltip,
-            "category":     row.category,
+            "standard":        row.standard,
+            "metric":          row.metric,
+            "measured_db":     round(float(measured), 1),
+            "limit_db":        row.limit_db,
+            "status":          status,
+            "kind":            kind,
+            "source_specific": row.source_specific,
+            "delta_db":        delta,
+            "source":          row.source,
+            "tooltip":         row.tooltip,
+            "category":        row.category,
         })
 
     return results

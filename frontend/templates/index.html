@@ -248,6 +248,30 @@
                                maxlength="80">
                         <span class="device-id-hint">Appears alongside the file name in the PDF &amp; Word report</span>
                     </div>
+                    <div class="device-env-inner">
+                        <i class="fas fa-location-dot device-id-icon"></i>
+                        <span class="device-id-label">Sensor placement</span>
+                        <div class="env-toggle" id="envToggle" role="group" aria-label="Sensor placement">
+                            <button type="button" class="env-toggle-btn active" data-env="outdoor"
+                                    onclick="setDeploymentEnvironment('outdoor')">
+                                <i class="fas fa-tree"></i> Outdoor
+                            </button>
+                            <button type="button" class="env-toggle-btn" data-env="indoor"
+                                    onclick="setDeploymentEnvironment('indoor')">
+                                <i class="fas fa-house"></i> Indoor
+                            </button>
+                        </div>
+                        <span class="device-id-hint" id="envHint">Outdoor: WHO indoor bedroom limits are omitted (not comparable to an outdoor mic)</span>
+                    </div>
+                </div>
+
+                <!-- Timestamp-integrity warning (shown when timestamps are unreadable) -->
+                <div id="timestampWarning" class="ts-warning" style="display:none;" role="alert">
+                    <i class="fas fa-triangle-exclamation ts-warning-icon"></i>
+                    <div class="ts-warning-body">
+                        <strong>Timestamps could not be read reliably</strong>
+                        <p id="timestampWarningText"></p>
+                    </div>
                 </div>
 
                 <!-- Plain-English Summary Card -->
@@ -267,9 +291,10 @@
                     <div id="gapLogContent"></div>
                 </div>
 
-                <!-- Key Metrics Panel -->
+                <!-- Key Findings Panel (at-a-glance) -->
                 <div class="metrics-panel">
-                    <h3>Statistical &amp; Environmental Indicators</h3>
+                    <h3>Key Findings at a Glance</h3>
+                    <p style="margin:-8px 0 4px;font-size:13px;color:#64748b;">The headline numbers for this location. Full per-channel statistics are in the <strong>Statistics</strong> tab.</p>
                     <div class="metrics-grid" id="metricsGrid"></div>
                 </div>
 
@@ -336,16 +361,16 @@
                         <!-- Hourly Diurnal Trend Chart -->
                         <div class="chart-section">
                             <div class="chart-section-header">
-                                <h4>24-Hour Diurnal LAeq Profile with Rolling Median</h4>
+                                <h4>24-Hour Diurnal LAeq Profile</h4>
                                 <button class="btn-chart-dl" onclick="downloadChartImage('rollingMedianChart', 'Hourly_Diurnal_LAeq_Profile')">
                                     <i class="fas fa-download"></i> Download PNG
                                 </button>
                             </div>
                             <div id="rollingMedianChart" class="chart-box" style="min-height: 450px;"></div>
                             <div class="chart-explainer">
-                                <strong>What it is:</strong> The energy-average LAeq for each hour of the day (00:00–23:00), averaged across all monitoring days in the dataset, with a 3-point centred rolling median overlay and WHO 2018 road-traffic reference lines (53 dB Lden, 45 dB Lnight).
-                                <strong>How it is calculated:</strong> Each hourly point is the logarithmic energy average (LAeq) of all measurements taken during that hour across every recording day — not a simple arithmetic mean. The rolling median smooths neighbour-hour spikes to reveal the true diurnal acoustic pattern.
-                                <strong>How to read it:</strong> Morning peaks (06:00–09:00) and evening peaks (17:00–20:00) typically correspond to commuter traffic. Hours where the line exceeds 45 dB (WHO Lnight limit) indicate nighttime noise capable of causing sleep disturbance. The shaded area shows the overall acoustic load profile throughout the day.
+                                <strong>What it is:</strong> The energy-average LAeq for each hour of the day (00:00–23:00), averaged across all monitoring days in the dataset, with the WHO night window (23:00–07:00) shaded and WHO 2018 road-traffic reference lines (53 dB Lden, 45 dB Lnight).
+                                <strong>How it is calculated:</strong> Each hourly point is the logarithmic energy average (LAeq) of all measurements taken during that hour across every recording day — not a simple arithmetic mean.
+                                <strong>How to read it:</strong> Morning peaks (06:00–09:00) and evening peaks (17:00–20:00) typically correspond to commuter traffic. Where the line enters the shaded night band above 45 dB (WHO Lnight limit), nighttime noise is capable of causing sleep disturbance. The filled area shows the overall acoustic load profile throughout the day.
                             </div>
                         </div>
 

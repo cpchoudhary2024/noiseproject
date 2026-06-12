@@ -424,8 +424,113 @@ class StandardsAnalyzer:
                     col_assessment["concern_level"] = "Low-Moderate"
             
             assessment["assessment_by_metric"][col] = col_assessment
-        
+
+        # ── Top-level rollup for the primary LEQ column ──────────────────────
+        # The UI health cards and recommendations consume these flat fields.
+        primary_col = self._pick_primary_column(list(assessment["assessment_by_metric"].keys()))
+        if primary_col:
+            primary = assessment["assessment_by_metric"][primary_col]
+            assessment["primary_metric"] = primary_col
+            assessment["laeq"]   = primary.get("LAeq_overall")
+            assessment["lamax"]  = primary.get("LAmax")
+            assessment["lden"]   = primary.get("Lden")
+            assessment["lnight"] = primary.get("Lnight")
+            assessment["concern_level"]  = primary.get("concern_level", "Low")
+            assessment["health_impacts"] = primary.get("health_impacts", [])
+            assessment["recommendations"] = self._generate_health_recommendations(primary)
+
         return assessment
+
+    @staticmethod
+    def _pick_primary_column(cols: list[str]) -> str | None:
+        """Pick the primary energy-average (LEQ) column for the headline rollup."""
+        if not cols:
+            return None
+        for c in cols:
+            n = "".join(ch for ch in c.lower() if ch.isalnum())
+            if "laeq" in n or "leq" in n:
+                return c
+        # Avoid headline-ing a max/min channel if a general level exists
+        non_peak = [c for c in cols
+                    if not any(k in c.lower() for k in ["max", "min", "peak"])]
+        return non_peak[0] if non_peak else cols[0]
+
+    @staticmethod
+    def _generate_health_recommendations(col_assessment: dict) -> list[str]:
+        """Build WHO-grounded, actionable recommendations from a column assessment.
+
+        Template-based (no AI). Thresholds: WHO 2018 road-traffic Lden 53 dB(A),
+        Lnight 45 dB(A); LOAEL 40 dB(A) Lnight.
+        """
+        recs: list[str] = []
+        lden   = col_assessment.get("Lden")
+        lnight = col_assessment.get("Lnight")
+        laeq   = col_assessment.get("LAeq_overall")
+        concern = str(col_assessment.get("concern_level", "Low"))
+
+        def _num(v):
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        lden_v, lnight_v, laeq_v = _num(lden), _num(lnight), _num(laeq)
+
+        # Daytime / Lden guidance (WHO road-traffic guideline = 53 dB Lden)
+        if lden_v is not None:
+            if lden_v > 53:
+                recs.append(
+                    f"Lden is {lden_v:.1f} dB(A), above the WHO 2018 road-traffic guideline of 53 dB(A). "
+                    "Consider source-directed mitigation (barriers, low-noise road surfaces, traffic calming, "
+                    "or setback distance) and prioritise façade insulation for exposed rooms."
+                )
+            else:
+                recs.append(
+                    f"Lden is {lden_v:.1f} dB(A), within the WHO 2018 road-traffic guideline of 53 dB(A). "
+                    "Maintain current conditions and re-monitor periodically."
+                )
+
+        # Nighttime / sleep guidance (WHO Lnight 45 dB; LOAEL 40 dB)
+        if lnight_v is not None:
+            if lnight_v > 45:
+                recs.append(
+                    f"Lnight is {lnight_v:.1f} dB(A), above the WHO sleep-protection guideline of 45 dB(A). "
+                    "Keep bedroom windows closed at night, position sleeping areas away from the noise source, "
+                    "and consider acoustic glazing — nighttime exposure at this level is linked to disrupted "
+                    "sleep architecture and cardiovascular strain."
+                )
+            elif lnight_v > 40:
+                recs.append(
+                    f"Lnight is {lnight_v:.1f} dB(A), between the WHO LOAEL (40 dB) and the 45 dB guideline. "
+                    "Subtle sleep effects may begin for sensitive residents; monitor and protect vulnerable "
+                    "occupants (children, elderly, shift workers)."
+                )
+            else:
+                recs.append(
+                    f"Lnight is {lnight_v:.1f} dB(A), below the WHO LOAEL of 40 dB(A). "
+                    "No nighttime sleep effects are expected at this level."
+                )
+
+        # Fallback when no timestamped Lden/Lnight could be computed
+        if lden_v is None and lnight_v is None and laeq_v is not None:
+            recs.append(
+                f"Overall LAeq is {laeq_v:.1f} dB(A). Timestamped Lden/Lnight could not be computed, so "
+                "day/night WHO comparisons are unavailable — ensure the dataset includes valid timestamps "
+                "for a full health assessment."
+            )
+
+        if concern in ("High", "Critical", "Moderate to High"):
+            recs.append(
+                "Given the elevated concern level, a professional acoustic assessment and a formal "
+                "noise-management plan are recommended."
+            )
+
+        # Universal protective guidance
+        recs.append(
+            "Protect sensitive groups (children, elderly, pregnant women, and people with "
+            "cardiovascular or respiratory conditions), who experience noise health effects at lower levels."
+        )
+        return recs
     
     def get_occupational_assessment(self):
         """Assess occupational exposure against NIOSH and OSHA standards."""

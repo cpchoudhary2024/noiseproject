@@ -38,10 +38,13 @@ class ReportGeneratorV2:
     
     def __init__(self, df, filepath, analysis=None, standards=None, daily_summary=None, hourly_summary=None,
                  device_id: str = '', source_files: list | None = None, merge_gap_report: dict | None = None,
-                 custom_section_heading: str = '', custom_section_body: str = ''):
+                 custom_section_heading: str = '', custom_section_body: str = '', environment: str = 'outdoor'):
         """
         Initialize report generator with ONLY the uploaded data.
         NO external CSV file loading - all summaries computed from df.
+
+        environment : 'outdoor' (default) or 'indoor' — controls whether the WHO
+        indoor bedroom guidelines are evaluated in the compliance matrix.
         """
         self.df = df.copy()
         self.filepath = filepath
@@ -50,6 +53,9 @@ class ReportGeneratorV2:
         self.merge_gap_report = merge_gap_report  # pre-computed gap dict from the merge step
         self.custom_section_heading = str(custom_section_heading or '').strip()
         self.custom_section_body = str(custom_section_body or '').strip()
+        self.environment = str(environment or 'outdoor').strip().lower()
+        self.timestamps_synthetic = False  # set True if no real timestamps could be read
+        self.timestamp_integrity = None
         self.analyzer = NoiseAnalyzer(df)
         self.standards = StandardsAnalyzer(df)
         self._analysis = analysis
@@ -463,6 +469,24 @@ class ReportGeneratorV2:
         ts_col, leq_col, lmax_col, lmin_col = self._resolve_acoustic_columns()
         ts = self._get_timestamp_series(ts_col)
 
+        # Timestamp-integrity warning — fabricated dates were substituted.
+        if self.timestamps_synthetic:
+            warn_style = ParagraphStyle(
+                'TsWarn', parent=styles['BodyText'], fontSize=9, leading=12,
+                backColor=colors.HexColor('#FEF2F2'), borderColor=colors.HexColor('#DC2626'),
+                borderWidth=1, borderPadding=(8, 10, 8, 10), textColor=colors.HexColor('#7F1D1D'),
+            )
+            story.append(Paragraph(
+                "<b>⚠ Timestamps could not be read from this file.</b> The original date/time column "
+                "was missing or corrupted, so date- and time-based results in this report "
+                "(Lden, Lnight, the daily summary, diurnal profile, and heatmap) are based on a "
+                "substituted index and should NOT be interpreted as real dates or times. Overall "
+                "LAeq and statistical percentiles remain valid. Re-export the source file keeping the "
+                "full 'YYYY-MM-DD HH:MM:SS' timestamp column for a complete time-based assessment.",
+                warn_style
+            ))
+            story.append(Spacer(1, 0.18 * inch))
+
         # ========== 8 SECTIONS ==========
         
         # Section 1: Executive Acoustic Summary
@@ -510,9 +534,14 @@ class ReportGeneratorV2:
         return report_path
 
     def generate_html_report(self, report_type='comprehensive', output_dir: str | None = None):
-        """Generate a comprehensive standalone HTML report with all sections, charts, and tables."""
+        """Generate a plain-language Community Noise Report for non-expert readers.
 
-        report_filename = f"noise_analysis_{report_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        Designed for research-study participants: a clear headline, friendly key
+        numbers, three intuitive visuals (how your noise compares, day-by-day
+        trend, a typical day), plus plain-language health meaning and actions.
+        No percentile tables, box-and-whisker, radar charts, or pass/fail jargon.
+        """
+        report_filename = f"community_noise_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         report_dir = output_dir or os.path.dirname(self.filepath)
         os.makedirs(report_dir, exist_ok=True)
         report_path = os.path.join(report_dir, report_filename)
@@ -520,61 +549,65 @@ class ReportGeneratorV2:
         ts_col, leq_col, lmax_col, lmin_col = self._resolve_acoustic_columns()
         ts  = self._get_timestamp_series(ts_col)
         leq = self._get_numeric_series(leq_col)
-        lmax = self._get_numeric_series(lmax_col) if lmax_col else None
-        lmin = self._get_numeric_series(lmin_col) if lmin_col else None
 
         ts_valid = ts.dropna()
-        start_str = ts_valid.min().strftime('%Y-%m-%d %H:%M:%S') if not ts_valid.empty else 'N/A'
-        end_str   = ts_valid.max().strftime('%Y-%m-%d %H:%M:%S') if not ts_valid.empty else 'N/A'
-        duration_label = self._compute_duration_label(ts)
+        start_str = ts_valid.min().strftime('%d %b %Y') if not ts_valid.empty else 'N/A'
+        end_str   = ts_valid.max().strftime('%d %b %Y') if not ts_valid.empty else 'N/A'
         n_days_v = int(round((ts_valid.max() - ts_valid.min()).total_seconds() / 86400)) if not ts_valid.empty else 0
         expected_s = max(0.0, (ts_valid.max() - ts_valid.min()).total_seconds()) if not ts_valid.empty else 0
         completeness = 100.0 * len(self.df) / max(1, expected_s) if expected_s > 0 else None
 
         # Acoustic metrics
-        laeq_v   = energetic_mean_db(leq) if not leq.dropna().empty else None
-        env      = compute_ldn_lden(ts, leq) or {} if not leq.dropna().empty else {}
+        leq_clean = leq.dropna()
+        laeq_v   = energetic_mean_db(leq) if not leq_clean.empty else None
+        env      = compute_ldn_lden(ts, leq) or {} if not leq_clean.empty else {}
         lden_v   = env.get('Lden')
         lnight_v = env.get('Lnight')
+        peak_v   = float(leq_clean.max()) if not leq_clean.empty else None
+        exc = exceedance_levels_db(leq_clean.to_numpy()) or {} if not leq_clean.empty else {}
+        l90_v = exc.get('L90')
+
+        # Participant-friendly headline numbers
+        WHO_DAY_GUIDELINE = 53.0   # WHO 2018 road-traffic Lden guideline
+        pct_within = (100.0 * float((leq_clean <= WHO_DAY_GUIDELINE).mean())
+                      if not leq_clean.empty else None)
+
+        # Loudest / quietest hour of day (from the precomputed hourly summary)
+        loud_hr = quiet_hr = None
+        loud_db = quiet_db = None
+        if self.hourly_summary is not None and not self.hourly_summary.empty:
+            hs = self.hourly_summary.dropna(subset=['Average_L_EQ_dB'])
+            if not hs.empty:
+                lrow = hs.loc[hs['Average_L_EQ_dB'].idxmax()]
+                qrow = hs.loc[hs['Average_L_EQ_dB'].idxmin()]
+                loud_hr, loud_db = int(lrow['Hour']), float(lrow['Average_L_EQ_dB'])
+                quiet_hr, quiet_db = int(qrow['Hour']), float(qrow['Average_L_EQ_dB'])
+
+        # Plain-English summary (reused; rendered as readable prose)
         h = ts.dt.hour
         is_day   = (h >= 7) & (h < 22)
         is_night = ~is_day
         laeq_day_v   = energetic_mean_db(leq[is_day])   if is_day.any()   else None
         laeq_night_v = energetic_mean_db(leq[is_night]) if is_night.any() else None
-        exc = exceedance_levels_db(leq.dropna().to_numpy()) or {} if not leq.dropna().empty else {}
-
-        # Plain-English summary
         summary_text = ReportGeneratorV2.generate_plain_english_summary(
             laeq=laeq_v, lden=lden_v, lnight=lnight_v,
             laeq_day=laeq_day_v, laeq_night=laeq_night_v,
-            laeq_min=float(leq.min()) if not leq.dropna().empty else None,
-            laeq_max=float(leq.max()) if not leq.dropna().empty else None,
-            l10=exc.get('L10'), l90=exc.get('L90'),
-            start_date=ts_valid.min().strftime('%d %b %Y') if not ts_valid.empty else '',
-            end_date=ts_valid.max().strftime('%d %b %Y') if not ts_valid.empty else '',
-            duration_label=duration_label,
-            data_completeness_pct=completeness,
-            n_days=n_days_v,
+            laeq_min=float(leq_clean.min()) if not leq_clean.empty else None,
+            laeq_max=peak_v,
+            l10=exc.get('L10'), l90=l90_v,
+            start_date=start_str, end_date=end_str,
+            duration_label=self._compute_duration_label(ts),
+            data_completeness_pct=completeness, n_days=n_days_v,
         )
 
-        # Concern level colour for summary box
-        concern_color = '#1e3a5f'
-        concern_bg    = '#EFF6FF'
+        # Concern level → colour
         _st_lower = summary_text.lower()
         if 'concern level: high' in _st_lower or 'concern level: serious' in _st_lower:
-            concern_color = '#991b1b'; concern_bg = '#FEF2F2'
+            concern_color, concern_bg, concern_label = '#991b1b', '#FEF2F2', 'HIGH'
         elif 'concern level: moderate' in _st_lower:
-            concern_color = '#92400e'; concern_bg = '#FFFBEB'
-
-        # Compliance results for table
-        try:
-            compliance_results = evaluate_compliance(
-                lden=lden_v, lnight=lnight_v, laeq=laeq_v,
-                laeq_day=laeq_day_v, laeq_night=laeq_night_v,
-                lamax=float(lmax.max()) if lmax is not None and not lmax.dropna().empty else None,
-            )
-        except Exception:
-            compliance_results = []
+            concern_color, concern_bg, concern_label = '#92400e', '#FFFBEB', 'MODERATE'
+        else:
+            concern_color, concern_bg, concern_label = '#166534', '#F0FDF4', 'LOW'
 
         def _hfmt(v):
             try:
@@ -587,268 +620,463 @@ class ReportGeneratorV2:
             return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
         def _summary_to_html(text: str) -> str:
-            """Convert the structured summary string to HTML paragraphs and bullet lists."""
-            html_parts = []
-            for para in text.split('\n\n'):
-                lines = para.split('\n')
-                bullet_lines = [l for l in lines if l.strip().startswith('•')]
-                header_lines = [l for l in lines if not l.strip().startswith('•')]
-                header_text  = ' '.join(header_lines).strip()
-                if header_text:
-                    # Section titles (WHO compliance, Overall Concern) → bold
-                    if header_text.startswith('WHO ') or header_text.startswith('Overall Concern'):
-                        html_parts.append(f"<p style='margin:8px 0 4px'><strong>{_esc(header_text)}</strong></p>")
-                    else:
-                        html_parts.append(f"<p style='margin:8px 0 4px'>{_esc(header_text)}</p>")
-                if bullet_lines:
-                    items = ''.join(
-                        f"<li style='margin-bottom:4px'>{_esc(l.strip().lstrip('•').strip())}</li>"
-                        for l in bullet_lines
-                    )
-                    html_parts.append(f"<ul style='margin:4px 0 8px 20px;padding:0'>{items}</ul>")
-            return '\n'.join(html_parts)
+            """Convert structured summary text to clean single-box HTML with visual sections."""
+            paras = [p.strip() for p in text.split('\n\n') if p.strip()]
+            body_paras, who_para, concern_para = [], None, None
+            for para in paras:
+                first_line = para.split('\n')[0].strip()
+                if first_line.startswith('WHO ') or first_line.startswith('WHO '):
+                    who_para = para
+                elif first_line.startswith('Overall Concern'):
+                    concern_para = para
+                else:
+                    body_paras.append(para)
 
-        # ── Compliance table rows HTML ──
-        comp_rows_html = ""
-        for r in compliance_results:
-            bg  = '#dcfce7' if r['status'] == 'PASS' else '#fee2e2'
-            clr = '#166534' if r['status'] == 'PASS' else '#991b1b'
-            delta = abs(r['delta_db'])
-            margin_text = (f"Within limit by {delta:.1f} dB" if r['status'] == 'PASS'
-                           else f"Exceeds limit by {delta:.1f} dB")
-            comp_rows_html += (
-                f"<tr>"
-                f"<td>{_esc(r['standard'])}</td>"
-                f"<td>{_esc(r['metric'])}</td>"
-                f"<td style='text-align:right'>{_hfmt(r['measured_db'])}</td>"
-                f"<td style='text-align:right'>{_hfmt(r['limit_db'])}</td>"
-                f"<td style='background:{bg};color:{clr};font-weight:600;text-align:center'>"
-                f"{r['status']} — {margin_text}</td>"
-                f"</tr>"
-            )
+            parts = []
 
-        # ── Percentile table rows ──
-        pct_rows_html = ""
-        pct_defs = {
-            "L5":  "Exceeded 5% of the time — captures peak / transient events",
-            "L10": "Exceeded 10% of the time — frequent high-noise events",
-            "L50": "Exceeded 50% of the time — median acoustic level",
-            "L90": "Exceeded 90% of the time — background / ambient noise floor",
-            "L95": "Exceeded 95% of the time — near-constant background level",
-        }
-        for k in ["L5", "L10", "L50", "L90", "L95"]:
-            v = exc.get(k)
-            pct_rows_html += (
-                f"<tr><td><b>{k}</b></td>"
-                f"<td style='text-align:right'>{_hfmt(v)}</td>"
-                f"<td>{pct_defs.get(k, '')}</td></tr>"
-            )
-
-        # ── Daily summary table rows ──
-        daily_rows_html = ""
-        if self.daily_summary is not None and not self.daily_summary.empty:
-            for _, row in self.daily_summary.iterrows():
-                d = row.get('Date', '')
-                try:
-                    d = pd.Timestamp(d).strftime('%Y-%m-%d')
-                except Exception:
-                    d = str(d)
-                daily_rows_html += (
-                    f"<tr>"
-                    f"<td>{_esc(d)}</td>"
-                    f"<td style='text-align:right'>{_hfmt(row.get('Average_L_EQ_dB'))}</td>"
-                    f"<td style='text-align:right'>{_hfmt(row.get('Daytime_LAeq'))}</td>"
-                    f"<td style='text-align:right'>{_hfmt(row.get('Nighttime_LAeq'))}</td>"
-                    f"<td style='text-align:right'>{_hfmt(row.get('Daily_Lden'))}</td>"
-                    f"</tr>"
+            # Concern level badge — shown first for instant visual cue
+            if concern_para:
+                level = 'HIGH'
+                for lv in ('SERIOUS', 'HIGH', 'MODERATE', 'LOW'):
+                    if lv in concern_para.upper():
+                        level = lv
+                        break
+                badge_colors = {
+                    'LOW':      ('#166534', '#dcfce7'),
+                    'MODERATE': ('#92400e', '#fef3c7'),
+                    'HIGH':     ('#991b1b', '#fee2e2'),
+                    'SERIOUS':  ('#7f1d1d', '#fca5a5'),
+                }
+                badge_fg, badge_bg = badge_colors.get(level, ('#1e3a5f', '#dbeafe'))
+                # Strip the "Overall Concern Level: X." prefix to get explanation text
+                explanation = concern_para
+                for prefix in (f'Overall Concern Level: {level}. ', f'Overall Concern Level: {level}.'):
+                    if explanation.startswith(prefix):
+                        explanation = explanation[len(prefix):]
+                        break
+                parts.append(
+                    f"<div style='display:flex;align-items:flex-start;gap:12px;margin-bottom:14px;"
+                    f"padding:10px 14px;background:{badge_bg};border-radius:6px;border-left:4px solid {badge_fg}'>"
+                    f"<span style='font-weight:700;font-size:13px;color:{badge_fg};white-space:nowrap;"
+                    f"letter-spacing:.05em;padding-top:1px'>CONCERN LEVEL: {level}</span>"
+                    f"<span style='font-size:13px;color:#374151;line-height:1.55'>{_esc(explanation)}</span>"
+                    f"</div>"
                 )
 
-        # ── Charts ──
-        charts_specs = [
-            ("Chart 1: Time Series — LAeq with L-Max/L-Min Envelope & WHO Limits",
-             self._fig_time_series_with_band(ts=ts, leq=leq, lmax=lmax, lmin=lmin),
-             "Shows the full LAeq time series across the measurement period with the L-Max/L-Min envelope and WHO guideline reference lines (Lden 53 dB, Lnight 45 dB). Each point is an energy-averaged LAeq over an adaptive resampling interval."),
-            ("Chart 2: Diurnal Box-and-Whisker — Hourly LAeq Volatility",
-             self._fig_diurnal_box_whisker(ts=ts, leq=leq),
-             "Shows the statistical spread of noise levels for each hour of the day, pooled across all measurement days. The box is the IQR (25th–75th percentile); the centre line is the median. Tall boxes indicate acoustically unpredictable hours."),
-            ("Chart 3: Temporal Heatmap — LAeq Intensity by Date & Hour",
-             self._fig_temporal_heatmap(ts=ts, leq=leq),
-             "Each cell shows the energy-averaged LAeq for a specific hour on a specific date. Green = quiet; orange/red = approaching or exceeding WHO limits. Scan vertically to identify noisiest times of day; horizontally to spot unusual days."),
-            ("Chart 4: Diurnal Noise Fingerprint — 24-Hour Polar Radar",
-             self._fig_diurnal_radar(ts=ts, leq=leq),
-             "Polar radar showing the mean LAeq for each of the 24 clock hours. A bulge at 07:00–09:00 and 17:00–19:00 indicates commuter traffic dominance. A uniform ring indicates a continuous source."),
-            ("Chart 5: Weekly Noise Profile — Day-of-Week Radar",
-             self._fig_weekly_radar(ts=ts, leq=leq),
-             "7-spoke radar comparing daytime (07:00–22:00) vs nighttime (22:00–07:00) LAeq for each day of the week. Shorter weekend spokes vs weekday spokes indicate traffic/commercial noise. Requires at least 7 days of data."),
-        ]
+            # Body paragraphs — flow as readable prose
+            for para in body_paras:
+                parts.append(
+                    f"<p style='margin:0 0 10px;line-height:1.7;color:#1f2937'>{_esc(para)}</p>"
+                )
 
+            # WHO compliance section — divider + bullet list
+            if who_para:
+                lines = who_para.split('\n')
+                bullet_lines  = [l for l in lines if l.strip().startswith('•')]
+                header_lines  = [l for l in lines if not l.strip().startswith('•')]
+                section_title = ' '.join(header_lines).strip()
+                items = ''.join(
+                    f"<li style='margin-bottom:5px;line-height:1.55'>{_esc(l.strip().lstrip('•').strip())}</li>"
+                    for l in bullet_lines
+                )
+                parts.append(
+                    f"<div style='margin-top:6px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.10)'>"
+                    f"<p style='margin:0 0 6px;font-weight:600;font-size:13px;color:#1e3a5f'>{_esc(section_title)}</p>"
+                    f"<ul style='margin:0;padding-left:18px;color:#374151;font-size:13px'>{items}</ul>"
+                    f"</div>"
+                )
+
+            return '\n'.join(parts)
+
+        def _level_word(v):
+            if v is None or not np.isfinite(v):
+                return ('not available', '#64748b')
+            if v < 45:  return ('quiet', '#166534')
+            if v < 55:  return ('moderate', '#15803d')
+            if v < 65:  return ('elevated', '#b45309')
+            if v < 75:  return ('high', '#c2410c')
+            return ('very high', '#991b1b')
+
+        avg_word, avg_color = _level_word(laeq_v)
+
+        # ── Participant-friendly charts ──
+        def _chart_html(fig):
+            return (fig.to_html(full_html=False, include_plotlyjs=False) if fig is not None
+                    else "<p style='color:#6b7280;font-style:italic'>Chart unavailable — not enough data.</p>")
+        fig_compare = self._fig_compare_to_references(laeq_v)
+        fig_daily   = self._fig_daily_simple()
+        fig_typical = self._fig_typical_day()
+
+        # ── Plain-language guidance ──
+        health_points, action_points = self._participant_guidance(lden_v, lnight_v, laeq_v)
+
+        # ── Plain within-guideline verdict (uses Lden, the metric the guideline applies to) ──
+        guide_metric = lden_v if (lden_v is not None and np.isfinite(lden_v)) else laeq_v
+        if guide_metric is not None and np.isfinite(guide_metric):
+            if guide_metric <= WHO_DAY_GUIDELINE:
+                verdict_txt = (f"Your overall day-and-night noise level is {guide_metric:.0f} dB, which is "
+                               f"<strong>within</strong> the World Health Organization health guideline of "
+                               f"{WHO_DAY_GUIDELINE:.0f} dB.")
+                verdict_bg, verdict_clr = '#dcfce7', '#166534'
+            else:
+                verdict_txt = (f"Your overall day-and-night noise level is {guide_metric:.0f} dB, which is "
+                               f"<strong>{guide_metric - WHO_DAY_GUIDELINE:.0f} dB above</strong> the World Health "
+                               f"Organization health guideline of {WHO_DAY_GUIDELINE:.0f} dB.")
+                verdict_bg, verdict_clr = '#fee2e2', '#991b1b'
+        else:
+            verdict_txt = "An overall guideline comparison could not be computed for this dataset."
+            verdict_bg, verdict_clr = '#f1f5f9', '#475569'
+
+        def _keycard(value, unit, label, sub):
+            return (
+                "<div class='kc'>"
+                f"<div class='kc-val'>{_esc(value)}<span class='kc-unit'>{_esc(unit)}</span></div>"
+                f"<div class='kc-label'>{_esc(label)}</div>"
+                f"<div class='kc-sub'>{_esc(sub)}</div>"
+                "</div>"
+            )
+
+        loud_txt  = f"{loud_hr:02d}:00" if loud_hr is not None else "N/A"
+        quiet_txt = f"{quiet_hr:02d}:00" if quiet_hr is not None else "N/A"
+
+        # ════════════════════════════════════════════════════════════════════
+        # PARTICIPANT-FRIENDLY ASSEMBLY
+        # ════════════════════════════════════════════════════════════════════
         source_label = (_esc(", ".join(self.source_files)) if self.source_files
                         else _esc(os.path.basename(self.filepath)))
-        device_line  = f"<div class='meta'>Device / Location: <b>{_esc(self.device_id)}</b></div>" if self.device_id else ""
         completeness_str = f"{completeness:.0f}%" if completeness is not None else "N/A"
-        uptime_warn  = (" <span style='color:#b91c1c'>⚠ High data loss</span>" if (completeness or 100) < 90 else "")
+        place = _esc(self.device_id) if self.device_id else "this location"
+
+        def _section(title, intro, body):
+            intro_html = f"<p class='sec-intro'>{intro}</p>" if intro else ""
+            return f"<section class='card'><h2>{_esc(title)}</h2>{intro_html}{body}</section>"
+
+        # Key-number cards
+        key_cards = "".join([
+            _keycard(_hfmt(laeq_v), " dB", "Average noise level",
+                     f"{avg_word} — the steady level with the same energy as the real noise"),
+            _keycard(quiet_txt, "", "Quietest time of day",
+                     (f"around {quiet_db:.0f} dB" if quiet_db is not None else "")),
+            _keycard(loud_txt, "", "Loudest time of day",
+                     (f"around {loud_db:.0f} dB" if loud_db is not None else "")),
+            _keycard((f"{pct_within:.0f}" if pct_within is not None else "N/A"), "%",
+                     "Time within the health guideline",
+                     "share of time at or below the WHO 53 dB level"),
+        ])
+
+        # Health & action bullet lists
+        health_html = "<ul class='plain-list'>" + "".join(
+            f"<li>{_esc(p)}</li>" for p in health_points) + "</ul>"
+        action_html = "<ul class='plain-list'>" + "".join(
+            f"<li>{_esc(p)}</li>" for p in action_points) + "</ul>"
+
+        # Timestamp warning (only when dates were unreadable)
+        ts_warn_html = ""
+        if getattr(self, 'timestamps_synthetic', False):
+            ts_warn_html = (
+                "<div class='card warn'><strong>⚠ Timestamps could not be read from this file.</strong>"
+                "<p>The date/time information was missing or unreadable, so the day-by-day trend and "
+                "typical-day chart below are based on a substituted order and should not be read as real "
+                "dates or times. The average levels remain valid.</p></div>"
+            )
+
+        # Optional custom notes from the user
+        custom_html = ""
+        if self.custom_section_heading or self.custom_section_body:
+            body = "".join(f"<p>{_esc(ln)}</p>" for ln in (self.custom_section_body or '').splitlines() if ln.strip())
+            custom_html = _section(self.custom_section_heading or "Additional Notes", "", body)
 
         html_parts = [
-            "<!DOCTYPE html>",
-            "<html lang='en'>",
-            "<head>",
+            "<!DOCTYPE html>", "<html lang='en'>", "<head>",
             "  <meta charset='UTF-8'>",
             "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>",
-            f"  <title>Noise Analysis Report</title>",
-            "  <script src='https://cdn.plot.ly/plotly-3.4.0.min.js'></script>",
+            "  <title>Community Noise Report</title>",
+            "  <script src='https://cdn.plot.ly/plotly-latest.min.js'></script>",
             "  <style>",
             "    *{box-sizing:border-box;margin:0;padding:0}",
-            "    body{font-family:Arial,sans-serif;background:#f6f8fb;color:#1f2937;font-size:14px}",
-            "    .container{max-width:1200px;margin:0 auto;padding:24px}",
-            "    .card{background:#fff;border-radius:12px;box-shadow:0 4px 16px rgba(15,23,42,0.08);padding:28px;margin-bottom:22px}",
-            "    h1{font-size:26px;color:#1e3a5f;margin-bottom:6px}",
-            "    h2{font-size:18px;color:#1e3a5f;margin-bottom:14px;padding-bottom:6px;border-bottom:2px solid #e5e7eb}",
-            "    h3{font-size:14px;color:#374151;margin:16px 0 8px 0}",
-            "    .meta{color:#6b7280;font-size:12px;margin-top:4px}",
-            "    .summary-box{border-radius:8px;padding:16px 20px;line-height:1.7;font-size:14px}",
-            "    .metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-top:14px}",
-            "    .metric-card{background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:14px;text-align:center}",
-            "    .metric-val{font-size:28px;font-weight:700;color:#1e3a5f}",
-            "    .metric-lbl{font-size:11px;color:#6b7280;margin-top:4px}",
-            "    table{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}",
-            "    th{background:#1e3a5f;color:#fff;padding:9px 12px;text-align:left;font-weight:600}",
-            "    td{padding:8px 12px;border-bottom:1px solid #e5e7eb;vertical-align:middle}",
-            "    tr:nth-child(even) td{background:#f8fafc}",
-            "    .chart-wrap{margin-top:18px}",
-            "    .chart-note{font-size:12px;color:#6b7280;margin-top:8px;line-height:1.5}",
-            "    .who-note{background:#fffbeb;border:1px solid #d97706;border-radius:6px;padding:14px;font-size:13px;line-height:1.6;margin-top:14px}",
-            "    .who-note b{color:#92400e}",
-            "    .footer{text-align:center;font-size:11px;color:#9ca3af;margin-top:30px;padding:16px}",
-            "  </style>",
-            "</head>",
-            "<body>",
-            "  <div class='container'>",
+            "    body{font-family:'Inter',-apple-system,Segoe UI,Arial,sans-serif;background:#eef2f7;color:#1e293b;line-height:1.6;font-size:15px}",
+            "    .wrap{max-width:920px;margin:0 auto;padding:28px 20px 60px}",
+            "    .card{background:#fff;border:1px solid #e3e9f1;border-radius:16px;box-shadow:0 4px 14px rgba(15,37,64,.06);padding:30px 32px;margin-bottom:22px}",
+            "    .hero{background:linear-gradient(115deg,#13294a 0%,#1e3a5f 55%,#244c77 100%);color:#fff;border:none}",
+            "    .hero h1{font-size:30px;font-weight:800;letter-spacing:-.02em;margin-bottom:6px}",
+            "    .hero .sub{opacity:.9;font-size:14px}",
+            "    .hero .meta{margin-top:14px;font-size:13px;opacity:.85;display:flex;flex-wrap:wrap;gap:6px 22px}",
+            "    h2{font-size:20px;color:#13294a;letter-spacing:-.01em;margin-bottom:6px}",
+            "    .sec-intro{color:#64748b;font-size:14px;margin-bottom:16px}",
+            "    .badge{display:inline-block;font-weight:800;font-size:13px;letter-spacing:.05em;padding:5px 12px;border-radius:999px;margin-bottom:14px}",
+            "    .summary p{margin:0 0 10px;color:#334155}",
+            "    .summary ul{margin:6px 0 0 18px;color:#334155;font-size:14px}",
+            "    .keygrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px}",
+            "    .kc{background:#f7f9fc;border:1px solid #e3e9f1;border-radius:13px;padding:18px 18px}",
+            "    .kc-val{font-family:'JetBrains Mono',monospace;font-size:30px;font-weight:700;color:#1e3a5f;letter-spacing:-.02em}",
+            "    .kc-unit{font-size:14px;font-weight:600;color:#64748b;margin-left:3px}",
+            "    .kc-label{font-weight:700;font-size:13px;color:#334155;margin-top:6px}",
+            "    .kc-sub{font-size:12px;color:#94a3b8;margin-top:3px;line-height:1.45}",
+            "    .verdict{padding:14px 18px;border-radius:11px;font-size:15px;margin-bottom:18px}",
+            "    .plain-list{margin:0;padding-left:20px}",
+            "    .plain-list li{margin-bottom:9px;color:#334155}",
+            "    .warn{background:#fef2f2;border-color:#fca5a5;border-left:5px solid #dc2626}",
+            "    .warn strong{color:#991b1b}.warn p{color:#7f1d1d;font-size:14px;margin-top:6px}",
+            "    .chart-note{font-size:13px;color:#64748b;margin-top:8px;line-height:1.5}",
+            "    .about{font-size:13px;color:#475569}.about div{padding:5px 0;border-bottom:1px solid #eef2f7;display:flex;gap:10px}",
+            "    .about b{min-width:170px;color:#334155}",
+            "    .footer{text-align:center;font-size:12px;color:#94a3b8;padding:22px 10px}",
+            "    .disclaimer{font-size:12px;color:#94a3b8;line-height:1.6;margin-top:12px}",
+            "  </style>", "</head>", "<body>", "  <div class='wrap'>",
 
-            # ── Header ──
-            "    <div class='card'>",
-            "      <h1>Environmental Noise Analysis Report</h1>",
-            device_line,
-            f"      <div class='meta'>Source file(s): {source_label}</div>",
-            f"      <div class='meta'>Measurement period: {_esc(start_str)} to {_esc(end_str)} ({_esc(duration_label)})</div>",
-            f"      <div class='meta'>Data completeness: {completeness_str}{uptime_warn}</div>",
-            f"      <div class='meta'>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>",
+            # ── Hero header ──
+            "  <section class='card hero'>",
+            "    <h1>Community Noise Report</h1>",
+            f"    <div class='sub'>A plain-language summary of the noise measured at {place}.</div>",
+            "    <div class='meta'>"
+            f"<span>📍 {place}</span>"
+            f"<span>🗓 {_esc(start_str)} → {_esc(end_str)}</span>"
+            f"<span>📊 {n_days_v} day(s), {completeness_str} data captured</span>"
+            f"<span>📄 Generated {datetime.now().strftime('%d %b %Y')}</span>"
+            "</div>",
+            "  </section>",
+
+            ts_warn_html,
+
+            # ── Headline: what we found ──
+            "  <section class='card summary'>",
+            "    <h2>What we found</h2>",
+            f"    <span class='badge' style='background:{concern_bg};color:{concern_color}'>OVERALL: {concern_label}</span>",
+            f"    {_summary_to_html(summary_text)}",
+            "  </section>",
+
+            # ── Key numbers ──
+            _section("Your noise at a glance", "", f"<div class='keygrid'>{key_cards}</div>"),
+
+            # ── How your noise compares ──
+            _section(
+                "How your noise compares",
+                "The bar below places your average noise level next to everyday sounds and the World "
+                "Health Organization (WHO) health guideline, so you can see where your location sits.",
+                f"<div class='verdict' style='background:{verdict_bg};color:{verdict_clr}'>{verdict_txt}</div>"
+                + _chart_html(fig_compare)
+            ),
+
+            # ── Day-by-day ──
+            _section(
+                "Day by day",
+                "Each point is the average noise level for one day of monitoring. The dashed line is the "
+                "WHO health guideline (53 dB) — days above it were louder than recommended.",
+                _chart_html(fig_daily)
+                + "<div class='chart-note'>A higher line means a louder day overall.</div>"
+            ),
+
+            # ── A typical day ──
+            _section(
+                "A typical day",
+                "This shows the average noise for each hour of the day, combined across all monitored days. "
+                "The shaded band is night-time (11 PM – 7 AM), when quiet matters most for sleep.",
+                _chart_html(fig_typical)
+                + "<div class='chart-note'>Use this to see when your location is usually loudest and quietest.</div>"
+            ),
+
+            # ── Health meaning ──
+            _section("What this means for your health", "", health_html),
+
+            # ── Actions ──
+            _section("What you can do", "", action_html),
+
+            custom_html,
+
+            # ── About ──
+            "  <section class='card'>",
+            "    <h2>About this measurement</h2>",
+            "    <div class='about'>",
+            f"      <div><b>Location / device</b><span>{place}</span></div>",
+            f"      <div><b>Monitoring period</b><span>{_esc(start_str)} to {_esc(end_str)} ({n_days_v} day(s))</span></div>",
+            f"      <div><b>Data captured</b><span>{completeness_str} of the period</span></div>",
+            f"      <div><b>Source file(s)</b><span>{source_label}</span></div>",
+            f"      <div><b>Loudest single moment</b><span>{_hfmt(peak_v)} dB</span></div>",
+            f"      <div><b>Quiet background level</b><span>{_hfmt(l90_v)} dB (the level it stays below 90% of the time)</span></div>",
             "    </div>",
+            "    <p class='disclaimer'>Noise is measured in A-weighted decibels (dB), matched to how human hearing works. "
+            "Levels are energy-averaged (LAeq), the standard way to summarise changing noise. Guideline values come from "
+            "the WHO Environmental Noise Guidelines (2018). This is a community summary for general understanding and "
+            "research participation — it is not a clinical diagnosis or legal assessment. For a formal evaluation, consult "
+            "a certified acoustic professional.</p>",
+            "  </section>",
 
-            # ── Section 1: Plain-English Summary ──
-            "    <div class='card'>",
-            "      <h2>Section 1: Non-Technical Summary — Noise Exposure &amp; Health Assessment</h2>",
-            f"      <div class='summary-box' style='background:{concern_bg};border:1px solid {concern_color};color:#1f2937'>",
-            f"        {_summary_to_html(summary_text)}",
-            "      </div>",
-            "    </div>",
-
-            # ── Section 2: Key Acoustic Metrics ──
-            "    <div class='card'>",
-            "      <h2>Section 2: Key Acoustic Metrics</h2>",
-            "      <div class='metrics-grid'>",
-            f"        <div class='metric-card'><div class='metric-val'>{_hfmt(laeq_v)}</div><div class='metric-lbl'>LAeq — 24-hr Energy Average (dB(A))</div></div>",
-            f"        <div class='metric-card'><div class='metric-val'>{_hfmt(lden_v)}</div><div class='metric-lbl'>Lden — Day-Evening-Night Weighted (dB(A))<br><span style='font-size:10px'>WHO limit: 53 dB(A)</span></div></div>",
-            f"        <div class='metric-card'><div class='metric-val'>{_hfmt(lnight_v)}</div><div class='metric-lbl'>Lnight — Nighttime Average 23:00–07:00 (dB(A))<br><span style='font-size:10px'>WHO limit: 45 dB(A)</span></div></div>",
-            f"        <div class='metric-card'><div class='metric-val'>{_hfmt(laeq_day_v)}</div><div class='metric-lbl'>LAeq Day — 07:00–22:00 (dB(A))</div></div>",
-            f"        <div class='metric-card'><div class='metric-val'>{_hfmt(laeq_night_v)}</div><div class='metric-lbl'>LAeq Night — 22:00–07:00 (dB(A))</div></div>",
-            f"        <div class='metric-card'><div class='metric-val'>{_hfmt(float(leq.max()) if not leq.dropna().empty else None)}</div><div class='metric-lbl'>LAmax — Absolute Peak (dB(A))</div></div>",
-            f"        <div class='metric-card'><div class='metric-val'>{_hfmt(float(leq.min()) if not leq.dropna().empty else None)}</div><div class='metric-lbl'>LAmin — Absolute Floor (dB(A))</div></div>",
-            "      </div>",
-            "    </div>",
-
-            # ── Section 3: Regulatory Compliance ──
-            "    <div class='card'>",
-            "      <h2>Section 3: Regulatory &amp; Health Compliance</h2>",
-            "      <p style='font-size:13px;color:#374151;margin-bottom:6px'>Standards: WHO Environmental Noise Guidelines (2018), WHO Community Noise Guidelines (1999), Maryland COMAR 26.02.03.02.</p>",
-            "      <table>",
-            "        <thead><tr><th>Regulatory Standard</th><th>Metric</th><th style='text-align:right'>Measured (dB(A))</th><th style='text-align:right'>Limit (dB(A))</th><th style='text-align:center'>Assessment</th></tr></thead>",
-            f"        <tbody>{comp_rows_html}</tbody>",
-            "      </table>",
-            "      <div class='who-note'>",
-            "        <b>Important note on WHO 2018 Road Traffic and Aircraft Noise rows:</b> "
-            "The WHO 2018 road-traffic (Lden ≤ 53 dB(A), Lnight ≤ 45 dB(A)) and aircraft (Lden ≤ 45 dB(A), Lnight ≤ 40 dB(A)) "
-            "guidelines are source-specific standards derived from studies that attributed noise exclusively to those sources. "
-            "The NSTRW MK4 sensor measures total combined acoustic energy and cannot identify or separate individual noise sources. "
-            "A 'NON-COMPLIANT' result here means total measured noise from all sources exceeds the WHO threshold — not that road "
-            "traffic or aircraft alone is responsible. Furthermore, WHO 2018 intends these metrics to represent long-term annual "
-            "average exposure; a measurement period of days or weeks is indicative only.",
-            "      </div>",
-            "    </div>",
-
-            # ── Section 4: Statistical Noise Profile (Percentiles) ──
-            "    <div class='card'>",
-            "      <h2>Section 4: Statistical Noise Profile — Exceedance Percentiles</h2>",
-            "      <table>",
-            "        <thead><tr><th>Percentile</th><th style='text-align:right'>Value (dB(A))</th><th>Definition</th></tr></thead>",
-            f"        <tbody>{pct_rows_html}</tbody>",
-            "      </table>",
-            "    </div>",
-        ]
-
-        # ── Top Peak Noise Events ──
-        _noise_events_html = self._top_noise_events_html(ts, leq_col)
-        if _noise_events_html:
-            html_parts.append(_noise_events_html)
-
-        # ── Optional custom section ──
-        if self.custom_section_heading or self.custom_section_body:
-            heading_text = _esc(self.custom_section_heading or "Additional Notes")
-            body_lines = "".join(
-                f"<p style='margin-bottom:8px;line-height:1.6'>{_esc(ln)}</p>"
-                for ln in (self.custom_section_body or '').splitlines()
-                if ln.strip()
-            )
-            html_parts += [
-                "    <div class='card'>",
-                f"      <h2>Additional Notes: {heading_text}</h2>",
-                body_lines,
-                "    </div>",
-            ]
-
-        # ── Section 5: Daily Summary Matrix ──
-        if daily_rows_html:
-            html_parts += [
-                "    <div class='card'>",
-                "      <h2>Section 5: Daily Summary Matrix</h2>",
-                "      <table>",
-                "        <thead><tr><th>Date</th><th style='text-align:right'>24-hr LAeq (dB(A))</th><th style='text-align:right'>Daytime 07–22 (dB(A))</th><th style='text-align:right'>Nighttime 22–07 (dB(A))</th><th style='text-align:right'>Daily Lden (dB(A))</th></tr></thead>",
-                f"        <tbody>{daily_rows_html}</tbody>",
-                "      </table>",
-                "    </div>",
-            ]
-
-        # ── Section 6: Advanced Visualisations ──
-        html_parts += [
-            "    <div class='card'>",
-            "      <h2>Section 6: Advanced Visualisations</h2>",
-            "      <p style='font-size:13px;color:#374151'>All charts are computed directly from the uploaded dataset using logarithmic energy-averaging (LAeq). WHO guideline lines are shown where applicable.</p>",
-        ]
-        for title, fig, note in charts_specs:
-            html_parts.append(f"      <div class='chart-wrap'><h3>{_esc(title)}</h3>")
-            if fig is None:
-                html_parts.append("        <p style='color:#6b7280;font-style:italic'>Chart unavailable — insufficient data.</p>")
-            else:
-                html_parts.append(fig.to_html(full_html=False, include_plotlyjs=False))
-            html_parts.append(f"        <div class='chart-note'>{_esc(note)}</div></div>")
-        html_parts.append("    </div>")
-
-        # ── Footer ──
-        html_parts += [
-            "    <div class='footer'>",
-            "      Environmental Noise Analysis Platform | "
-            "Developed by Chandra Prakash Choudhary | "
-            "PI: Dr. Ana María Rule, Associate Professor, Johns Hopkins University | "
-            f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "    </div>",
+            # ── Footer ──
+            "  <div class='footer'>",
+            "    Environmental Noise Analysis Platform · Developed by Chandra Prakash Choudhary · "
+            "PI: Dr. Ana María Rule, Johns Hopkins University",
             "  </div>",
-            "</body>",
-            "</html>",
+            "  </div>", "</body>", "</html>",
         ]
 
         with open(report_path, 'w', encoding='utf-8') as fh:
-            fh.write('\n'.join(html_parts))
+            fh.write('\n'.join(p for p in html_parts if p))
 
         return report_path
+
+    # ============================================================
+    # PARTICIPANT-FRIENDLY CHART BUILDERS (HTML report)
+    # ============================================================
+
+    def _fig_compare_to_references(self, laeq):
+        """Horizontal bar placing the measured average next to everyday sounds."""
+        if laeq is None or not np.isfinite(laeq):
+            return None
+        refs = [
+            ("Whisper / quiet bedroom", 30.0, '#cbd5e1'),
+            ("Library / soft rain", 40.0, '#cbd5e1'),
+            ("Normal conversation", 50.0, '#cbd5e1'),
+            ("WHO health guideline", 53.0, '#f59e0b'),
+            ("Your location", float(laeq), '#1e3a5f'),
+            ("Busy street traffic", 70.0, '#cbd5e1'),
+            ("Power tools (hearing risk)", 85.0, '#cbd5e1'),
+        ]
+        refs.sort(key=lambda r: r[1])
+        labels = [r[0] for r in refs]
+        values = [r[1] for r in refs]
+        colors = [r[2] for r in refs]
+        fig = go.Figure(go.Bar(
+            x=values, y=labels, orientation='h',
+            marker=dict(color=colors),
+            text=[f"{v:.0f} dB" for v in values],
+            textposition='outside',
+            cliponaxis=False,
+            hovertemplate='%{y}: %{x:.0f} dB(A)<extra></extra>',
+        ))
+        fig.update_layout(
+            height=340, margin=dict(l=10, r=60, t=20, b=40),
+            xaxis=dict(title='Noise level (dB)', range=[0, 95], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
+            yaxis=dict(automargin=True),
+            plot_bgcolor='white', paper_bgcolor='white', showlegend=False,
+        )
+        return fig
+
+    def _fig_daily_simple(self):
+        """Simple day-by-day average noise trend vs the WHO guideline."""
+        ds = self.daily_summary
+        if ds is None or ds.empty or 'Average_L_EQ_dB' not in ds.columns:
+            return None
+        d = ds.dropna(subset=['Average_L_EQ_dB'])
+        if d.empty:
+            return None
+        try:
+            x = [pd.Timestamp(v).strftime('%d %b') for v in d['Date']]
+        except Exception:
+            x = [str(v) for v in d['Date']]
+        y = [float(v) for v in d['Average_L_EQ_dB']]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=x, y=y, mode='lines+markers', fill='tozeroy',
+            line=dict(color='#1e3a5f', width=2.5), marker=dict(size=7, color='#1e3a5f'),
+            fillcolor='rgba(30,58,95,0.08)', name='Daily average',
+            hovertemplate='%{x}<br>%{y:.1f} dB(A)<extra></extra>',
+        ))
+        ymax = max(y + [53]) + 6
+        ymin = min(y + [45]) - 4
+        fig.add_hline(y=53, line=dict(color='#dc2626', width=1.5, dash='dash'),
+                      annotation_text='WHO guideline 53 dB', annotation_position='top left',
+                      annotation_font=dict(size=11, color='#b91c1c'))
+        fig.update_layout(
+            height=360, margin=dict(l=55, r=30, t=30, b=60),
+            xaxis=dict(title='Date', automargin=True, gridcolor='rgba(0,0,0,0.06)'),
+            yaxis=dict(title='Average noise (dB)', range=[ymin, ymax], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
+            plot_bgcolor='white', paper_bgcolor='white', showlegend=False,
+        )
+        return fig
+
+    def _fig_typical_day(self):
+        """24-hour average profile with the WHO night window shaded."""
+        hs = self.hourly_summary
+        if hs is None or hs.empty or 'Average_L_EQ_dB' not in hs.columns:
+            return None
+        d = hs.dropna(subset=['Average_L_EQ_dB']).sort_values('Hour')
+        if d.empty:
+            return None
+        hours = [int(v) for v in d['Hour']]
+        labels = [f"{hh:02d}:00" for hh in hours]
+        y = [float(v) for v in d['Average_L_EQ_dB']]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=labels, y=y, mode='lines+markers', fill='tozeroy',
+            line=dict(color='#1e3a5f', width=2.5), marker=dict(size=6, color='#1e3a5f'),
+            fillcolor='rgba(30,58,95,0.07)', name='Hourly average',
+            hovertemplate='%{x}<br>%{y:.1f} dB(A)<extra></extra>',
+        ))
+        ymax = max(y + [53]) + 6
+        ymin = min(y + [40]) - 4
+        # Shade the WHO night window (23:00–07:00) by category index.
+        def _idx(hr):
+            return hours.index(hr) if hr in hours else None
+        shapes = []
+        a, b = _idx(0), _idx(6)
+        if a is not None and b is not None:
+            shapes.append(dict(type='rect', xref='x', yref='paper', x0=a - 0.5, x1=b + 0.5,
+                               y0=0, y1=1, fillcolor='rgba(30,58,95,0.07)', line=dict(width=0), layer='below'))
+        c = _idx(23)
+        if c is not None:
+            shapes.append(dict(type='rect', xref='x', yref='paper', x0=c - 0.5, x1=c + 0.5,
+                               y0=0, y1=1, fillcolor='rgba(30,58,95,0.07)', line=dict(width=0), layer='below'))
+        fig.add_hline(y=53, line=dict(color='#dc2626', width=1.3, dash='dot'))
+        fig.add_hline(y=45, line=dict(color='#d97706', width=1.3, dash='dot'))
+        fig.update_layout(
+            height=360, margin=dict(l=55, r=30, t=40, b=60), shapes=shapes,
+            xaxis=dict(title='Hour of day', automargin=True, gridcolor='rgba(0,0,0,0.06)'),
+            yaxis=dict(title='Average noise (dB)', range=[ymin, ymax], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
+            plot_bgcolor='white', paper_bgcolor='white', showlegend=False,
+            annotations=[dict(xref='paper', yref='paper', x=0.01, y=0.98, showarrow=False,
+                              text='Shaded = night (11 PM–7 AM)', font=dict(size=11, color='rgba(30,58,95,0.65)'),
+                              xanchor='left', yanchor='top')],
+        )
+        return fig
+
+    @staticmethod
+    def _participant_guidance(lden, lnight, laeq):
+        """Return (health_points, action_points) as plain-language bullet strings."""
+        def _ok(v):
+            return v is not None and np.isfinite(v)
+
+        health, actions = [], []
+
+        # Night-time / sleep
+        if _ok(lnight) and lnight > 45:
+            health.append(
+                f"At night the noise averaged about {lnight:.0f} dB, above the WHO sleep-protection level "
+                "of 45 dB. Night noise can disturb sleep even when you don't fully wake up, and over years "
+                "is linked to higher blood pressure and heart strain.")
+            actions.append("Keep bedroom windows closed at night and, if you can, sleep in a room facing away from the noise.")
+            actions.append("Consider soft earplugs or a steady background sound (a fan) to mask sudden noises while sleeping.")
+        elif _ok(lnight) and lnight > 40:
+            health.append(
+                f"Night-time noise averaged about {lnight:.0f} dB. This is within the WHO limit but above the "
+                "level where the most sensitive sleepers can begin to notice effects.")
+            actions.append("If your sleep feels disturbed, keeping bedroom windows closed at night can help.")
+        elif _ok(lnight):
+            health.append(
+                f"Night-time noise averaged about {lnight:.0f} dB, within WHO sleep-protection guidance — "
+                "disturbed sleep from outdoor noise is unlikely.")
+
+        # Daytime / overall
+        if _ok(lden) and lden > 53:
+            health.append(
+                f"Your overall day-and-night level of about {lden:.0f} dB is above the WHO health guideline "
+                "of 53 dB. Long-term exposure at higher levels is associated with annoyance and increased "
+                "cardiovascular risk.")
+            actions.append("Spend relaxing or outdoor time during the quieter hours shown in the 'typical day' chart.")
+        elif _ok(lden):
+            health.append(
+                f"Your overall day-and-night level of about {lden:.0f} dB is within the WHO health guideline of 53 dB.")
+        elif _ok(laeq):
+            health.append(
+                f"The average noise level was about {laeq:.0f} dB. Day/night-weighted guideline figures could not "
+                "be computed for this dataset.")
+
+        # Universal
+        actions.append(
+            "Sensitive people — children, older adults, pregnant women, and anyone with heart or breathing "
+            "conditions — feel noise effects sooner, so take extra care for them.")
+        if not health:
+            health.append("Noise levels were within general health guidance for the monitored period.")
+        return health, actions
 
     # ============================================================
     # OPTIONAL CUSTOM SECTION (user notes, inserted after Section 4)
@@ -1008,10 +1236,21 @@ class ReportGeneratorV2:
         return ts_col, leq_col, lmax_col, lmin_col
 
     def _get_timestamp_series(self, ts_col: str | None) -> pd.Series:
+        """Return a usable timestamp series, recovering messy formats where possible.
+
+        Sets ``self.timestamps_synthetic = True`` when no real timestamps could be
+        read and a synthetic index was substituted, so report sections can warn
+        instead of presenting fabricated dates as real.
+        """
+        from analysis.timestamp_utils import assess_timestamp_integrity
         if ts_col and ts_col in self.df.columns:
-            ts = pd.to_datetime(self.df[ts_col], errors="coerce", dayfirst=True, cache=True)
-            if ts.notna().sum() > 0:
-                return ts
+            verdict = assess_timestamp_integrity(self.df[ts_col])
+            if verdict.time_metrics_valid and verdict.parsed is not None and verdict.parsed.notna().sum() > 0:
+                self.timestamps_synthetic = False
+                self.timestamp_integrity = verdict
+                return verdict.parsed
+            self.timestamp_integrity = verdict
+        self.timestamps_synthetic = True
         return pd.Series(pd.date_range(start=datetime.now(), periods=len(self.df), freq="s"))
 
     def _get_numeric_series(self, col: str | None) -> pd.Series:
@@ -1167,48 +1406,103 @@ class ReportGeneratorV2:
         _sl = summary_text.lower()
         if 'concern level: high' in _sl or 'concern level: serious' in _sl:
             _box_bg, _box_border = '#FEF2F2', '#991b1b'
+            _level_label, _level_fg = 'HIGH', '#991b1b'
         elif 'concern level: moderate' in _sl:
             _box_bg, _box_border = '#FFFBEB', '#92400e'
+            _level_label, _level_fg = 'MODERATE', '#92400e'
         else:
             _box_bg, _box_border = '#EFF6FF', '#3D5A80'
+            _level_label, _level_fg = 'LOW', '#166534'
 
-        summary_box_style = ParagraphStyle(
-            'SummaryBox',
+        # Inner style — NO border, no background (the Table provides the single outer box)
+        _inner_style = ParagraphStyle(
+            'SummaryInner',
             parent=styles['BodyText'],
             fontSize=9,
-            leading=13,
-            backColor=colors.HexColor(_box_bg),
-            borderPadding=(8, 10, 8, 10),
-            borderColor=colors.HexColor(_box_border),
-            borderWidth=1,
-            borderRadius=4,
-        )
-        bullet_style = ParagraphStyle(
-            'SummaryBullet',
-            parent=summary_box_style,
-            leftIndent=12,
-            bulletIndent=0,
+            leading=14,
+            spaceAfter=6,
         )
 
         story.append(Paragraph(
             "<b>Non-Technical Summary: Noise Exposure &amp; Health Assessment</b>", styles['h2']
         ))
 
-        # Render each structured paragraph as separate ReportLab Paragraphs
+        # Parse summary text into sections
+        body_parts, who_part, concern_part = [], None, None
         for para_block in summary_text.split('\n\n'):
             lines = para_block.split('\n')
-            header_lines  = [l for l in lines if not l.strip().startswith('•')]
-            bullet_lines  = [l for l in lines if l.strip().startswith('•')]
+            header_lines = [l for l in lines if not l.strip().startswith('•')]
+            bullet_lines = [l.strip().lstrip('•').strip() for l in lines if l.strip().startswith('•')]
             header_joined = ' '.join(header_lines).strip()
-            if header_joined:
-                if header_joined.startswith('WHO ') or header_joined.startswith('Overall Concern'):
-                    story.append(Paragraph(f"<b>{escape(header_joined)}</b>", summary_box_style))
-                else:
-                    story.append(Paragraph(escape(header_joined), summary_box_style))
-            for bl in bullet_lines:
-                text_part = bl.strip().lstrip('•').strip()
-                story.append(Paragraph(f"• {escape(text_part)}", bullet_style))
+            first = header_joined.strip()
+            if first.startswith('WHO '):
+                who_part = (header_joined, bullet_lines)
+            elif first.startswith('Overall Concern'):
+                concern_part = header_joined
+            else:
+                if header_joined or bullet_lines:
+                    body_parts.append((header_joined, bullet_lines))
 
+        # Build content as separate inner Paragraphs inside one Table cell.
+        # This is the only reliable way to get ONE outer border in ReportLab.
+        _plain_style = ParagraphStyle(
+            'SummaryPlain', parent=styles['BodyText'],
+            fontSize=9, leading=13, spaceAfter=4,
+        )
+        _bold_style = ParagraphStyle(
+            'SummaryBold', parent=_plain_style,
+            fontName='Helvetica-Bold', spaceAfter=2,
+        )
+
+        inner_content = []
+
+        # 1. Concern level — prominent coloured line
+        if concern_part:
+            explanation = concern_part
+            for pfx in (f'Overall Concern Level: {_level_label}. ',
+                        f'Overall Concern Level: {_level_label.capitalize()}. ',
+                        'Overall Concern Level: '):
+                if explanation.startswith(pfx):
+                    explanation = explanation[len(pfx):]
+                    break
+            inner_content.append(Paragraph(
+                f'<font color="{_level_fg}"><b>CONCERN LEVEL: {_level_label}</b></font>'
+                f'  {escape(explanation)}',
+                _plain_style,
+            ))
+            inner_content.append(Spacer(1, 4))
+
+        # 2. Body paragraphs (dataset overview, noise level, variability)
+        for (hdr, bullets) in body_parts:
+            if hdr:
+                inner_content.append(Paragraph(escape(hdr), _plain_style))
+            for bl in bullets:
+                inner_content.append(Paragraph(f'•  {escape(bl)}', _plain_style))
+
+        # 3. WHO compliance section
+        if who_part:
+            inner_content.append(Spacer(1, 4))
+            hdr, bullets = who_part
+            inner_content.append(Paragraph(escape(hdr), _bold_style))
+            for bl in bullets:
+                inner_content.append(Paragraph(f'•  {escape(bl)}', _plain_style))
+
+        # Wrap all inner content in a KeepTogether inside a single-cell Table
+        # → one background, one border, no per-paragraph boxes
+        summary_table = Table(
+            [[ inner_content ]],
+            colWidths=[9.0 * inch],
+        )
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND',    (0, 0), (-1, -1), colors.HexColor(_box_bg)),
+            ('BOX',           (0, 0), (-1, -1), 1.2, colors.HexColor(_box_border)),
+            ('TOPPADDING',    (0, 0), (-1, -1), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+            ('LEFTPADDING',   (0, 0), (-1, -1), 14),
+            ('RIGHTPADDING',  (0, 0), (-1, -1), 14),
+            ('VALIGN',        (0, 0), (-1, -1), 'TOP'),
+        ]))
+        story.append(summary_table)
         story.append(Spacer(1, 0.12 * inch))
 
         # ── Top 10 Peak Noise Events ──────────────────────────────────────────
@@ -1534,6 +1828,7 @@ class ReportGeneratorV2:
                 laeq_day=laeq_day,
                 laeq_night=laeq_night,
                 lamax=lamax,
+                environment=self.environment,
             )
         except Exception as _e:
             print(f"[Report] Compliance evaluation failed: {_e}")
@@ -1560,6 +1855,8 @@ class ReportGeneratorV2:
                                      textColor=colors.HexColor('#15803d'), fontName='Helvetica-Bold')
         assess_fail = ParagraphStyle('AssessFail', parent=cell_8,
                                      textColor=colors.HexColor('#b91c1c'), fontName='Helvetica-Bold')
+        assess_ref  = ParagraphStyle('AssessRef', parent=cell_8,
+                                     textColor=colors.HexColor('#6b7280'), fontName='Helvetica-Oblique')
 
         header_row = [
             Paragraph("Regulatory Standard",    hdr_style_left),
@@ -1572,7 +1869,13 @@ class ReportGeneratorV2:
         rows = []
         for r in results:
             delta = r['delta_db']
-            if r['status'] == 'PASS':
+            if r.get('kind') == 'indicative':
+                # Source-specific reference (aircraft/railway) — no compliance verdict.
+                margin = abs(delta)
+                rel = "above" if r['status'] == 'ABOVE' else "below"
+                assess_txt = f"{self._fmt_float(margin, 1)} dB {rel} source reference — indicative only"
+                assess_style = assess_ref
+            elif r['status'] == 'PASS':
                 margin = abs(delta)
                 assess_txt = f"Within limit by {self._fmt_float(margin, 1)} dB — compliant"
                 assess_style = assess_pass
@@ -1627,15 +1930,16 @@ class ReportGeneratorV2:
             borderWidth=1,
         )
         story.append(Paragraph(
-            "<b>Important note on WHO 2018 Road Traffic and Aircraft Noise rows:</b> "
-            "The WHO 2018 guidelines for road traffic (Lden ≤ 53 dB(A), Lnight ≤ 45 dB(A)) and aircraft noise "
-            "(Lden ≤ 45 dB(A), Lnight ≤ 40 dB(A)) are source-specific standards — they were derived from "
-            "epidemiological studies that attributed noise exclusively to road vehicles or aircraft. "
-            "The NSTRW MK4 sensor measures total combined acoustic energy from all sources in the environment; "
-            "it cannot identify or separate individual sources. Therefore, if these rows show NON-COMPLIANT, it "
-            "means the total measured noise exceeds the WHO threshold — not that road traffic or aircraft noise "
-            "alone is responsible. Additionally, WHO 2018 intends these metrics to represent long-term annual "
-            "average exposure; a measurement period of days or weeks is indicative only. "
+            "<b>How to read these rows:</b> "
+            "The road-traffic (Lden ≤ 53 dB(A), Lnight ≤ 45 dB(A)) and Maryland COMAR rows are evaluated as "
+            "<b>compliance</b> checks against the total measured environmental level. "
+            "The aircraft (Lden ≤ 45 dB(A)) and railway (Lden ≤ 54 dB(A)) rows are shown as "
+            "<b>indicative reference comparisons only</b>: these WHO guidelines were derived from studies that "
+            "attributed noise exclusively to a single source, but the sound level meter measures total combined "
+            "acoustic energy and cannot confirm the source. They therefore report how the measured level sits "
+            "relative to the reference, not a pass/fail verdict. "
+            "Additionally, WHO 2018 intends Lden/Lnight to represent long-term annual average exposure; a "
+            "measurement period of days or weeks is indicative only. "
             "This information is provided to prevent misinterpretation of the compliance results.",
             who_note_style
         ))
@@ -2559,32 +2863,22 @@ class ReportGeneratorV2:
     # ============================================================
 
     def _plotly_fig_to_image(self, fig, width_inch=8, height_inch=4):
-        """Convert Plotly figure to ReportLab Image."""
+        """Convert Plotly figure to ReportLab Image via kaleido."""
         if fig is None:
             return None
         try:
             scale = 1.25 if len(self.df) > 500_000 else 2
-            try:
-                img_bytes = fig.to_image(format="png", scale=scale, engine="kaleido")
-            except Exception:
-                try:
-                    img_bytes = fig.to_image(format="png", scale=scale, engine="orca")
-                except Exception:
-                    import plotly.io as pio
-                    img_bytes = pio.to_image(fig, format="png")
-            
+            img_bytes = fig.to_image(format="png", scale=scale)
             img = Image(io.BytesIO(img_bytes))
             aspect = img.imageHeight / img.imageWidth if img.imageWidth > 0 else 1
-            img.drawWidth = width_inch * inch
+            img.drawWidth  = width_inch * inch
             img.drawHeight = (width_inch * inch) * aspect
-            
             if img.drawHeight > height_inch * inch:
                 img.drawHeight = height_inch * inch
-                img.drawWidth = (height_inch * inch) / aspect
-            
+                img.drawWidth  = (height_inch * inch) / aspect
             return img
         except Exception as e:
-            print(f"[Report] Chart rendering failed: {str(e)[:100]}")
+            print(f"[Report] Chart rendering failed: {str(e)[:120]}")
             return None
 
     def _get_pdf_styles(self):

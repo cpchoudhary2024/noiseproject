@@ -3,6 +3,10 @@ let uploadedFilepath = null;
 let currentAnalysis = null;
 let currentStandards = null;
 
+// Sensor placement — controls whether WHO indoor bedroom limits are evaluated.
+// 'outdoor' (default) omits them; 'indoor' includes them.
+let deploymentEnvironment = 'outdoor';
+
 // Temporal filtration state
 let currentFilters = { exclusions: [], bound_start: null, bound_end: null };
 
@@ -460,6 +464,7 @@ function runAnalysis() {
         body: JSON.stringify({
             filepath: uploadedFilepath,
             job_id: _analysisJobId,
+            environment: deploymentEnvironment,
             filters: (currentFilters && (currentFilters.exclusions.length || currentFilters.bound_start || currentFilters.bound_end)) ? currentFilters : null,
         })
     })
@@ -469,6 +474,8 @@ function runAnalysis() {
         if (data.success) {
             currentAnalysis = data.analysis;
             currentStandards = data.standards;
+            window.timestampIntegrity = data.timestamp_integrity || { status: 'ok', time_metrics_valid: true };
+            window.keyFindings = data.key_findings || {};
             // Display plain-English summary if returned by server
             displayPlainEnglishSummary(data.plain_english_summary || '');
             try {
@@ -657,8 +664,11 @@ async function loadHealthAssessment() {
         
         const data = await response.json();
         if (data.success) {
-            renderHealthCards(data.assessment);
-            renderRecommendations(data.assessment);
+            // Backend returns the rollup under `health_assessment` (flat lden/lnight/
+            // concern_level/recommendations fields are added server-side).
+            const assessment = data.health_assessment || data.assessment;
+            renderHealthCards(assessment);
+            renderRecommendations(assessment);
         }
     } catch (error) {
         console.error('Error loading health assessment:', error);
@@ -673,42 +683,46 @@ function renderHealthCards(assessment) {
     
     let html = '';
     
-    // Lden card
-    if (assessment.lden !== undefined) {
-        const ldenStatus = assessment.lden > 55 ? 'danger' : (assessment.lden > 50 ? 'warning' : 'success');
+    // Lden card — WHO 2018 road-traffic guideline is 53 dB(A); cardiovascular risk rises above 55 dB.
+    if (Number.isFinite(Number(assessment.lden))) {
+        const lden = Number(assessment.lden);
+        const ldenStatus = lden > 58 ? 'danger' : (lden > 53 ? 'warning' : 'success');
         html += `
             <div class="health-card ${ldenStatus}">
                 <div class="health-card-header">
                     <div class="health-card-icon">🌍</div>
                     <div class="health-card-title">Lden (Day-Evening-Night)</div>
                 </div>
-                <div class="health-card-value">${safeToFixed(assessment.lden, 1)}</div>
+                <div class="health-card-value">${safeToFixed(lden, 1)}</div>
                 <div class="health-card-desc">24-hour noise exposure with evening/night penalties</div>
-                <div class="health-card-status">WHO guideline: 55 dB</div>
+                <div class="health-card-status">WHO guideline: 53 dB</div>
             </div>
         `;
     }
-    
-    // Lnight card
-    if (assessment.lnight !== undefined) {
-        const lnightStatus = assessment.lnight > 45 ? 'danger' : (assessment.lnight > 40 ? 'warning' : 'success');
+
+    // Lnight card — WHO 2018 sleep guideline is 45 dB(A); LOAEL (first effects) is 40 dB.
+    if (Number.isFinite(Number(assessment.lnight))) {
+        const lnight = Number(assessment.lnight);
+        const lnightStatus = lnight > 45 ? 'danger' : (lnight > 40 ? 'warning' : 'success');
         html += `
             <div class="health-card ${lnightStatus}">
                 <div class="health-card-header">
                     <div class="health-card-icon">😴</div>
                     <div class="health-card-title">Lnight (Night Sleep)</div>
                 </div>
-                <div class="health-card-value">${safeToFixed(assessment.lnight, 1)}</div>
+                <div class="health-card-value">${safeToFixed(lnight, 1)}</div>
                 <div class="health-card-desc">Night-time noise level affecting sleep quality</div>
-                <div class="health-card-status">WHO guideline: 40 dB</div>
+                <div class="health-card-status">WHO guideline: 45 dB</div>
             </div>
         `;
     }
-    
+
     // Overall concern level
     if (assessment.concern_level) {
-        const concernColors = { 'Low': 'success', 'Moderate': 'warning', 'High': 'danger', 'Critical': 'danger' };
-        const concernStatus = concernColors[assessment.concern_level] || 'info';
+        const cl = String(assessment.concern_level).toLowerCase();
+        const concernStatus = (cl.includes('critical') || cl.includes('high')) ? 'danger'
+                            : (cl.includes('moderate')) ? 'warning'
+                            : 'success';
         html += `
             <div class="health-card ${concernStatus}">
                 <div class="health-card-header">
@@ -758,75 +772,64 @@ function renderCoreMetricWidgets() {
     if (elLaminVal) elLaminVal.textContent = safeToFixed(lminStat.min, 1);
 }
 
+// At-a-glance key findings — the headline numbers a reader cares about,
+// shown nowhere else. Detailed per-channel statistics live in the Statistics tab.
 function renderMetricsPanel() {
-    if (!currentAnalysis || !currentAnalysis.statistics) return;
-
     const container = document.getElementById('metricsGrid');
     if (!container) return;
 
-    const stats      = currentAnalysis.statistics;
-    const percentiles = currentAnalysis.percentiles || {};
-    const envMetrics  = currentAnalysis.environmental_metrics || {};
+    const kf = window.keyFindings || {};
+    const timeValid = !(window.timestampIntegrity && window.timestampIntegrity.time_metrics_valid === false);
 
-    // WHO 2018 reference thresholds for colouring
-    const WHO_LDEN   = 53;
-    const WHO_LNIGHT = 45;
-    const WHO_LAMAX  = 60;
+    const avg = Number(kf.avg_laeq);
+    const fmt = (v, d = 0) => Number.isFinite(Number(v)) ? Number(v).toFixed(d) : '—';
 
-    function dbClass(val, warn, danger) {
-        const n = Number(val);
-        if (!Number.isFinite(n)) return '';
-        if (n >= danger) return 'metric-danger';
-        if (n >= warn)   return 'metric-warn';
-        return 'metric-ok';
+    function levelWord(v) {
+        if (!Number.isFinite(v)) return ['—', 'metric-ok'];
+        if (v < 45) return ['quiet', 'metric-ok'];
+        if (v < 55) return ['moderate', 'metric-ok'];
+        if (v < 65) return ['elevated', 'metric-warn'];
+        if (v < 75) return ['high', 'metric-danger'];
+        return ['very high', 'metric-danger'];
+    }
+    const [word, avgCls] = levelWord(avg);
+
+    function card(value, unit, label, note, cls) {
+        return `
+        <div class="metric-item ${cls || ''}">
+            <div class="metric-value">${escapeHtml(value)}<span style="font-size:14px;font-weight:600;color:#94a3b8;margin-left:3px">${escapeHtml(unit || '')}</span></div>
+            <div class="metric-label" style="margin-top:6px">${escapeHtml(label)}</div>
+            <div class="metric-note">${escapeHtml(note)}</div>
+        </div>`;
     }
 
-    let html = '';
+    const cards = [];
+    cards.push(card(fmt(avg, 1), 'dB(A)', 'Average noise level',
+        `${word} — the steady level with the same energy as the real noise`, avgCls));
 
-    for (const [colName, stat] of Object.entries(stats)) {
-        if (!stat) continue;
-        const pct = percentiles[colName] || {};
-        const env = envMetrics[colName]  || {};
-
-        const laeq  = stat.laeq_db ?? stat.mean;
-        const l10   = pct.L10;
-        const l50   = pct.L50 ?? stat.median;
-        const l90   = pct.L90;
-        const lmax  = stat.max;
-        const lmin  = stat.min;
-        const stdDev = stat.std_dev;
-        const lden   = env.Lden;
-        const lnight = env.Lnight;
-
-        // Acoustic climate score: L10-L90 spread (lower = more stable environment)
-        const spread = (Number.isFinite(Number(l10)) && Number.isFinite(Number(l90)))
-            ? (Number(l10) - Number(l90)).toFixed(1) : null;
-
-        html += `<div class="metric-profile-card">`;
-        html += `<div class="metric-profile-header"><span class="metric-col-name">${escapeHtml(colName)}</span></div>`;
-        html += `<div class="metric-profile-grid">`;
-
-        // ── Statistical & Environmental Indicators ──
-        html += _metricCell('L10', l10,  'dB(A)', 'Exceeded 10% of time — transient peak zone', dbClass(l10, 55, 70));
-        html += _metricCell('L50', l50,  'dB(A)', 'Median level — typical acoustic climate', dbClass(l50, 48, 60));
-        html += _metricCell('L90', l90,  'dB(A)', 'Exceeded 90% of time — statistical background floor', dbClass(l90, 40, 55));
-        html += _metricCell('Std Dev', stdDev, 'dB', 'Variability — higher = more erratic environment', dbClass(stdDev, 6, 10));
-        if (spread !== null) {
-            html += _metricCell('L10−L90', spread, 'dB', 'Acoustic climate index — spread of everyday variation', dbClass(spread, 15, 25));
-        }
-
-        // ── Environmental metrics (requires timestamps) ──
-        if (Number.isFinite(Number(lden))) {
-            html += _metricCell('Lden', lden, 'dB(A)', 'Day-Evening-Night indicator (WHO limit: 53 dB)', dbClass(lden, WHO_LDEN, WHO_LDEN + 5));
-        }
-        if (Number.isFinite(Number(lnight))) {
-            html += _metricCell('Lnight', lnight, 'dB(A)', 'Night-time indicator 23:00–07:00 (WHO limit: 45 dB)', dbClass(lnight, WHO_LNIGHT, WHO_LNIGHT + 5));
-        }
-
-        html += `</div></div>`;
+    if (Number.isFinite(Number(kf.pct_within_guideline))) {
+        const p = Number(kf.pct_within_guideline);
+        cards.push(card(fmt(p, 0), '%', 'Time within health guideline',
+            'share of time at or below the WHO 53 dB level',
+            p >= 90 ? 'metric-ok' : (p >= 60 ? 'metric-warn' : 'metric-danger')));
     }
 
-    container.innerHTML = html || '<p style="color:#6b7280;">No statistics available.</p>';
+    if (timeValid && Number.isFinite(Number(kf.quietest_hour))) {
+        cards.push(card(`${String(kf.quietest_hour).padStart(2, '0')}:00`, '', 'Quietest time of day',
+            `around ${fmt(kf.quietest_hour_db, 0)} dB — best for outdoor time`, 'metric-ok'));
+    }
+    if (timeValid && Number.isFinite(Number(kf.loudest_hour))) {
+        cards.push(card(`${String(kf.loudest_hour).padStart(2, '0')}:00`, '', 'Loudest time of day',
+            `around ${fmt(kf.loudest_hour_db, 0)} dB`, 'metric-warn'));
+    }
+    if (Number.isFinite(Number(kf.peak))) {
+        cards.push(card(fmt(kf.peak, 0), 'dB(A)', 'Loudest single moment',
+            'the highest level recorded at any instant', ''));
+    }
+
+    container.innerHTML = cards.length
+        ? `<div class="keyfindings-grid">${cards.join('')}</div>`
+        : '<p style="color:#6b7280;">Key findings unavailable.</p>';
 }
 
 function _metricCell(label, value, unit, note, cssClass) {
@@ -953,6 +956,47 @@ function renderGapAnalysis(gapData) {
 }
 
 // ============================================================================
+// Sensor placement (Outdoor / Indoor) toggle
+// ============================================================================
+
+function setDeploymentEnvironment(env) {
+    const next = (env === 'indoor') ? 'indoor' : 'outdoor';
+    deploymentEnvironment = next;
+
+    // Reflect active state on the toggle buttons
+    document.querySelectorAll('#envToggle .env-toggle-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.env === next);
+    });
+
+    const hint = document.getElementById('envHint');
+    if (hint) {
+        hint.textContent = next === 'indoor'
+            ? 'Indoor: WHO bedroom limits (30 dB LAeq / 45 dB LAmax) are included in the compliance matrix.'
+            : 'Outdoor: WHO indoor bedroom limits are omitted (not comparable to an outdoor mic).';
+    }
+
+    // If results are already on screen, refresh compliance immediately.
+    if (uploadedFilepath && currentAnalysis) {
+        refreshComplianceForEnvironment();
+    }
+}
+
+function refreshComplianceForEnvironment() {
+    fetch('/api/compliance-check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filepath: uploadedFilepath, environment: deploymentEnvironment }),
+    })
+        .then(r => r.json())
+        .then(data => {
+            if (data && data.success) {
+                renderComplianceMatrix(data.compliance_matrix || []);
+            }
+        })
+        .catch(err => console.error('Compliance refresh failed:', err));
+}
+
+// ============================================================================
 // MODULE 7 — Compliance Matrix (WHO 2018 + Maryland COMAR)
 // ============================================================================
 
@@ -970,7 +1014,7 @@ function renderComplianceMatrix(matrixRows) {
 
     // Group by category for section dividers
     const categories = {
-        who_env:    { label: 'WHO 2018 — Environmental (Road Traffic & Aircraft)', rows: [] },
+        who_env:    { label: 'WHO 2018 — Environmental (Road Traffic, Aircraft & Railway)', rows: [] },
         who_indoor: { label: 'WHO 1999 / 2018 — Indoor (Bedroom)', rows: [] },
         maryland:   { label: 'Maryland COMAR 26.02.03.02 — Legal Limits', rows: [] },
     };
@@ -1000,38 +1044,55 @@ function renderComplianceMatrix(matrixRows) {
         html += `<tr class="cm-category-header"><td colspan="6">${escapeHtml(cat.label)}</td></tr>`;
 
         cat.rows.forEach(r => {
+            const indicative = r.kind === 'indicative';
             const pass   = r.status === 'PASS';
             const delta  = Number(r.delta_db);
             const deltaStr = Number.isFinite(delta)
                 ? (delta >= 0 ? `+${delta.toFixed(1)}` : delta.toFixed(1))
                 : '—';
-            const deltaCls = delta > 0 ? 'positive' : (delta < 0 ? 'negative' : 'zero');
-            const pillCls  = pass ? 'pass' : 'fail';
-            const pillIcon = pass ? '✓' : '✕';
+            const deltaCls = indicative ? 'zero' : (delta > 0 ? 'positive' : (delta < 0 ? 'negative' : 'zero'));
+
+            // Source-specific (aircraft/railway): show a neutral "indicative reference"
+            // pill instead of PASS/FAIL — a source-blind meter cannot attribute the source.
+            let pillCls, pillIcon, pillText;
+            if (indicative) {
+                pillCls  = 'indicative';
+                pillIcon = 'ⓘ';
+                pillText = 'Indicative';
+            } else {
+                pillCls  = pass ? 'pass' : 'fail';
+                pillIcon = pass ? '✓' : '✕';
+                pillText = r.status;
+            }
 
             const tooltip = r.tooltip ? `
                 <span class="cm-tooltip-icon">ⓘ</span>
                 <span class="cm-tooltip-text">${escapeHtml(r.tooltip)}</span>` : '';
 
-            html += `<tr>
+            html += `<tr${indicative ? ' class="cm-indicative-row"' : ''}>
                 <td class="cm-standard-name cm-tooltip-cell">
                     ${escapeHtml(r.standard)}${tooltip}
                 </td>
                 <td class="cm-metric">${escapeHtml(r.metric)}</td>
                 <td class="cm-measured">${safeToFixed(r.measured_db, 1)} dB(A)</td>
-                <td class="cm-limit">${safeToFixed(r.limit_db, 1)} dB(A)</td>
-                <td><span class="status-pill ${pillCls}">${pillIcon} ${r.status}</span></td>
+                <td class="cm-limit">${safeToFixed(r.limit_db, 1)} dB(A)${indicative ? ' <span class="cm-ref-tag">ref</span>' : ''}</td>
+                <td><span class="status-pill ${pillCls}">${pillIcon} ${pillText}</span></td>
                 <td class="cm-delta ${deltaCls}">${deltaStr}</td>
             </tr>`;
         });
     }
 
     html += `</tbody></table>
-    <p style="margin-top:14px;font-size:11px;color:#9ca3af;">
-        Delta = Measured − Limit. Negative = below limit (compliant). Positive = exceedance.
+    <div class="cm-caveats">
+        <p><strong>Indicative reference rows (aircraft, railway):</strong> the sound level meter measures
+        total combined acoustic energy and cannot confirm the source, so these source-specific WHO guidelines
+        are shown as reference comparisons only — not pass/fail verdicts.</p>
+        <p><strong>Measurement window:</strong> WHO 2018 intends Lden/Lnight as long-term <em>annual average</em>
+        exposure. A monitoring period of days or weeks is indicative of conditions during that window only.</p>
+        <p style="color:#9ca3af;">Delta = Measured − Limit. Negative = below limit (compliant). Positive = exceedance.
         A legal PASS under Maryland COMAR does not imply absence of health risk — WHO limits are stricter.
-        Hover the ⓘ icon for clinical basis.
-    </p>`;
+        Hover the ⓘ icon for clinical basis.</p>
+    </div>`;
 
     container.innerHTML = html;
 }
@@ -1075,7 +1136,10 @@ function displayResults() {
     const analysis = currentAnalysis;
     const statistics = analysis.statistics || {};
 
-    // Render core metric widgets FIRST
+    // Timestamp integrity — gate all time-dependent outputs.
+    const timeValid = applyTimestampIntegrity();
+
+    // Render core metric widgets FIRST (time-independent)
     renderCoreMetricWidgets();
 
     // MODULE 6: Data Continuity Log — prefer gap from multi-file merge, fall back to analyze response
@@ -1083,26 +1147,72 @@ function displayResults() {
     renderGapAnalysis(gapData);
 
     renderMetricsPanel();
-    loadHealthAssessment();
     renderDataInsights(statistics);
 
-    // Load computed summaries for daily/hourly display
-    loadComputedSummaries();
-
-    // Executive Summary
+    // Executive Summary + Statistics (time-independent)
     displayExecutiveSummary(statistics);
-
-    // Statistics Tab
     displayStatistics(statistics, analysis.percentiles);
 
-    // MODULE 7: Compliance Matrix (replaces old compliance display)
-    renderComplianceMatrix(analysis.compliance_matrix || null);
-
-    // Charts (including new visualizations)
-    displayCharts(analysis);
-
-    // Standards
+    // Standards (time-independent)
     displayStandards(currentStandards);
+
+    if (timeValid) {
+        loadHealthAssessment();
+        loadComputedSummaries();
+        renderComplianceMatrix(analysis.compliance_matrix || null);
+        displayCharts(analysis);
+    } else {
+        suppressTimeDependentOutputs();
+    }
+}
+
+// ── Timestamp integrity gate ────────────────────────────────────────────────
+
+function applyTimestampIntegrity() {
+    const ti = window.timestampIntegrity || { status: 'ok', time_metrics_valid: true };
+    const valid = ti.time_metrics_valid !== false;
+    const banner = document.getElementById('timestampWarning');
+    const txt = document.getElementById('timestampWarningText');
+    const soft = valid && ti.status === 'recovered';
+
+    if (banner) {
+        if (!valid || soft) {
+            banner.style.display = 'flex';
+            banner.classList.toggle('ts-warning-soft', soft);
+            const title = banner.querySelector('strong');
+            if (title) title.textContent = soft
+                ? 'Timestamps recovered — please verify'
+                : 'Timestamps could not be read reliably';
+            if (txt) txt.textContent = ti.message ||
+                'Timestamps are unreliable; time-based metrics are suppressed.';
+        } else {
+            banner.style.display = 'none';
+        }
+    }
+    return valid;
+}
+
+function suppressTimeDependentOutputs() {
+    const notice = (msg) => `<div class="ts-suppressed-note">
+        <i class="fas fa-clock"></i> ${msg}</div>`;
+
+    // Hide the plain-English summary (it leads with Lden/Lnight).
+    const pe = document.getElementById('plainEnglishSummaryCard');
+    if (pe) pe.style.display = 'none';
+
+    const setHTML = (id, msg) => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = notice(msg);
+    };
+    const m = 'Unavailable — requires valid timestamps.';
+    setHTML('healthStatusCards', m);
+    setHTML('recommendationsContainer', m);
+    setHTML('complianceContainer', m);
+    setHTML('rollingMedianChart', m);
+    setHTML('boxWhiskerChart', m);
+    setHTML('heatmapChart', m);
+    setHTML('timeSeriesChart', m);
+    setHTML('thresholdChart', '');  // percentiles still valid; rendered separately
 }
 
 // ============================================================================
@@ -1163,86 +1273,87 @@ async function loadComputedSummaries() {
 function displayExecutiveSummary(statistics) {
     const container = document.getElementById('healthAssessmentContainer');
     if (!container) return;
-    
-    let html = '<h3>Health Impact Assessment</h3>';
-    
-    // Summary statistics
-    html += '<div class="summary-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px;">';
-    
-    for (const [colName, stats] of Object.entries(statistics)) {
-        const laeqNum = Number(stats?.laeq_db ?? stats?.mean);
-        let boxClass = '';
 
-        if (Number.isFinite(laeqNum) && laeqNum < 55) {
-            boxClass = 'success';
-        } else if (Number.isFinite(laeqNum) && laeqNum < 70) {
-            boxClass = 'warning';
-        } else if (Number.isFinite(laeqNum)) {
-            boxClass = 'danger';
-        }
+    // Pull the primary noise column stats
+    const firstCol   = Object.keys(statistics)[0] || '';
+    const firstStats = statistics[firstCol] || {};
+    const laeq = Number(firstStats?.laeq_db ?? firstStats?.mean);
 
-        html += `
-            <div class="summary-box ${boxClass}" style="padding: 20px; border-radius: 8px; border-left: 4px solid;">
-                <div class="summary-label" style="font-size: 12px; color: #666; text-transform: uppercase; margin-bottom: 8px;">${escapeHtml(colName)}</div>
-                <div class="summary-value" style="font-size: 32px; font-weight: 700; margin-bottom: 8px;">${safeToFixed(laeqNum, 1)}</div>
-                <div class="summary-unit" style="font-size: 12px; color: #666;">dB(A) LAeq</div>
-                <div style="font-size: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #eee;">
-                    Range: ${safeToFixed(stats?.min, 1)} – ${safeToFixed(stats?.max, 1)} dB(A)
-                </div>
+    // Derive environmental metrics (Lden, Lnight) from analysis
+    const env        = currentAnalysis?.environmental_metrics || {};
+    const envFirst   = env[firstCol] || env[Object.keys(env)[0]] || {};
+    const lden       = Number(envFirst?.Lden  ?? envFirst?.lden  ?? NaN);
+    const lnight     = Number(envFirst?.Lnight ?? envFirst?.lnight ?? NaN);
+    const laeqDay    = Number(envFirst?.LAeq_day   ?? NaN);
+    const laeqNight  = Number(envFirst?.LAeq_night ?? NaN);
+
+    // Concern level based on WHO 2018 thresholds
+    let level = 'LOW', levelBg = '#f0fdf4', levelFg = '#166534', levelBdr = '#86efac';
+    if (Number.isFinite(lden) && lden > 53) {
+        level = 'HIGH'; levelBg = '#fef2f2'; levelFg = '#991b1b'; levelBdr = '#fca5a5';
+    } else if (Number.isFinite(lnight) && lnight > 45) {
+        level = 'HIGH'; levelBg = '#fef2f2'; levelFg = '#991b1b'; levelBdr = '#fca5a5';
+    } else if (Number.isFinite(laeq) && laeq > 55) {
+        level = 'MODERATE'; levelBg = '#fffbeb'; levelFg = '#92400e'; levelBdr = '#fcd34d';
+    }
+
+    function metricRow(label, val, limit, unit = 'dB(A)') {
+        if (!Number.isFinite(val)) return '';
+        const over  = Number.isFinite(limit) && val > limit;
+        const badge = over
+            ? `<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#fee2e2;color:#991b1b;font-weight:600;margin-left:8px">EXCEEDS by ${(val - limit).toFixed(1)} dB</span>`
+            : (Number.isFinite(limit)
+                ? `<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#dcfce7;color:#166534;font-weight:600;margin-left:8px">WITHIN LIMIT</span>`
+                : '');
+        const limitNote = Number.isFinite(limit) ? ` <span style="color:#9ca3af;font-size:12px">WHO limit: ${limit} ${unit}</span>` : '';
+        return `<tr>
+            <td style="padding:9px 12px;border-bottom:1px solid #f1f5f9;color:#374151">${label}${limitNote}</td>
+            <td style="padding:9px 12px;border-bottom:1px solid #f1f5f9;text-align:right;font-weight:700;font-size:15px;color:#1e3a5f">${val.toFixed(1)} ${unit}</td>
+            <td style="padding:9px 12px;border-bottom:1px solid #f1f5f9">${badge}</td>
+        </tr>`;
+    }
+
+    let html = `
+        <div style="background:${levelBg};border:1.5px solid ${levelBdr};border-radius:10px;padding:16px 20px;margin-bottom:18px;display:flex;align-items:center;gap:14px">
+            <div style="font-size:13px;font-weight:700;color:${levelFg};white-space:nowrap;letter-spacing:.05em">
+                CONCERN LEVEL: ${level}
             </div>
-        `;
-    }
-    
-    html += '</div>';
+            <div style="width:1px;height:28px;background:${levelBdr};flex-shrink:0"></div>
+            <div style="font-size:13px;color:#374151;line-height:1.5">
+                ${level === 'HIGH'
+                    ? 'WHO 2018 health-based noise guidelines are exceeded. Prolonged exposure is associated with cardiovascular and sleep health risks.'
+                    : level === 'MODERATE'
+                    ? 'Noise levels approach WHO guidelines. Continued monitoring recommended, especially for sensitive occupants.'
+                    : 'Noise levels are within WHO 2018 health-based guidelines. Periodic monitoring is advisable.'}
+            </div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;background:white;border-radius:8px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.06)">
+            <thead>
+                <tr style="background:#1e3a5f;color:#fff">
+                    <th style="padding:9px 12px;text-align:left;font-weight:600">Acoustic Metric</th>
+                    <th style="padding:9px 12px;text-align:right;font-weight:600">Measured</th>
+                    <th style="padding:9px 12px;font-weight:600">WHO Assessment</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${metricRow('LAeq — 24-hr Energy Average', laeq, NaN)}
+                ${metricRow('Lden — Day-Evening-Night Weighted', lden, 53)}
+                ${metricRow('Lnight — Nighttime (23:00–07:00)', lnight, 45)}
+                ${metricRow('LAeq Day (07:00–22:00)', laeqDay, NaN)}
+                ${metricRow('LAeq Night (22:00–07:00)', laeqNight, NaN)}
+            </tbody>
+        </table>`;
 
-    // Environmental metrics (if available)
-    const env = currentAnalysis?.environmental_metrics || {};
-    const entries = Object.entries(env);
-    if (entries.length > 0) {
-        html += '<h4>Environmental Metrics (from timestamps)</h4>';
-        html += '<div style="overflow-x: auto;">';
-        for (const [colName, metrics] of entries) {
-            if (!metrics || typeof metrics !== 'object') continue;
-            html += `<h5>${escapeHtml(colName)}</h5>`;
-            html += '<table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">';
-            html += '<tbody>';
-            const keys = ['LAeq_24h', 'LAeq_day', 'LAeq_evening', 'LAeq_night', 'Lnight', 'Ldn', 'Lden'];
-            keys.forEach((k) => {
-                if (metrics[k] !== undefined && metrics[k] !== null) {
-                    html += `<tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">${escapeHtml(k)}</td><td style="padding: 8px; text-align: right;">${safeToFixed(metrics[k], 2)} dB</td></tr>`;
-                }
-            });
-            html += '</tbody></table>';
-        }
-        html += '</div>';
-    }
-    
-    // Interpretations
-    const interpretations = currentAnalysis.interpretations || [];
+    // Interpretations (if returned by the old health API)
+    const interpretations = currentAnalysis?.interpretations || [];
     if (interpretations.length > 0) {
-        html += '<h4>Assessment Interpretation</h4>';
-        const mean = Object.values(statistics)[0]?.mean || 0;
-        let concernLevel = 'Low';
-        let concernColor = '#10b981';
-        
-        if (mean < 55) {
-            concernLevel = 'Low';
-            concernColor = '#10b981';
-        } else if (mean < 70) {
-            concernLevel = 'Moderate';
-            concernColor = '#f59e0b';
-        } else {
-            concernLevel = 'High';
-            concernColor = '#ef4444';
-        }
-        
-        html += `<div style="padding: 16px; border-left: 4px solid ${concernColor}; background: #f9fafb; border-radius: 4px;">`;
-        interpretations.forEach(interp => {
-            html += `<p style="margin: 8px 0;">${escapeHtml(interp)}</p>`;
+        html += `<div style="margin-top:14px;padding:14px 16px;border-left:4px solid #3D5A80;background:#f8fafc;border-radius:0 6px 6px 0">`;
+        interpretations.forEach(i => {
+            html += `<p style="margin:6px 0;font-size:13px;color:#374151;line-height:1.55">${escapeHtml(i)}</p>`;
         });
-        html += '</div>';
+        html += `</div>`;
     }
-    
+
     container.innerHTML = html;
 }
 
@@ -1967,13 +2078,15 @@ function displayRollingMedianChart() {
     try {
         let xLabels, yLaeq, xTitle, chartTitle;
 
+        let hourValues = null;  // numeric hour per x point (hourly mode only)
         if (hourlySummary && hourlySummary.length > 0) {
             // ── HOURLY mode: Hour 0-23 averaged across all monitoring days ──
             const sorted = [...hourlySummary].sort((a, b) => Number(a.Hour) - Number(b.Hour));
+            hourValues = sorted.map(h => Number(h.Hour));
             xLabels = sorted.map(h => `${String(Number(h.Hour)).padStart(2, '0')}:00`);
             yLaeq   = sorted.map(h => Number(h.Average_L_EQ_dB));
             xTitle      = 'Hour of Day';
-            chartTitle  = '24-Hour Diurnal LAeq Profile with Rolling Median';
+            chartTitle  = '24-Hour Diurnal LAeq Profile';
         } else {
             // ── DAILY fallback ──
             const validPairs = dailySummary
@@ -1995,12 +2108,6 @@ function displayRollingMedianChart() {
             return;
         }
 
-        // 3-point centred rolling median
-        const rollingMedian = yLaeq.map((_, i) => {
-            const slice = yLaeq.slice(Math.max(0, i - 1), i + 2).filter(Number.isFinite).sort((a, b) => a - b);
-            return slice.length ? slice[Math.floor(slice.length / 2)] : null;
-        });
-
         // Fill area under line for better readability
         const areaTrace = {
             x: xLabels, y: yLaeq,
@@ -2015,17 +2122,9 @@ function displayRollingMedianChart() {
             x: xLabels, y: yLaeq,
             name: 'Hourly LAeq',
             type: 'scatter', mode: 'lines+markers',
-            line: { color: '#3D5A80', width: 2 },
+            line: { color: '#3D5A80', width: 2.5 },
             marker: { size: 7, color: '#3D5A80', symbol: 'circle' },
             hovertemplate: '%{x}<br>LAeq: %{y:.1f} dB(A)<extra></extra>',
-        };
-
-        const medianTrace = {
-            x: xLabels, y: rollingMedian,
-            name: '3-point Rolling Median',
-            type: 'scatter', mode: 'lines',
-            line: { color: '#e74c3c', width: 2.5, dash: 'solid' },
-            hovertemplate: '%{x}<br>Rolling Median: %{y:.1f} dB(A)<extra></extra>',
         };
 
         const allVals = validY.concat([53, 45]);
@@ -2033,9 +2132,6 @@ function displayRollingMedianChart() {
         const yMax = Math.ceil(Math.max(...allVals) + 6);
 
         const shapes = [
-            { type: 'rect', xref: 'paper', x0: 0, x1: 1,
-              y0: 0, y1: 45,
-              fillcolor: 'rgba(46,204,113,0.05)', line: { width: 0 } },
             { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 53, y1: 53,
               line: { color: 'rgba(239,68,68,0.55)', width: 1.5, dash: 'dot' } },
             { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 45, y1: 45,
@@ -2051,6 +2147,32 @@ function displayRollingMedianChart() {
               xanchor: 'right', yanchor: 'bottom', yshift: 3 },
         ];
 
+        // Shade the WHO Lnight window (23:00–07:00) on the categorical hour axis.
+        // Plotly maps categories to integer positions 0..23, so we shade by index.
+        if (hourValues && hourValues.length) {
+            const idxOf = (hr) => hourValues.indexOf(hr);
+            const nightBands = [];
+            const preDawn = idxOf(0);   // 00:00
+            const dawnEnd = idxOf(6);   // through 06:59 (07:00 boundary)
+            const lateNight = idxOf(23);
+            if (preDawn !== -1 && dawnEnd !== -1) nightBands.push([preDawn - 0.5, dawnEnd + 0.5]);
+            if (lateNight !== -1) nightBands.push([lateNight - 0.5, lateNight + 0.5]);
+            nightBands.forEach(([x0, x1]) => {
+                shapes.unshift({
+                    type: 'rect', xref: 'x', yref: 'paper',
+                    x0, x1, y0: 0, y1: 1,
+                    fillcolor: 'rgba(30, 58, 95, 0.07)',
+                    line: { width: 0 }, layer: 'below',
+                });
+            });
+            annotations.push({
+                xref: 'paper', yref: 'paper', x: 0.01, y: 0.98,
+                text: '▮ Shaded = WHO night window (23:00–07:00)',
+                showarrow: false, font: { size: 10, color: 'rgba(30,58,95,0.65)' },
+                xanchor: 'left', yanchor: 'top',
+            });
+        }
+
         const layout = {
             title: { text: chartTitle, font: { size: 15, color: '#1e293b' }, x: 0.5, xanchor: 'center' },
             xaxis: { title: xTitle, automargin: true, showgrid: true, gridcolor: 'rgba(0,0,0,0.06)' },
@@ -2064,7 +2186,7 @@ function displayRollingMedianChart() {
             paper_bgcolor: 'white',
         };
 
-        Plotly.newPlot(container, [areaTrace, rawTrace, medianTrace], layout,
+        Plotly.newPlot(container, [areaTrace, rawTrace], layout,
                        { responsive: true, displayModeBar: true, displaylogo: false });
     } catch (e) {
         console.error('Hourly trend chart failed:', e);
@@ -2221,6 +2343,7 @@ function generateReport(reportType, format = 'html') {
             filters: (currentFilters && (currentFilters.exclusions.length || currentFilters.bound_start || currentFilters.bound_end)) ? currentFilters : null,
             device_id: deviceId,
             source_files: sourceFiles,
+            environment: deploymentEnvironment,
             merge_gap_report: window.mergeGapReport || null,
             custom_section_heading: customSectionHeading,
             custom_section_body: customSectionBody,
