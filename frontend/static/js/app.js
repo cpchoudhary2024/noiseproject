@@ -2998,6 +2998,7 @@ async function runComparison() {
         if (!res.ok || data.error) throw new Error(data.error || 'Server error');
 
         compareDatasets = data.datasets;
+        window.comparisonSummary = data.comparison_summary || null;
         document.getElementById('compareLoading').style.display = 'none';
         document.getElementById('compareResults').style.display = 'block';
         _renderComparisonResults(compareDatasets);
@@ -3014,11 +3015,64 @@ function _fmt(v, decimals = 1) {
 }
 
 function _renderComparisonResults(datasets) {
-    _renderCompareMetricsTable(datasets);
-    _renderCompareBarChart(datasets);
+    _renderCompareVerdict(window.comparisonSummary);
+    _renderRankedBar('compareRankDen', datasets, 'lden', 53, 'Overall day-and-night level (Lden)');
+    _renderRankedBar('compareRankNight', datasets, 'lnight', 45, 'Night-time level (Lnight)');
     _renderCompareDiurnalChart(datasets);
-    _renderComparePercentilesChart(datasets);
-    _renderCompareExceedanceChart(datasets);
+    _renderCompareMetricsTable(datasets);
+}
+
+// Plain-language ranking / verdict banner
+function _renderCompareVerdict(summary) {
+    const el = document.getElementById('compareVerdict');
+    if (!el) return;
+    if (!summary || !summary.verdict) { el.style.display = 'none'; return; }
+    const anyExceed = (summary.n_exceed_day || 0) > 0 || (summary.n_exceed_night || 0) > 0;
+    el.className = 'compare-verdict ' + (anyExceed ? 'warn' : 'ok');
+    el.style.display = 'block';
+    el.innerHTML = `<div class="cv-title"><i class="fas fa-circle-info"></i> What the comparison shows</div>
+        <p>${escapeHtml(summary.verdict)}</p>`;
+}
+
+// Ranked horizontal bar: sites sorted loudest-at-top, colored by WHO pass/fail
+function _renderRankedBar(containerId, datasets, key, limit, title) {
+    const el = document.getElementById(containerId);
+    if (!el || typeof Plotly === 'undefined') return;
+
+    const pairs = datasets
+        .map(d => ({ name: d.name, v: d[key] }))
+        .filter(p => p.v !== null && p.v !== undefined && Number.isFinite(Number(p.v)))
+        .sort((a, b) => a.v - b.v);  // quietest first -> bottom; loudest -> top
+
+    if (pairs.length === 0) {
+        el.innerHTML = '<p style="color:#6b7280;padding:14px;">Not enough data to rank.</p>';
+        return;
+    }
+
+    const names = pairs.map(p => p.name);
+    const vals = pairs.map(p => Number(p.v));
+    const barColors = vals.map(v => v > limit ? '#dc2626' : '#16a34a');
+    const maxv = Math.max(...vals, limit);
+
+    const trace = {
+        type: 'bar', orientation: 'h', x: vals, y: names,
+        marker: { color: barColors },
+        text: vals.map(v => `${v.toFixed(1)} dB`), textposition: 'outside', cliponaxis: false,
+        hovertemplate: '%{y}: %{x:.1f} dB(A)<extra></extra>',
+    };
+    const layout = {
+        title: { text: title, font: { size: 14, color: '#1e293b' } },
+        xaxis: { title: 'dB(A)', range: [0, maxv + 12], gridcolor: 'rgba(0,0,0,0.06)', zeroline: false },
+        yaxis: { automargin: true },
+        height: 110 + names.length * 46,
+        margin: { l: 10, r: 60, t: 50, b: 45 },
+        plot_bgcolor: 'white', paper_bgcolor: 'white', showlegend: false,
+        shapes: [{ type: 'line', x0: limit, x1: limit, yref: 'paper', y0: 0, y1: 1,
+                   line: { color: '#1e3a5f', dash: 'dot', width: 2 } }],
+        annotations: [{ x: limit, yref: 'paper', y: 1.02, xanchor: 'center', yanchor: 'bottom',
+                        text: `WHO ${limit} dB`, showarrow: false, font: { size: 11, color: '#1e3a5f' } }],
+    };
+    Plotly.newPlot(el, [trace], layout, { responsive: true, displayModeBar: false });
 }
 
 function _renderCompareMetricsTable(datasets) {
@@ -3028,19 +3082,13 @@ function _renderCompareMetricsTable(datasets) {
     const WHO_DAY = 53, WHO_NIGHT = 45;
 
     const metrics = [
-        { label: 'Date Range',             key: 'date_range',           fmt: v => v || 'N/A', who: null },
-        { label: 'Duration',               key: 'duration_label',       fmt: v => v || 'N/A', who: null },
-        { label: 'Records',                key: 'n_records',            fmt: v => v != null ? v.toLocaleString() : 'N/A', who: null },
-        { label: 'LAeq dB(A)',             key: 'laeq',                 fmt: v => v != null ? _fmt(v) : 'N/A', who: null },
-        { label: 'LAmax dB(A)',            key: 'lmax',                 fmt: v => v != null ? _fmt(v) : 'N/A', who: null },
-        { label: 'LAmin dB(A)',            key: 'lmin',                 fmt: v => v != null ? _fmt(v) : 'N/A', who: null },
-        { label: 'Lden dB(A)',             key: 'lden',                 fmt: v => v != null ? _fmt(v) : 'N/A', who: { limit: WHO_DAY,   higher_is_bad: true } },
-        { label: 'Lnight dB(A)',           key: 'lnight',               fmt: v => v != null ? _fmt(v) : 'N/A', who: { limit: WHO_NIGHT, higher_is_bad: true } },
-        { label: 'L10 dB(A)',             key: 'l10',                  fmt: v => v != null ? _fmt(v) : 'N/A', who: null },
-        { label: 'L50 dB(A)',             key: 'l50',                  fmt: v => v != null ? _fmt(v) : 'N/A', who: null },
-        { label: 'L90 dB(A)',             key: 'l90',                  fmt: v => v != null ? _fmt(v) : 'N/A', who: null },
-        { label: '% time > 53 dB (day)',  key: 'pct_above_day_who',    fmt: v => v != null ? `${_fmt(v)}%` : 'N/A', who: null },
-        { label: '% time > 45 dB (night)',key: 'pct_above_night_who',  fmt: v => v != null ? `${_fmt(v)}%` : 'N/A', who: null },
+        { label: 'Monitoring period',        key: 'date_range',     fmt: v => v || 'N/A', who: null },
+        { label: 'Duration',                 key: 'duration_label', fmt: v => v || 'N/A', who: null },
+        { label: 'Average level (LAeq)',     key: 'laeq',           fmt: v => v != null ? `${_fmt(v)} dB` : 'N/A', who: null },
+        { label: 'Day-night (Lden)',         key: 'lden',           fmt: v => v != null ? `${_fmt(v)} dB` : 'N/A', who: { limit: WHO_DAY,   higher_is_bad: true } },
+        { label: 'Night (Lnight)',           key: 'lnight',         fmt: v => v != null ? `${_fmt(v)} dB` : 'N/A', who: { limit: WHO_NIGHT, higher_is_bad: true } },
+        { label: 'Loudest moment (LAmax)',   key: 'lmax',           fmt: v => v != null ? `${_fmt(v)} dB` : 'N/A', who: null },
+        { label: 'Quiet background (L90)',   key: 'l90',            fmt: v => v != null ? `${_fmt(v)} dB` : 'N/A', who: null },
     ];
 
     const headerRow = `<tr><th class="metric-label">Metric</th>${datasets.map(d => `<th>${d.name}</th>`).join('')}</tr>`;
@@ -3058,44 +3106,6 @@ function _renderCompareMetricsTable(datasets) {
     }).join('');
 
     container.innerHTML = `<table class="compare-metrics-table"><thead>${headerRow}</thead><tbody>${bodyRows}</tbody></table>`;
-}
-
-function _renderCompareBarChart(datasets) {
-    const el = document.getElementById('compareBarChart');
-    if (!el || typeof Plotly === 'undefined') return;
-
-    const names = datasets.map(d => d.name);
-    const COLORS = ['#3498db', '#e74c3c', '#27ae60', '#f39c12', '#9b59b6', '#1abc9c'];
-
-    const traces = [
-        { name: 'LAeq', values: datasets.map(d => d.laeq), color: '#3498db' },
-        { name: 'Lden',  values: datasets.map(d => d.lden),  color: '#e74c3c' },
-        { name: 'Lnight',values: datasets.map(d => d.lnight),color: '#9b59b6' },
-    ].map(t => ({
-        type: 'bar', name: t.name, x: names, y: t.values,
-        marker: { color: t.color }, text: t.values.map(v => v != null ? _fmt(v) : ''),
-        textposition: 'outside', cliponaxis: false
-    }));
-
-    const layout = {
-        barmode: 'group',
-        yaxis: { title: 'dB(A)', range: [0, Math.max(80, ...datasets.flatMap(d => [d.laeq || 0, d.lden || 0]) ) + 5] },
-        xaxis: { title: '' },
-        shapes: [
-            { type: 'line', x0: -0.5, x1: names.length - 0.5, y0: 53, y1: 53, line: { color: '#c0392b', dash: 'dot', width: 2 } },
-            { type: 'line', x0: -0.5, x1: names.length - 0.5, y0: 45, y1: 45, line: { color: '#8e44ad', dash: 'dash', width: 1.5 } },
-        ],
-        annotations: [
-            { x: names.length - 0.5, y: 53, xanchor: 'right', yanchor: 'bottom', text: 'WHO Lden 53 dB', showarrow: false, font: { size: 10, color: '#c0392b' } },
-            { x: names.length - 0.5, y: 45, xanchor: 'right', yanchor: 'bottom', text: 'WHO Lnight 45 dB', showarrow: false, font: { size: 10, color: '#8e44ad' } },
-        ],
-        legend: { orientation: 'h', y: -0.2 },
-        margin: { l: 55, r: 20, t: 30, b: 80 },
-        plot_bgcolor: '#f8fafc', paper_bgcolor: 'white',
-        height: 400,
-    };
-
-    Plotly.newPlot(el, traces, layout, { responsive: true, displayModeBar: true });
 }
 
 function _renderCompareDiurnalChart(datasets) {
@@ -3133,69 +3143,6 @@ function _renderCompareDiurnalChart(datasets) {
         margin: { l: 55, r: 20, t: 30, b: 80 },
         plot_bgcolor: '#f8fafc', paper_bgcolor: 'white',
         height: 420,
-    };
-
-    Plotly.newPlot(el, traces, layout, { responsive: true, displayModeBar: true });
-}
-
-function _renderComparePercentilesChart(datasets) {
-    const el = document.getElementById('comparePercentilesChart');
-    if (!el || typeof Plotly === 'undefined') return;
-
-    const COLORS = ['#0066ff', '#e74c3c', '#27ae60', '#f39c12', '#9b59b6', '#1abc9c'];
-    const percentileKeys = ['l10', 'l50', 'l90'];
-    const percentileLabels = ['L10', 'L50', 'L90'];
-
-    const traces = datasets.map((d, i) => ({
-        type: 'scatter', mode: 'lines+markers', name: d.name,
-        x: percentileLabels,
-        y: percentileKeys.map(k => d[k]),
-        line: { color: COLORS[i % COLORS.length], width: 2.5 },
-        marker: { size: 8 },
-    }));
-
-    const layout = {
-        xaxis: { title: 'Percentile' },
-        yaxis: { title: 'dB(A)' },
-        legend: { orientation: 'h', y: -0.2 },
-        margin: { l: 55, r: 20, t: 30, b: 60 },
-        plot_bgcolor: '#f8fafc', paper_bgcolor: 'white',
-        height: 380,
-    };
-
-    Plotly.newPlot(el, traces, layout, { responsive: true, displayModeBar: true });
-}
-
-function _renderCompareExceedanceChart(datasets) {
-    const el = document.getElementById('compareExceedanceChart');
-    if (!el || typeof Plotly === 'undefined') return;
-
-    const names = datasets.map(d => d.name);
-
-    const traces = [
-        {
-            type: 'bar', name: '% > 53 dB (WHO day)',
-            x: names, y: datasets.map(d => d.pct_above_day_who),
-            marker: { color: '#e74c3c' },
-            text: datasets.map(d => d.pct_above_day_who != null ? `${_fmt(d.pct_above_day_who)}%` : ''),
-            textposition: 'outside', cliponaxis: false,
-        },
-        {
-            type: 'bar', name: '% > 45 dB (WHO night)',
-            x: names, y: datasets.map(d => d.pct_above_night_who),
-            marker: { color: '#9b59b6' },
-            text: datasets.map(d => d.pct_above_night_who != null ? `${_fmt(d.pct_above_night_who)}%` : ''),
-            textposition: 'outside', cliponaxis: false,
-        },
-    ];
-
-    const layout = {
-        barmode: 'group',
-        yaxis: { title: '% of monitoring time', range: [0, 105] },
-        legend: { orientation: 'h', y: -0.2 },
-        margin: { l: 55, r: 20, t: 30, b: 80 },
-        plot_bgcolor: '#f8fafc', paper_bgcolor: 'white',
-        height: 380,
     };
 
     Plotly.newPlot(el, traces, layout, { responsive: true, displayModeBar: true });

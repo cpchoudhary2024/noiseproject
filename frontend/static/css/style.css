@@ -2454,6 +2454,34 @@ body {
     box-shadow: var(--shadow-sm);
 }
 
+/* Plain-language verdict banner for the comparison */
+.compare-verdict {
+    border-radius: 12px;
+    padding: 18px 22px;
+    margin-bottom: 24px;
+    border: 1px solid;
+    box-shadow: var(--shadow-sm);
+}
+.compare-verdict.ok   { background: #f0fdf4; border-color: #bbf7d0; }
+.compare-verdict.warn { background: #fffbeb; border-color: #fde68a; }
+.compare-verdict .cv-title {
+    font-weight: 700;
+    font-size: 14px;
+    color: #1e3a5f;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.compare-verdict p {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.6;
+    color: #334155;
+}
+.compare-chart-box#compareRankDen,
+.compare-chart-box#compareRankNight { min-height: 220px; }
+
 .compare-results-card h3 {
     font-size: 1rem;
     font-weight: 700;

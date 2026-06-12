@@ -2179,6 +2179,73 @@ def _compute_comparison_metrics(df: pd.DataFrame, original_name: str) -> dict:
     }
 
 
+def _comparison_summary(datasets: list[dict]) -> dict:
+    """Build a plain-language ranking + verdict for a set of compared datasets.
+
+    Ranks by Lden (the day-evening-night level the WHO 53 dB guideline applies to),
+    falling back to LAeq when Lden is unavailable. Also expresses the loudest-vs-
+    quietest gap as perceived loudness (2x per +10 dB) and sound energy (10x per
+    +10 dB), and counts how many sites exceed the WHO guidelines.
+    """
+    WHO_DEN, WHO_NIGHT = 53.0, 45.0
+
+    def _rank_value(d):
+        v = d.get('lden')
+        if v is None:
+            v = d.get('laeq')
+        return v
+
+    ranked = [d for d in datasets if _rank_value(d) is not None]
+    ranked.sort(key=_rank_value)  # quietest first
+
+    summary = {
+        'who_den_limit': WHO_DEN,
+        'who_night_limit': WHO_NIGHT,
+        'order': [d['name'] for d in ranked],
+        'quietest': None,
+        'loudest': None,
+        'gap_db': None,
+        'loudness_factor': None,
+        'energy_factor': None,
+        'n_exceed_day': sum(1 for d in datasets if (d.get('lden') is not None and d['lden'] > WHO_DEN)),
+        'n_exceed_night': sum(1 for d in datasets if (d.get('lnight') is not None and d['lnight'] > WHO_NIGHT)),
+        'n_total': len(datasets),
+        'verdict': '',
+    }
+
+    if len(ranked) >= 2:
+        q, l = ranked[0], ranked[-1]
+        qv, lv = _rank_value(q), _rank_value(l)
+        gap = round(lv - qv, 1)
+        summary['quietest'] = {'name': q['name'], 'level': round(qv, 1)}
+        summary['loudest'] = {'name': l['name'], 'level': round(lv, 1)}
+        summary['gap_db'] = gap
+        summary['loudness_factor'] = round(2 ** (gap / 10.0), 1)
+        summary['energy_factor'] = round(10 ** (gap / 10.0), 1)
+
+        parts = [
+            f"{q['name']} is the quietest location at {round(qv,1)} dB, and "
+            f"{l['name']} is the loudest at {round(lv,1)} dB."
+        ]
+        if gap >= 3:
+            parts.append(
+                f"That {gap} dB difference means {l['name']} sounds about "
+                f"{summary['loudness_factor']}x as loud and carries roughly "
+                f"{summary['energy_factor']}x the sound energy."
+            )
+        nd = summary['n_exceed_day']
+        if nd == 0:
+            parts.append(f"All {summary['n_total']} locations are within the WHO health guideline (53 dB).")
+        else:
+            parts.append(f"{nd} of {summary['n_total']} locations exceed the WHO health guideline (53 dB).")
+        nn = summary['n_exceed_night']
+        if nn > 0:
+            parts.append(f"{nn} exceed the stricter night-time sleep guideline (45 dB).")
+        summary['verdict'] = ' '.join(parts)
+
+    return summary
+
+
 @app.route('/api/compare', methods=['POST'])
 def compare_files():
     """Process 2–6 noise data files and return side-by-side comparison metrics."""
@@ -2210,7 +2277,8 @@ def compare_files():
                 return jsonify({'error': f'Could not read {file.filename}: {str(e)}'}), 400
 
         _run_retention_cleanup(keep_paths=tuple(saved_paths))
-        return jsonify({'success': True, 'datasets': datasets})
+        return jsonify({'success': True, 'datasets': datasets,
+                        'comparison_summary': _comparison_summary(datasets)})
 
     except Exception as e:
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
@@ -2256,214 +2324,178 @@ def compare_report():
                                   textColor=colors.HexColor('#888888')))
 
         story = []
+        summary = _comparison_summary(datasets)
+        n = len(datasets)
 
-        # ---- Title ----
-        story.append(Paragraph("Multi-Dataset Environmental Noise Comparison", styles['Title']))
-        story.append(Spacer(1, 0.1 * inch))
-        story.append(Paragraph(
-            f"Comparative Acoustic Analysis  |  Generated: {datetime.now().strftime('%B %d, %Y  %H:%M')}",
-            styles['Sub']
-        ))
-        story.append(Spacer(1, 0.25 * inch))
-
-        # ---- Metrics Table ----
-        story.append(Paragraph("Section 1: Key Metrics Comparison", styles['h1']))
-        story.append(Spacer(1, 0.1 * inch))
+        import io as _io
+        from reportlab.platypus import Image as RLImage
 
         def _db(v):
             return f"{v:.1f}" if v is not None else "N/A"
 
-        def _pct(v):
-            return f"{v:.1f}%" if v is not None else "N/A"
+        def _ranked_bar_fig(key, limit, title):
+            pairs = [(d['name'], d.get(key)) for d in datasets if d.get(key) is not None]
+            if not pairs:
+                return None
+            pairs.sort(key=lambda p: p[1])  # quietest -> bottom, loudest -> top
+            names = [p[0][:26] for p in pairs]
+            vals = [p[1] for p in pairs]
+            bar_colors = ['#dc2626' if v > limit else '#16a34a' for v in vals]
+            fig = go.Figure(go.Bar(
+                x=vals, y=names, orientation='h', marker_color=bar_colors,
+                text=[f'{v:.1f} dB' for v in vals], textposition='outside', cliponaxis=False,
+            ))
+            fig.add_vline(x=limit, line_dash='dot', line_color='#1e3a5f',
+                          annotation_text=f'WHO guideline {limit:.0f} dB', annotation_position='top right')
+            maxv = max(vals + [limit])
+            fig.update_layout(
+                title=title, xaxis_title='dB(A)',
+                xaxis=dict(range=[0, maxv + 12], gridcolor='rgba(0,0,0,0.06)'),
+                height=120 + len(vals) * 42, width=950,
+                margin=dict(l=10, r=60, t=55, b=45),
+                plot_bgcolor='white', paper_bgcolor='white', showlegend=False, font=dict(size=12),
+            )
+            return fig
 
-        headers = ["Metric"] + [d['name'][:22] for d in datasets]
+        def _add_fig(fig, h_in):
+            if fig is None:
+                story.append(Paragraph("<i>Chart unavailable — insufficient data.</i>", styles['BodyText']))
+                return
+            try:
+                img = fig.to_image(format='png', scale=2)
+                story.append(RLImage(_io.BytesIO(img), width=9.5 * inch, height=h_in * inch))
+            except Exception:
+                story.append(Paragraph("<i>Chart could not be rendered.</i>", styles['BodyText']))
+
+        # ---- Title ----
+        story.append(Paragraph("Noise Comparison Report", styles['Title']))
+        story.append(Spacer(1, 0.06 * inch))
+        story.append(Paragraph(
+            f"Comparing {n} monitoring locations  |  Generated {datetime.now().strftime('%B %d, %Y')}",
+            styles['Sub']))
+        story.append(Spacer(1, 0.22 * inch))
+
+        # ---- Plain-language verdict ----
+        if summary.get('verdict'):
+            verdict_style = ParagraphStyle(
+                'Verdict', parent=styles['BodyText'], fontSize=11, leading=16,
+                backColor=colors.HexColor('#EFF6FF'), borderColor=colors.HexColor('#3D5A80'),
+                borderWidth=1, borderPadding=(10, 12, 10, 12))
+            story.append(Paragraph("What the comparison shows", styles['h1']))
+            story.append(Spacer(1, 0.06 * inch))
+            story.append(Paragraph(summary['verdict'], verdict_style))
+            story.append(Spacer(1, 0.2 * inch))
+
+        # ---- Ranked: overall day-night level ----
+        story.append(Paragraph("Overall noise ranking (day &amp; night)", styles['h1']))
+        story.append(Paragraph(
+            "Each location's overall day-and-night noise level (Lden), loudest at the top. "
+            "Green is within the WHO health guideline of 53 dB; red is above it.", styles['BodyText']))
+        story.append(Spacer(1, 0.08 * inch))
+        _add_fig(_ranked_bar_fig('lden', 53.0, 'Overall day-and-night level (Lden) by location'),
+                 0.9 + 0.5 * n)
+        story.append(Spacer(1, 0.18 * inch))
+
+        # ---- Ranked: night-time ----
+        story.append(Paragraph("Night-time noise ranking (sleep)", styles['h1']))
+        story.append(Paragraph(
+            "Night-time noise level (Lnight, 23:00–07:00) per location. Green is within the WHO "
+            "sleep-protection guideline of 45 dB; red is above it.", styles['BodyText']))
+        story.append(Spacer(1, 0.08 * inch))
+        _add_fig(_ranked_bar_fig('lnight', 45.0, 'Night-time level (Lnight) by location'),
+                 0.9 + 0.5 * n)
+        story.append(PageBreak())
+
+        # ---- Side-by-side summary table (slim, plain) ----
+        story.append(Paragraph("Side-by-side summary", styles['h1']))
+        story.append(Spacer(1, 0.08 * inch))
+
+        def _verdict_cell(v, limit):
+            if v is None:
+                return "N/A"
+            if v <= limit:
+                return f"<font color='#15803d'>Within ({_db(v)})</font>"
+            return f"<font color='#b91c1c'>Above +{round(v - limit, 1)} ({_db(v)})</font>"
+
+        headers = ["Location"] + [d['name'][:20] for d in datasets]
         rows = [
-            ["Date Range"] + [d.get('date_range', 'N/A') for d in datasets],
+            ["Monitoring period"] + [d.get('date_range', 'N/A') for d in datasets],
             ["Duration"] + [d.get('duration_label', 'N/A') for d in datasets],
-            ["Records"] + [str(d.get('n_records', 'N/A')) for d in datasets],
-            ["LAeq dB(A)"] + [_db(d.get('laeq')) for d in datasets],
-            ["LAmax dB(A)"] + [_db(d.get('lmax')) for d in datasets],
-            ["LAmin dB(A)"] + [_db(d.get('lmin')) for d in datasets],
-            ["Lden dB(A)"] + [_db(d.get('lden')) for d in datasets],
-            ["Lnight dB(A)"] + [_db(d.get('lnight')) for d in datasets],
-            ["L10 dB(A)"] + [_db(d.get('l10')) for d in datasets],
-            ["L50 dB(A)"] + [_db(d.get('l50')) for d in datasets],
-            ["L90 dB(A)"] + [_db(d.get('l90')) for d in datasets],
-            ["% time > 53 dB (WHO day)"] + [_pct(d.get('pct_above_day_who')) for d in datasets],
-            ["% time > 45 dB (WHO night)"] + [_pct(d.get('pct_above_night_who')) for d in datasets],
+            ["Average level (LAeq)"] + [f"{_db(d.get('laeq'))} dB" for d in datasets],
+            ["Day-night (Lden) vs 53"] + [_verdict_cell(d.get('lden'), 53.0) for d in datasets],
+            ["Night (Lnight) vs 45"] + [_verdict_cell(d.get('lnight'), 45.0) for d in datasets],
+            ["Loudest moment (LAmax)"] + [f"{_db(d.get('lmax'))} dB" for d in datasets],
+            ["Quiet background (L90)"] + [f"{_db(d.get('l90'))} dB" for d in datasets],
         ]
-
         n_cols = len(headers)
-        metric_col_w = 2.0 * inch
+        metric_col_w = 1.9 * inch
         data_col_w = (10.5 * inch - metric_col_w) / max(1, n_cols - 1)
         col_widths = [metric_col_w] + [data_col_w] * (n_cols - 1)
-
         table_data = [[Paragraph(str(c), styles['BodyText']) for c in row] for row in [headers] + rows]
         t = Table(table_data, colWidths=col_widths)
-
-        ts_style = [
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3D5A80')),
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e3a5f')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('TOPPADDING', (0, 0), (-1, 0), 8),
             ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#EEF2F7')),
             ('FONTNAME', (0, 1), (0, -1), 'Helvetica-Bold'),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F8FAFC')),
-            ('BACKGROUND', (0, 1), (0, -1), colors.HexColor('#EEF2F7')),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CCCCCC')),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#D1D5DB')),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
             ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
             ('FONTSIZE', (0, 0), (-1, -1), 8),
             ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor('#F8FAFC'), colors.white]),
-        ]
-        t.setStyle(TableStyle(ts_style))
+            ('TOPPADDING', (0, 1), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 1), (-1, -1), 5),
+        ]))
         story.append(t)
-        story.append(Spacer(1, 0.25 * inch))
+        story.append(Spacer(1, 0.22 * inch))
 
-        # ---- WHO Compliance Summary ----
-        story.append(Paragraph("Section 2: WHO 2018 Compliance Overview", styles['h1']))
-        story.append(Spacer(1, 0.08 * inch))
-        who_day_limit = 53.0
-        who_night_limit = 45.0
-        for ds in datasets:
-            lden = ds.get('lden')
-            lnight = ds.get('lnight')
-
-            # Daytime (Lden) sentence
-            if lden is not None:
-                day_diff = round(lden - who_day_limit, 1)
-                if day_diff > 0:
-                    day_sent = (
-                        f"Lden is <b>{_db(lden)} dB(A)</b> — "
-                        f"<font color='#c0392b'>exceeds the WHO daytime limit of 53 dB(A) by <b>{day_diff} dB</b>,"
-                        f" indicating elevated daytime acoustic exposure.</font>"
-                    )
-                else:
-                    day_sent = (
-                        f"Lden is <b>{_db(lden)} dB(A)</b> — "
-                        f"<font color='#27ae60'>within the WHO daytime limit of 53 dB(A) by <b>{abs(day_diff)} dB</b>,"
-                        f" compliant with daytime guidelines.</font>"
-                    )
-            else:
-                day_sent = "Lden could not be computed (insufficient data)."
-
-            # Nighttime (Lnight) sentence
-            if lnight is not None:
-                night_diff = round(lnight - who_night_limit, 1)
-                if night_diff > 0:
-                    night_sent = (
-                        f"Lnight is <b>{_db(lnight)} dB(A)</b> — "
-                        f"<font color='#c0392b'>exceeds the WHO nighttime limit of 45 dB(A) by <b>{night_diff} dB</b>,"
-                        f" posing a risk of sleep disturbance and cardiovascular effects.</font>"
-                    )
-                else:
-                    night_sent = (
-                        f"Lnight is <b>{_db(lnight)} dB(A)</b> — "
-                        f"<font color='#27ae60'>within the WHO nighttime limit of 45 dB(A) by <b>{abs(night_diff)} dB</b>,"
-                        f" compliant with nighttime health guidelines.</font>"
-                    )
-            else:
-                night_sent = "Lnight could not be computed (insufficient data)."
-
-            story.append(Paragraph(f"<b>{ds['name']}</b>", styles['h2']))
-            story.append(Paragraph(day_sent, styles['BodyText']))
-            story.append(Paragraph(night_sent, styles['BodyText']))
-            story.append(Spacer(1, 0.10 * inch))
-
-        story.append(PageBreak())
-
-        # ---- Diurnal Profile Chart ----
-        story.append(Paragraph("Section 3: Diurnal Comparison (24-Hour Average LAeq per Dataset)", styles['h1']))
-        story.append(Spacer(1, 0.08 * inch))
+        # ---- Daily pattern (diurnal) ----
+        story.append(Paragraph("Daily pattern — when is each location loudest?", styles['h1']))
         story.append(Paragraph(
-            "Each line represents the energy-averaged LAeq (dB(A)) for each clock hour aggregated across all "
-            "measurement days. Dashed reference lines show WHO Lnight threshold (45 dB, 23:00–07:00 band) and "
-            "WHO Lden daytime threshold (53 dB). A higher diurnal peak indicates more pronounced traffic or "
-            "activity-driven noise.",
-            styles['BodyText']
-        ))
+            "Average noise for each hour of the day, combined across all monitored days. Use it to see "
+            "when each location is quietest and loudest. Dotted lines mark the WHO day (53 dB) and "
+            "night (45 dB) guidelines.", styles['BodyText']))
         story.append(Spacer(1, 0.1 * inch))
-
         hours = list(range(24))
-        colors_list = ['#0066ff', '#e74c3c', '#27ae60', '#f39c12', '#9b59b6', '#1abc9c']
+        colors_list = ['#1e3a5f', '#e74c3c', '#16a34a', '#f39c12', '#9b59b6', '#0ea5e9']
         diurnal_fig = go.Figure()
         for i, ds in enumerate(datasets):
-            diurnal = ds.get('diurnal', [None] * 24)
-            y = [v if v is not None else None for v in diurnal]
+            y = [v if v is not None else None for v in ds.get('diurnal', [None] * 24)]
             diurnal_fig.add_trace(go.Scatter(
-                x=hours, y=y, mode='lines+markers', name=ds['name'],
-                line=dict(color=colors_list[i % len(colors_list)], width=2.5),
-                connectgaps=False
-            ))
-        diurnal_fig.add_hline(y=45, line_dash='dash', line_color='#8e44ad', annotation_text='WHO Lnight 45 dB')
-        diurnal_fig.add_hline(y=53, line_dash='dot', line_color='#c0392b', annotation_text='WHO Lden 53 dB')
+                x=hours, y=y, mode='lines+markers', name=ds['name'][:24],
+                line=dict(color=colors_list[i % len(colors_list)], width=2.5), connectgaps=False))
+        diurnal_fig.add_hline(y=45, line_dash='dash', line_color='#d97706')
+        diurnal_fig.add_hline(y=53, line_dash='dot', line_color='#c0392b')
         diurnal_fig.update_layout(
-            title='Diurnal Hourly Average LAeq Comparison',
-            xaxis_title='Hour of Day', yaxis_title='LAeq dB(A)',
+            xaxis_title='Hour of day', yaxis_title='Average noise dB(A)',
             xaxis=dict(tickmode='array', tickvals=list(range(0, 24, 2)),
-                       ticktext=[f'{h:02d}:00' for h in range(0, 24, 2)]),
-            height=400, width=950,
-            legend=dict(orientation='h', y=-0.25),
-            margin=dict(l=60, r=20, t=50, b=80),
-            plot_bgcolor='#f8fafc', paper_bgcolor='white'
-        )
+                       ticktext=[f'{h:02d}:00' for h in range(0, 24, 2)], gridcolor='rgba(0,0,0,0.06)'),
+            yaxis=dict(gridcolor='rgba(0,0,0,0.06)'),
+            height=400, width=950, legend=dict(orientation='h', y=-0.25),
+            margin=dict(l=60, r=20, t=30, b=80), plot_bgcolor='white', paper_bgcolor='white')
+        _add_fig(diurnal_fig, 4.0)
+        story.append(Spacer(1, 0.2 * inch))
 
-        try:
-            img_bytes = diurnal_fig.to_image(format='png', scale=2)
-            import io as _io
-            from reportlab.platypus import Image as RLImage
-            img_obj = RLImage(_io.BytesIO(img_bytes), width=9.5 * inch, height=4.0 * inch)
-            story.append(img_obj)
-        except Exception:
-            story.append(Paragraph("<i>Diurnal chart could not be rendered.</i>", styles['BodyText']))
-
-        story.append(Spacer(1, 0.25 * inch))
-
-        # ---- LAeq / Lden / Lnight Bar Chart ----
-        story.append(Paragraph("Section 4: LAeq, Lden, and Lnight Bar Comparison", styles['h1']))
+        # ---- Methodology & disclaimer ----
+        story.append(Paragraph("How to read this report", styles['h1']))
+        story.append(Paragraph(
+            "Noise is measured in A-weighted decibels (dB), matched to human hearing, and averaged using "
+            "energy averaging (LAeq) — the standard method. <b>Lden</b> is the day-evening-night level "
+            "(evening and night count for more, reflecting greater impact); <b>Lnight</b> is the night-only "
+            "level. Every +10 dB sounds about twice as loud and carries ten times the sound energy. "
+            "Guideline values are from the WHO Environmental Noise Guidelines (2018).",
+            styles['BodyText']))
         story.append(Spacer(1, 0.08 * inch))
         story.append(Paragraph(
-            "Grouped bar chart comparing the three primary acoustic load metrics across all datasets. "
-            "LAeq is the overall energy average; Lden adds evening (+5 dB) and night (+10 dB) penalties; "
-            "Lnight reflects the unpenalised nocturnal average. WHO 2018 limits: Lden ≤ 53 dB, Lnight ≤ 45 dB.",
-            styles['BodyText']
-        ))
-        story.append(Spacer(1, 0.1 * inch))
-
-        names = [ds['name'] for ds in datasets]
-        laeq_vals = [ds.get('laeq') for ds in datasets]
-        lden_vals = [ds.get('lden') for ds in datasets]
-        lnight_vals = [ds.get('lnight') for ds in datasets]
-
-        bar_fig = go.Figure()
-        bar_fig.add_trace(go.Bar(name='LAeq', x=names, y=laeq_vals, marker_color='#3498db'))
-        bar_fig.add_trace(go.Bar(name='Lden', x=names, y=lden_vals, marker_color='#e74c3c'))
-        bar_fig.add_trace(go.Bar(name='Lnight', x=names, y=lnight_vals, marker_color='#9b59b6'))
-        bar_fig.add_hline(y=53, line_dash='dot', line_color='#c0392b', annotation_text='WHO Lden limit')
-        bar_fig.add_hline(y=45, line_dash='dash', line_color='#8e44ad', annotation_text='WHO Lnight limit')
-        bar_fig.update_layout(
-            barmode='group', title='LAeq / Lden / Lnight Comparison',
-            yaxis_title='dB(A)', height=380, width=950,
-            legend=dict(orientation='h', y=-0.25),
-            margin=dict(l=60, r=20, t=50, b=80),
-            plot_bgcolor='#f8fafc', paper_bgcolor='white'
-        )
-        try:
-            img_bytes = bar_fig.to_image(format='png', scale=2)
-            img_obj = RLImage(_io.BytesIO(img_bytes), width=9.5 * inch, height=3.8 * inch)
-            story.append(img_obj)
-        except Exception:
-            story.append(Paragraph("<i>Bar chart could not be rendered.</i>", styles['BodyText']))
-
-        story.append(Spacer(1, 0.25 * inch))
-        story.append(Paragraph("Section 5: Disclaimer", styles['h1']))
-        story.append(Paragraph(
-            "This report was generated automatically from user-uploaded acoustic monitoring data. "
-            "Results are evaluated against WHO 2018 Environmental Noise Guidelines. "
-            "This document is for environmental research purposes only and does not constitute "
-            "medical or legal advice. Accuracy depends on proper sensor calibration.",
-            styles['BodyText']
-        ))
+            "<b>Note on fairness of comparison:</b> locations measured over different periods or durations "
+            "are not perfectly comparable — check the monitoring period row above. WHO guidelines are "
+            "intended as long-term annual averages, so shorter measurements are indicative only. This "
+            "report is for environmental research and community information, not medical or legal advice, "
+            "and accuracy depends on proper sensor calibration.",
+            styles['BodyText']))
 
         def _footer(canvas, doc):
             canvas.saveState()

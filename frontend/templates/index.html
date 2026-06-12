@@ -601,39 +601,35 @@
                 <!-- Results -->
                 <div id="compareResults" style="display:none;">
 
-                    <!-- Metrics summary table -->
+                    <!-- Plain-language verdict / ranking -->
+                    <div class="compare-verdict" id="compareVerdict" style="display:none;"></div>
+
+                    <!-- Ranking 1: overall day-night level -->
                     <div class="compare-results-card">
-                        <h3><i class="fas fa-table" style="color:#3D5A80;"></i> Key Metrics Comparison</h3>
-                        <p class="compare-results-note">WHO 2018 limits: Lden ≤ 53 dB(A) · Lnight ≤ 45 dB(A). Cells highlighted red exceed the guideline.</p>
-                        <div class="compare-table-scroll" id="compareMetricsTable"></div>
+                        <h3><i class="fas fa-ranking-star" style="color:#3D5A80;"></i> Overall noise ranking (day &amp; night)</h3>
+                        <p class="compare-results-note">Each location's overall day-and-night level (Lden), loudest at the top. <span style="color:#16a34a;font-weight:600;">Green</span> = within the WHO health guideline (53 dB); <span style="color:#dc2626;font-weight:600;">red</span> = above it.</p>
+                        <div id="compareRankDen" class="compare-chart-box"></div>
                     </div>
 
-                    <!-- Chart 1: LAeq / Lden / Lnight bar -->
+                    <!-- Ranking 2: night-time -->
                     <div class="compare-results-card">
-                        <h3><i class="fas fa-chart-bar" style="color:#3D5A80;"></i> LAeq · Lden · Lnight Comparison</h3>
-                        <p class="compare-results-note">Grouped bar chart. Dotted lines mark WHO limits. Lden includes evening (+5 dB) and night (+10 dB) penalties; Lnight covers 23:00–07:00 only.</p>
-                        <div id="compareBarChart" class="compare-chart-box"></div>
+                        <h3><i class="fas fa-moon" style="color:#3D5A80;"></i> Night-time noise ranking (sleep)</h3>
+                        <p class="compare-results-note">Night-time level (Lnight, 23:00–07:00). <span style="color:#16a34a;font-weight:600;">Green</span> = within the WHO sleep guideline (45 dB); <span style="color:#dc2626;font-weight:600;">red</span> = above it.</p>
+                        <div id="compareRankNight" class="compare-chart-box"></div>
                     </div>
 
-                    <!-- Chart 2: Diurnal profile overlay -->
+                    <!-- Daily pattern -->
                     <div class="compare-results-card">
-                        <h3><i class="fas fa-chart-line" style="color:#3D5A80;"></i> 24-Hour Diurnal Profile</h3>
-                        <p class="compare-results-note">Energy-averaged LAeq per clock hour across all measurement days. Reveals site-specific peak periods and nighttime noise floors.</p>
+                        <h3><i class="fas fa-chart-line" style="color:#3D5A80;"></i> Daily pattern — when is each location loudest?</h3>
+                        <p class="compare-results-note">Average noise for each hour of the day, combined across all monitored days. Dotted lines mark the WHO day (53 dB) and night (45 dB) guidelines.</p>
                         <div id="compareDiurnalChart" class="compare-chart-box"></div>
                     </div>
 
-                    <!-- Chart 3: Percentile comparison -->
+                    <!-- Side-by-side summary table -->
                     <div class="compare-results-card">
-                        <h3><i class="fas fa-chart-area" style="color:#3D5A80;"></i> Statistical Percentiles (L10 · L50 · L90)</h3>
-                        <p class="compare-results-note">L90 ≈ background floor; L50 = median acoustic climate; L10 = transient peak zone. A wide L10–L90 gap signals a highly variable environment.</p>
-                        <div id="comparePercentilesChart" class="compare-chart-box"></div>
-                    </div>
-
-                    <!-- Chart 4: WHO exceedance -->
-                    <div class="compare-results-card">
-                        <h3><i class="fas fa-exclamation-triangle" style="color:#e74c3c;"></i> WHO Exceedance — % Time Above Limits</h3>
-                        <p class="compare-results-note">Fraction of total monitoring time where instantaneous LAeq exceeded WHO daytime (53 dB) and nighttime (45 dB) thresholds.</p>
-                        <div id="compareExceedanceChart" class="compare-chart-box"></div>
+                        <h3><i class="fas fa-table" style="color:#3D5A80;"></i> Side-by-side summary</h3>
+                        <p class="compare-results-note">WHO 2018 guidelines: Lden ≤ 53 dB(A) · Lnight ≤ 45 dB(A).</p>
+                        <div class="compare-table-scroll" id="compareMetricsTable"></div>
                     </div>
 
                     <!-- Download -->
