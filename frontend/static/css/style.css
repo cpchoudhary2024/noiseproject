@@ -2507,8 +2507,47 @@ body {
     line-height: 1.6;
     color: #334155;
 }
-.compare-chart-box#compareRankDen,
-.compare-chart-box#compareRankNight { min-height: 220px; }
+/* Per-location comparison status cards */
+.compare-status-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+}
+.cmp-card {
+    border: 1px solid var(--gray-200);
+    border-left: 5px solid var(--gray-300);
+    border-radius: 12px;
+    padding: 16px 18px;
+    background: #fff;
+    box-shadow: var(--shadow-sm);
+}
+.cmp-card.ok  { border-left-color: var(--success); background: #f6fdf9; }
+.cmp-card.bad { border-left-color: var(--danger);  background: #fef6f6; }
+.cmp-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.cmp-rank {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px; font-weight: 700; color: #fff;
+    background: var(--primary); border-radius: 6px; padding: 2px 7px; flex-shrink: 0;
+}
+.cmp-card-name {
+    font-weight: 700; font-size: 14px; color: var(--ink);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cmp-metric { padding: 8px 0; border-top: 1px solid var(--gray-100); }
+.cmp-metric:first-of-type { border-top: none; }
+.cmp-metric-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.cmp-metric-label { font-size: 12px; color: var(--gray-500); font-weight: 600; }
+.cmp-metric-val {
+    font-family: 'JetBrains Mono', monospace; font-size: 20px; font-weight: 700; color: var(--ink);
+}
+.cmp-unit { font-size: 12px; font-weight: 600; color: var(--gray-400); }
+.cmp-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+}
+.cmp-badge.ok  { background: var(--success-light); color: #15803d; }
+.cmp-badge.bad { background: var(--danger-light);  color: #b91c1c; }
+.cmp-badge.na  { background: var(--gray-100); color: var(--gray-500); }
 
 .compare-results-card h3 {
     font-size: 1rem;

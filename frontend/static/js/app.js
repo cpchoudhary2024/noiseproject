@@ -3029,10 +3029,43 @@ function _fmt(v, decimals = 1) {
 
 function _renderComparisonResults(datasets) {
     _renderCompareVerdict(window.comparisonSummary);
-    _renderCompareDotPlot(datasets);
-    _renderCompareBoxPlot(datasets);
+    _renderCompareStatusCards(datasets);
     _renderCompareDiurnalChart(datasets);
     _renderCompareMetricsTable(datasets);
+}
+
+// Per-location status cards — plain numbers + within/above-guideline badges,
+// sorted loudest to quietest. No axes, legends, or plots to interpret.
+function _renderCompareStatusCards(datasets) {
+    const el = document.getElementById('compareStatusCards');
+    if (!el) return;
+
+    const ds = [...datasets].sort((a, b) => (b.lden ?? b.laeq ?? 0) - (a.lden ?? a.laeq ?? 0)); // loudest first
+
+    const badge = (v, limit) => {
+        if (v == null) return `<span class="cmp-badge na">—</span>`;
+        if (v <= limit) return `<span class="cmp-badge ok"><i class="fas fa-check"></i> Within guideline</span>`;
+        return `<span class="cmp-badge bad"><i class="fas fa-triangle-exclamation"></i> Above by ${(v - limit).toFixed(1)} dB</span>`;
+    };
+    const val = v => v != null ? `${Number(v).toFixed(1)}<span class="cmp-unit"> dB</span>` : '—';
+
+    el.innerHTML = ds.map((d, i) => {
+        const exceeds = (d.lden != null && d.lden > 53) || (d.lnight != null && d.lnight > 45);
+        return `<div class="cmp-card ${exceeds ? 'bad' : 'ok'}">
+            <div class="cmp-card-head">
+                <span class="cmp-rank">#${i + 1}</span>
+                <span class="cmp-card-name" title="${escapeHtml(d.name)}">${escapeHtml(d.name)}</span>
+            </div>
+            <div class="cmp-metric">
+                <div class="cmp-metric-top"><span class="cmp-metric-label">Day &amp; night (Lden)</span><span class="cmp-metric-val">${val(d.lden)}</span></div>
+                ${badge(d.lden, 53)}
+            </div>
+            <div class="cmp-metric">
+                <div class="cmp-metric-top"><span class="cmp-metric-label">Night (Lnight)</span><span class="cmp-metric-val">${val(d.lnight)}</span></div>
+                ${badge(d.lnight, 45)}
+            </div>
+        </div>`;
+    }).join('');
 }
 
 // Plain-language ranking / verdict banner
@@ -3048,89 +3081,6 @@ function _renderCompareVerdict(summary) {
 }
 
 // Dot plot: each location's Lden (circle) and Lnight (diamond) vs the WHO lines.
-// No bars — points show exact values, no misleading filled area or false zero.
-function _renderCompareDotPlot(datasets) {
-    const el = document.getElementById('compareDotPlot');
-    if (!el || typeof Plotly === 'undefined') return;
-
-    const ds = datasets
-        .filter(d => d.lden != null || d.lnight != null)
-        .sort((a, b) => (a.lden ?? a.lnight ?? 0) - (b.lden ?? b.lnight ?? 0)); // loudest -> top
-    if (ds.length === 0) { el.innerHTML = '<p style="color:#6b7280;padding:14px;">Not enough data.</p>'; return; }
-
-    const names = ds.map(d => d.name);
-    const lden = ds.map(d => d.lden);
-    const lnight = ds.map(d => d.lnight);
-    const allv = [...lden, ...lnight].filter(v => v != null);
-    const lo = Math.min(...allv) - 9, hi = Math.max(...allv) + 10;
-
-    const traces = [
-        {
-            x: lden, y: names, mode: 'markers+text', name: 'Day-night (Lden)', type: 'scatter',
-            marker: { symbol: 'circle', size: 15, line: { color: '#1e3a5f', width: 1 },
-                      color: lden.map(v => (v != null && v > 53) ? '#dc2626' : '#16a34a') },
-            text: lden.map(v => v != null ? v.toFixed(1) : ''), textposition: 'top center',
-            textfont: { size: 10, color: '#334155' },
-            hovertemplate: '%{y} — Lden %{x:.1f} dB<extra></extra>',
-        },
-        {
-            x: lnight, y: names, mode: 'markers', name: 'Night (Lnight)', type: 'scatter',
-            marker: { symbol: 'diamond', size: 13, line: { color: '#1e3a5f', width: 1 },
-                      color: lnight.map(v => (v != null && v > 45) ? '#dc2626' : '#16a34a') },
-            hovertemplate: '%{y} — Lnight %{x:.1f} dB<extra></extra>',
-        },
-    ];
-    const layout = {
-        xaxis: { title: 'dB(A)', range: [lo, hi], gridcolor: 'rgba(0,0,0,0.06)', zeroline: false },
-        yaxis: { automargin: true },
-        height: 130 + names.length * 50, margin: { l: 10, r: 30, t: 22, b: 60 },
-        plot_bgcolor: 'white', paper_bgcolor: 'white',
-        legend: { orientation: 'h', y: -0.2, x: 0.5, xanchor: 'center' },
-        shapes: [
-            { type: 'line', x0: 53, x1: 53, yref: 'paper', y0: 0, y1: 1, line: { color: '#c0392b', dash: 'dot', width: 2 } },
-            { type: 'line', x0: 45, x1: 45, yref: 'paper', y0: 0, y1: 1, line: { color: '#d97706', dash: 'dash', width: 2 } },
-        ],
-        annotations: [
-            { x: 53, yref: 'paper', y: 1.02, text: 'WHO 53', showarrow: false, font: { size: 10, color: '#c0392b' }, xanchor: 'center', yanchor: 'bottom' },
-            { x: 45, yref: 'paper', y: 1.02, text: 'WHO 45', showarrow: false, font: { size: 10, color: '#d97706' }, xanchor: 'center', yanchor: 'bottom' },
-        ],
-    };
-    Plotly.newPlot(el, traces, layout, { responsive: true, displayModeBar: false });
-}
-
-// Box-and-whisker: distribution of readings per location (precomputed quartiles).
-function _renderCompareBoxPlot(datasets) {
-    const el = document.getElementById('compareBoxPlot');
-    if (!el || typeof Plotly === 'undefined') return;
-
-    const ds = datasets.filter(d => d.box).sort((a, b) => a.box.median - b.box.median);
-    if (ds.length === 0) { el.innerHTML = '<p style="color:#6b7280;padding:14px;">Distribution data unavailable.</p>'; return; }
-
-    const trace = {
-        type: 'box',
-        x: ds.map(d => d.name),
-        q1: ds.map(d => d.box.q1), median: ds.map(d => d.box.median), q3: ds.map(d => d.box.q3),
-        lowerfence: ds.map(d => d.box.lo), upperfence: ds.map(d => d.box.hi),
-        marker: { color: '#3D5A80' }, line: { color: '#293241' },
-        fillcolor: 'rgba(61,90,128,0.25)', showlegend: false,
-    };
-    const layout = {
-        yaxis: { title: 'dB(A)', gridcolor: 'rgba(0,0,0,0.06)', zeroline: false },
-        xaxis: { automargin: true },
-        height: 440, margin: { l: 55, r: 30, t: 24, b: 70 },
-        plot_bgcolor: 'white', paper_bgcolor: 'white',
-        shapes: [
-            { type: 'line', yref: 'y', y0: 53, y1: 53, xref: 'paper', x0: 0, x1: 1, line: { color: '#c0392b', dash: 'dot', width: 2 } },
-            { type: 'line', yref: 'y', y0: 45, y1: 45, xref: 'paper', x0: 0, x1: 1, line: { color: '#d97706', dash: 'dash', width: 2 } },
-        ],
-        annotations: [
-            { xref: 'paper', x: 1, y: 53, text: 'WHO 53', showarrow: false, font: { size: 10, color: '#c0392b' }, xanchor: 'right', yanchor: 'bottom' },
-            { xref: 'paper', x: 1, y: 45, text: 'WHO 45', showarrow: false, font: { size: 10, color: '#d97706' }, xanchor: 'right', yanchor: 'bottom' },
-        ],
-    };
-    Plotly.newPlot(el, [trace], layout, { responsive: true, displayModeBar: false });
-}
-
 function _renderCompareMetricsTable(datasets) {
     const container = document.getElementById('compareMetricsTable');
     if (!container) return;

@@ -2357,68 +2357,6 @@ def compare_report():
         def _db(v):
             return f"{v:.1f}" if v is not None else "N/A"
 
-        def _dot_fig():
-            # Dot plot: each location's Lden (circle) and Lnight (diamond) vs the WHO
-            # guideline lines. No bars — points show the exact value with no misleading
-            # filled area or false zero baseline. Loudest locations at the top.
-            ds = [d for d in datasets if d.get('lden') is not None or d.get('lnight') is not None]
-            ds = sorted(ds, key=lambda d: (d.get('lden') if d.get('lden') is not None else d.get('lnight', 0)))
-            if not ds:
-                return None
-            names = [d['name'][:26] for d in ds]
-            lden = [d.get('lden') for d in ds]
-            lnight = [d.get('lnight') for d in ds]
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=lden, y=names, mode='markers+text', name='Day-night (Lden)',
-                marker=dict(symbol='circle', size=15,
-                            color=['#dc2626' if (v is not None and v > 53) else '#16a34a' for v in lden],
-                            line=dict(color='#1e3a5f', width=1)),
-                text=[f'{v:.1f}' if v is not None else '' for v in lden],
-                textposition='top center', textfont=dict(size=9, color='#334155'),
-                hovertemplate='%{y} — Lden %{x:.1f} dB<extra></extra>'))
-            fig.add_trace(go.Scatter(
-                x=lnight, y=names, mode='markers', name='Night (Lnight)',
-                marker=dict(symbol='diamond', size=12,
-                            color=['#dc2626' if (v is not None and v > 45) else '#16a34a' for v in lnight],
-                            line=dict(color='#1e3a5f', width=1)),
-                hovertemplate='%{y} — Lnight %{x:.1f} dB<extra></extra>'))
-            fig.add_vline(x=53, line_dash='dot', line_color='#c0392b', annotation_text='WHO 53 (day-night)')
-            fig.add_vline(x=45, line_dash='dash', line_color='#d97706', annotation_text='WHO 45 (night)')
-            allv = [v for v in lden + lnight if v is not None] or [50]
-            fig.update_layout(
-                title='Each location vs the WHO guidelines  (circle = day-night, diamond = night)',
-                xaxis=dict(title='dB(A)', range=[min(allv) - 9, max(allv) + 10], gridcolor='rgba(0,0,0,0.06)'),
-                yaxis=dict(automargin=True),
-                height=140 + len(names) * 46, width=950, margin=dict(l=10, r=40, t=60, b=55),
-                plot_bgcolor='white', paper_bgcolor='white', font=dict(size=12),
-                legend=dict(orientation='h', y=-0.2, x=0.5, xanchor='center'))
-            return fig
-
-        def _box_fig():
-            # Box-and-whisker: distribution of noise readings per location (quartiles +
-            # 1.5*IQR whiskers, precomputed). Shows spread that bars hide.
-            ds = [d for d in datasets if d.get('box')]
-            ds = sorted(ds, key=lambda d: d['box']['median'])
-            if not ds:
-                return None
-            fig = go.Figure(go.Box(
-                x=[d['name'][:20] for d in ds],
-                q1=[d['box']['q1'] for d in ds], median=[d['box']['median'] for d in ds],
-                q3=[d['box']['q3'] for d in ds], lowerfence=[d['box']['lo'] for d in ds],
-                upperfence=[d['box']['hi'] for d in ds],
-                marker_color='#3D5A80', line_color='#293241',
-                fillcolor='rgba(61,90,128,0.25)', showlegend=False))
-            fig.add_hline(y=53, line_dash='dot', line_color='#c0392b', annotation_text='WHO 53 dB')
-            fig.add_hline(y=45, line_dash='dash', line_color='#d97706', annotation_text='WHO 45 dB')
-            fig.update_layout(
-                title='Spread of noise readings at each location  (box = typical range, line = median)',
-                yaxis=dict(title='dB(A)', gridcolor='rgba(0,0,0,0.06)'),
-                xaxis=dict(automargin=True),
-                height=430, width=950, margin=dict(l=55, r=30, t=60, b=95),
-                plot_bgcolor='white', paper_bgcolor='white', font=dict(size=12))
-            return fig
-
         def _add_fig(fig, h_in):
             if fig is None:
                 story.append(Paragraph("<i>Chart unavailable — insufficient data.</i>", styles['BodyText']))
@@ -2448,25 +2386,6 @@ def compare_report():
             story.append(Paragraph(summary['verdict'], verdict_style))
             story.append(Spacer(1, 0.2 * inch))
 
-        # ---- Dot plot: each location vs the WHO guidelines ----
-        story.append(Paragraph("How each location compares to the WHO guidelines", styles['h1']))
-        story.append(Paragraph(
-            "Each location's day-and-night level (Lden, circle) and night-time level (Lnight, diamond) "
-            "plotted against the WHO guidelines (53 dB day-night, 45 dB night). Green markers are within "
-            "the guideline; red are above it. Loudest locations are at the top.", styles['BodyText']))
-        story.append(Spacer(1, 0.08 * inch))
-        _add_fig(_dot_fig(), 1.0 + 0.5 * n)
-        story.append(Spacer(1, 0.2 * inch))
-
-        # ---- Box plot: distribution / spread ----
-        story.append(Paragraph("How much the noise varies at each location", styles['h1']))
-        story.append(Paragraph(
-            "Each box shows the spread of noise readings at a location: the box covers the typical range "
-            "(the middle half of readings), the line inside is the median, and the whiskers show the usual "
-            "low and high. A taller box means more variable, less predictable noise.", styles['BodyText']))
-        story.append(Spacer(1, 0.08 * inch))
-        _add_fig(_box_fig(), 4.4)
-        story.append(PageBreak())
 
         # ---- Side-by-side summary table (slim, plain) ----
         story.append(Paragraph("Side-by-side summary", styles['h1']))

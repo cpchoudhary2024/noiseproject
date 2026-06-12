@@ -604,18 +604,11 @@
                     <!-- Plain-language verdict / ranking -->
                     <div class="compare-verdict" id="compareVerdict" style="display:none;"></div>
 
-                    <!-- Dot plot: each location vs WHO guidelines -->
+                    <!-- Per-location status cards -->
                     <div class="compare-results-card">
-                        <h3><i class="fas fa-circle-dot" style="color:#3D5A80;"></i> How each location compares to the WHO guidelines</h3>
-                        <p class="compare-results-note">Day-and-night level (Lden, ●) and night-time level (Lnight, ◆) per location, against the WHO guidelines (53 dB day-night · 45 dB night). <span style="color:#16a34a;font-weight:600;">Green</span> = within; <span style="color:#dc2626;font-weight:600;">red</span> = above. Loudest at the top.</p>
-                        <div id="compareDotPlot" class="compare-chart-box"></div>
-                    </div>
-
-                    <!-- Box plot: distribution / spread -->
-                    <div class="compare-results-card">
-                        <h3><i class="fas fa-chart-simple" style="color:#3D5A80;"></i> How much the noise varies at each location</h3>
-                        <p class="compare-results-note">Each box shows the spread of readings: the box is the typical range (middle half), the line is the median, and the whiskers show the usual low and high. A taller box = more variable noise.</p>
-                        <div id="compareBoxPlot" class="compare-chart-box"></div>
+                        <h3><i class="fas fa-location-dot" style="color:#3D5A80;"></i> Each location vs the WHO guidelines</h3>
+                        <p class="compare-results-note">Sorted loudest to quietest. Each location's overall day-and-night level (Lden) and night-time level (Lnight), with whether it is within the WHO health guidelines (53 dB day-night · 45 dB night).</p>
+                        <div id="compareStatusCards" class="compare-status-grid"></div>
                     </div>
 
                     <!-- Daily pattern -->
