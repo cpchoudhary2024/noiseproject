@@ -1663,6 +1663,34 @@ body {
 .staged-file-item:last-child { border-bottom: none; }
 .staged-file-item:hover { background: #f0f4f8; }
 
+/* Editable label for each file in the comparison list */
+.compare-label-input {
+    flex: 1 1 200px;
+    min-width: 140px;
+    padding: 6px 10px;
+    border: 1.5px solid var(--gray-300);
+    border-radius: 7px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--primary);
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+.compare-label-input:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.compare-file-item .compare-file-orig {
+    flex: 0 1 auto;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--gray-400);
+    font-size: 11px;
+}
+@media (max-width: 640px) {
+    .compare-file-item .compare-file-orig { display: none; }
+}
+
 .staged-file-icon {
     color: #3D5A80;
     width: 18px;
