@@ -18,10 +18,10 @@ from analysis.chart_generator import AdvancedChartGenerator
 from analysis.environmental_viz import EnvironmentalVisualizationEngine
 from analysis.environmental_metrics import EnvironmentalMetricsCalculator
 from analysis.wlg_parser import parse_wlg_file, WLGParser
-from analysis.gap_detector import detect_gaps, gap_report_to_dict, merge_dataframes
+from analysis.gap_detector import detect_gaps, gap_report_to_dict, merge_dataframes, data_completeness_pct
 from analysis.compliance_matrix import evaluate_compliance
 from analysis.acoustics import energetic_mean_db, compute_ldn_lden
-from analysis.timestamp_utils import assess_timestamp_integrity, primary_time_column
+from analysis.timestamp_utils import assess_timestamp_integrity, primary_time_column, parse_timestamps_robust
 import io
 import logging
 import threading
@@ -107,7 +107,7 @@ _DATA_CACHE = {}
 
 # Bump this when parser/analysis behavior changes in a way that should invalidate
 # cached results (e.g., WLG decode/scaling fixes).
-_CACHE_VERSION = "2026-04-29-merge-rename-back-v3"
+_CACHE_VERSION = "2026-06-18-ts-yearfirst-forced-v5"
 
 
 def _cache_mtime(filepath: str) -> float | None:
@@ -307,17 +307,125 @@ def _run_retention_cleanup(*, keep_paths=()):
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def _detect_delimiter(sample_line: str) -> str:
+    """Pick the most likely column delimiter from a header/sample line.
+
+    Many logger exports masquerading as ``.xls`` are actually tab-separated text;
+    others use ',' or ';'. We choose the candidate with the highest count on the
+    header line, defaulting to ',' when none is present.
+    """
+    candidates = ('\t', ';', ',', '|')
+    counts = {d: sample_line.count(d) for d in candidates}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else ','
+
+
+def _expand_tied_timestamps(ts: pd.Series) -> pd.Series:
+    """Give every row a distinct, monotonic timestamp when the source stored
+    sub-interval samples at a coarser time resolution.
+
+    Some logger/Excel exports truncate the time column to whole minutes, so all
+    ~60 one-second samples in a minute share the stamp ``HH:MM:00``. Treating
+    those as duplicates and dropping them would silently discard 59/60 of the
+    data. Instead we spread each run of identical timestamps across the interval
+    up to the next distinct timestamp, reconstructing the native cadence
+    (e.g. 1 Hz). **No row is ever added or removed.**
+
+    Behaviour:
+      * Already-unique timestamps → returned unchanged (fast no-op).
+      * A full block (e.g. 60 ties before the next minute) → evenly spread to the
+        native interval (``:00 … :59``), staying contiguous with the next block
+        so no spurious gap is introduced.
+      * A block followed by a genuine gap → spread only at the native interval so
+        the real gap is preserved (never smeared across the gap).
+      * NaT values are preserved in place.
+
+    Assumes rows are in recorded (chronological) order, which is true for these
+    loggers; the merge step re-sorts globally afterwards.
+
+    Parameters
+    ----------
+    ts : pd.Series
+        Datetime series in recorded order.
+
+    Returns
+    -------
+    pd.Series
+        Datetime series, strictly increasing within each block, ties expanded.
+    """
+    ts = pd.to_datetime(ts, errors='coerce')
+    if len(ts) < 2:
+        return ts
+    valid = ts.notna()
+    if int(valid.sum()) < 2 or int(ts[valid].duplicated().sum()) == 0:
+        return ts  # nothing tied → no reconstruction needed
+
+    work = ts.reset_index(drop=True)
+    block = work.ne(work.shift()).cumsum()          # new id at each timestamp change
+
+    starts = work.groupby(block).first()
+    sizes = work.groupby(block).size().astype('float64')
+    widths = (starts.shift(-1) - starts).dt.total_seconds()   # NaN for the final block
+
+    positive = widths[widths > 0]
+    if not positive.empty:
+        modal = positive.mode()
+        modal_width = float(modal.iloc[0]) if not modal.empty else float(positive.median())
+    else:
+        modal_width = 1.0
+    size_mode = sizes.mode()
+    modal_size = float(size_mode.iloc[0]) if not size_mode.empty else 1.0
+    native_interval = (modal_width / modal_size) if modal_size > 0 else 1.0
+
+    # Fill the open-ended final block's width with the modal block width.
+    widths = widths.fillna(modal_width)
+
+    # Lay each block's samples at the native interval (e.g. 1 s) — never invent a
+    # finer-than-native cadence. A short block that is contiguous with the next
+    # block (a partial first/early minute → recording started mid-minute) is
+    # anchored to that block's END (e.g. :32 … :59) so no spurious internal gap
+    # appears. The final block, and any block sitting before a genuine gap, are
+    # anchored to the START so real gaps are preserved.
+    is_last = pd.Series(False, index=sizes.index)
+    if len(is_last):
+        is_last.iloc[-1] = True
+    contiguous = (widths <= modal_width * 1.5) & (~is_last) & (sizes > 1)
+    fits = (sizes * native_interval) <= widths
+
+    spacing = pd.Series(native_interval, index=sizes.index, dtype='float64')
+    base = pd.Series(0.0, index=sizes.index, dtype='float64')
+    end_anchor = contiguous & fits
+    base[end_anchor] = widths[end_anchor] - sizes[end_anchor] * native_interval
+    # Over-dense block (more samples than fit at native spacing) → compress evenly.
+    compress = contiguous & (~fits)
+    spacing[compress] = widths[compress] / sizes[compress]
+
+    k = work.groupby(block).cumcount().astype('float64')
+    offset_s = block.map(base).astype('float64') + k * block.map(spacing).astype('float64')
+    expanded = block.map(starts) + pd.to_timedelta(offset_s, unit='s')
+    expanded = expanded.where(work.notna(), other=pd.NaT)
+    expanded.index = ts.index
+    return expanded
+
+
 def read_excel_file(filepath):
-    """Read Excel file with content-based engine detection (.xls vs .xlsx)."""
+    """Read Excel file with content-based engine detection (.xls vs .xlsx).
+
+    Also reconstructs a unique, monotonic timestamp when the workbook stored
+    sub-minute samples at minute resolution, so downstream code never has to drop
+    "duplicate" rows.
+    """
     head = _read_file_head(filepath, size=16)
     if head.startswith(OLE_XLS_SIGNATURE):
-        return pd.read_excel(filepath, engine='xlrd')
-    if head.startswith(ZIP_SIGNATURE):
-        return pd.read_excel(filepath, engine='openpyxl')
-    raise ValueError(
-        "Unsupported or corrupt Excel file. The file does not look like a real .xls or .xlsx. "
-        "If you renamed the file extension, please re-save it as a true .xlsx or .csv."
-    )
+        df = pd.read_excel(filepath, engine='xlrd')
+    elif head.startswith(ZIP_SIGNATURE):
+        df = pd.read_excel(filepath, engine='openpyxl')
+    else:
+        raise ValueError(
+            "Unsupported or corrupt Excel file. The file does not look like a real .xls or .xlsx. "
+            "If you renamed the file extension, please re-save it as a true .xlsx or .csv."
+        )
+    return _maybe_add_absolute_timestamp(df, None, filepath=filepath)
 
 
 def read_input_file(filepath):
@@ -472,22 +580,46 @@ def _maybe_add_absolute_timestamp(
     if df.empty:
         return df
 
-    # Prefer an existing timestamp/datetime column.
-    if any(any(k in c.lower() for k in ['timestamp', 'datetime']) for c in df.columns):
-        return df
-
-    time_col = next((c for c in df.columns if 'time' in c.lower()), None)
+    # Choose the primary time column: prefer an explicit timestamp/datetime,
+    # else any column mentioning 'time', else the first column.
+    time_col = next((c for c in df.columns
+                     if any(k in c.lower() for k in ['timestamp', 'datetime'])), None)
+    if time_col is None:
+        time_col = next((c for c in df.columns if 'time' in c.lower()), None)
     if time_col is None:
         time_col = df.columns[0]
 
-    s = df[time_col].astype(str).str.strip()
+    col = df[time_col]
 
-    # Try parsing as a full datetime first (e.g. '12-03-2026 10:33').
-    parsed = pd.to_datetime(s, errors='coerce', dayfirst=True, cache=True)
-    if float(parsed.notna().mean()) >= 0.9 and parsed.dt.normalize().nunique(dropna=True) >= 2:
+    # Absolute datetimes (Excel datetime cells, or ISO/date strings):
+    # normalise, expand any minute-collapsed ties into a unique timeline, and
+    # write back IN PLACE so every downstream time-column selector is consistent.
+    if pd.api.types.is_datetime64_any_dtype(col):
+        parsed = pd.to_datetime(col, errors='coerce')
+    else:
+        s = col.astype(str).str.strip()
+        # Robust parse — auto-detects year-first ('2026/05/12') vs day-first and
+        # falls back to explicit formats, so slash dates with day > 12 are not
+        # silently turned into NaT by a wrong dayfirst guess.
+        parsed, _ = parse_timestamps_robust(col)
+        # Only treat as absolute when the raw text actually looks like calendar
+        # dates (a 4-digit year or a d/d separator) — not a MM:SS / HH:MM:SS
+        # elapsed clock that pandas happened to coerce.
+        looks_absolute = (
+            float(parsed.notna().mean()) >= 0.9
+            and float(s.str.contains(r'\d{4}|\d{1,2}[/-]\d{1,2}', regex=True, na=False).mean()) >= 0.5
+        )
+        if not looks_absolute:
+            parsed = None
+
+    if parsed is not None and float(parsed.notna().mean()) >= 0.9:
+        expanded = _expand_tied_timestamps(parsed)
         df = df.copy()
-        df['Timestamp'] = parsed
+        df[time_col] = expanded
+        df['Timestamp'] = expanded
         return df
+
+    s = df[time_col].astype(str).str.strip()
 
     # Try MM:SS(.sss)
     mmss = s.str.extract(r'^(?P<m>\d+):(?P<s>\d+(?:\.\d+)?)$')
@@ -563,15 +695,25 @@ def read_csv_file(filepath: str) -> pd.DataFrame:
     lines = _sniff_text_lines(filepath)
     skiprows = _detect_csv_header_row(lines)
     start_dt = _parse_trial_start_datetime(lines)
+    header_line = lines[skiprows] if skiprows < len(lines) else (lines[0] if lines else '')
+    sep = _detect_delimiter(header_line)
 
     # pandas 2+ supports encoding_errors
     df = pd.read_csv(
         filepath,
         skiprows=skiprows,
+        sep=sep,
         encoding='utf-8-sig',
         encoding_errors='replace',
         low_memory=False,
     )
+
+    # Lines that end with the delimiter (common in logger TSV exports) create a
+    # trailing all-empty column — drop it so it isn't mistaken for a data field.
+    empty_unnamed = [c for c in df.columns
+                     if str(c).startswith('Unnamed') and df[c].isna().all()]
+    if empty_unnamed:
+        df = df.drop(columns=empty_unnamed)
 
     df = _maybe_add_absolute_timestamp(df, start_dt, filepath=filepath)
     return df
@@ -591,8 +733,9 @@ def _quick_preview_read(filepath, nrows=10):
     if _looks_like_text(head):
         lines = _sniff_text_lines(filepath)
         skiprows = _detect_csv_header_row(lines) or 0
+        header_line = lines[skiprows] if skiprows < len(lines) else (lines[0] if lines else '')
         return pd.read_csv(
-            filepath, nrows=nrows,
+            filepath, nrows=nrows, sep=_detect_delimiter(header_line),
             skiprows=range(1, skiprows + 1) if skiprows else None,
             on_bad_lines='skip',
         )
@@ -857,8 +1000,7 @@ def analyze_data():
             n_days_pe = int(round((ts_valid_pe.max() - ts_valid_pe.min()).total_seconds() / 86400)) if not ts_valid_pe.empty else 0
             start_pe = ts_valid_pe.min().strftime('%d %b %Y') if not ts_valid_pe.empty else ''
             end_pe   = ts_valid_pe.max().strftime('%d %b %Y') if not ts_valid_pe.empty else ''
-            expected_s_pe = max(0.0, (ts_valid_pe.max() - ts_valid_pe.min()).total_seconds()) if not ts_valid_pe.empty else 0
-            completeness_pe = 100.0 * len(df) / max(1, expected_s_pe) if expected_s_pe > 0 else None
+            completeness_pe = data_completeness_pct(ts_valid_pe, actual_count=len(df))
 
             plain_english_summary = ReportGeneratorV2.generate_plain_english_summary(
                 laeq        = env_first_pe.get('LAeq_24h') or float(stat_first_pe.get('laeq_db') or stat_first_pe.get('mean') or 0) or None,

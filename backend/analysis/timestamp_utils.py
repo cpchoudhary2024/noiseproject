@@ -30,10 +30,11 @@ _MIN_PARSE_FRACTION = 0.60
 _EXPLICIT_FORMATS = [
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%d %H:%M:%S.%f",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M:%S.%f",
     "%d/%m/%Y %H:%M:%S",
     "%m/%d/%Y %H:%M:%S",
     "%d-%m-%Y %H:%M:%S",
-    "%Y/%m/%d %H:%M:%S",
     "%d.%m.%Y %H:%M:%S",
 ]
 
@@ -92,9 +93,30 @@ def parse_timestamps_robust(raw: pd.Series) -> tuple[pd.Series, str]:
     def _frac(s: pd.Series) -> float:
         return float(s.notna().sum()) / max(1, n)
 
-    best = pd.to_datetime(raw, errors="coerce", dayfirst=True)
-    best_method = "inferred"
-    best_frac = _frac(best)
+    # Year-first dates (e.g. '2026/05/12 18:36:28.000') are UNAMBIGUOUS and must
+    # be parsed month-first. Under dayfirst=True pandas swaps month/day — and
+    # when every day-of-month is <= 12 it still parses 100% but silently yields
+    # WRONG dates ('2026/03/05' -> May 3, '2026/03/06' -> Jun 3 ...), scattering
+    # consecutive samples across different months and inventing huge gaps. So
+    # detect year-first explicitly and force month-first; only genuinely
+    # ambiguous day-first inputs use the dayfirst heuristic.
+    sample = raw.dropna().astype(str).str.strip()
+    year_first = bool(
+        not sample.empty
+        and sample.head(1000).str.match(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}").mean() >= 0.5
+    )
+    if year_first:
+        best = pd.to_datetime(raw, errors="coerce", dayfirst=False)
+        best_method = "inferred-yearfirst"
+        best_frac = _frac(best)
+    else:
+        best = pd.to_datetime(raw, errors="coerce", dayfirst=True)
+        best_method = "inferred-dayfirst"
+        best_frac = _frac(best)
+        # Fall back to month-first if it recovers strictly more rows.
+        cand = pd.to_datetime(raw, errors="coerce", dayfirst=False)
+        if _frac(cand) > best_frac:
+            best, best_frac, best_method = cand, _frac(cand), "inferred-monthfirst"
 
     # Try explicit formats only if inference is weak.
     if best_frac < 0.95:

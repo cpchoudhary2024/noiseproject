@@ -11,7 +11,7 @@ from analysis.iso_epa_standards import StandardsAnalyzer
 from analysis.standards_reference import who_2018_environmental_noise_guideline_levels
 from analysis.chart_generator import AdvancedChartGenerator
 from analysis.acoustics import compute_ldn_lden, energetic_mean_db, exceedance_levels_db
-from analysis.gap_detector import detect_gaps, gap_report_to_dict
+from analysis.gap_detector import detect_gaps, gap_report_to_dict, data_completeness_pct, _modal_interval_seconds
 from analysis.compliance_matrix import evaluate_compliance
 import io
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle, KeepTogether
@@ -554,8 +554,7 @@ class ReportGeneratorV2:
         start_str = ts_valid.min().strftime('%d %b %Y') if not ts_valid.empty else 'N/A'
         end_str   = ts_valid.max().strftime('%d %b %Y') if not ts_valid.empty else 'N/A'
         n_days_v = int(round((ts_valid.max() - ts_valid.min()).total_seconds() / 86400)) if not ts_valid.empty else 0
-        expected_s = max(0.0, (ts_valid.max() - ts_valid.min()).total_seconds()) if not ts_valid.empty else 0
-        completeness = 100.0 * len(self.df) / max(1, expected_s) if expected_s > 0 else None
+        completeness = data_completeness_pct(ts_valid, actual_count=len(self.df))
 
         # Acoustic metrics
         leq_clean = leq.dropna()
@@ -892,7 +891,7 @@ class ReportGeneratorV2:
             f"      <div><b>Data captured</b><span>{completeness_str} of the period</span></div>",
             f"      <div><b>Source file(s)</b><span>{source_label}</span></div>",
             f"      <div><b>Loudest single moment</b><span>{_hfmt(peak_v)} dB</span></div>",
-            f"      <div><b>Quiet background level</b><span>{_hfmt(l90_v)} dB (the level it stays below 90% of the time)</span></div>",
+            f"      <div><b>Quiet background level</b><span>{_hfmt(l90_v)} dB (the noise stays above this 90% of the time)</span></div>",
             "    </div>",
             "    <p class='disclaimer'>Noise is measured in A-weighted decibels (dB), matched to how human hearing works. "
             "Levels are energy-averaged (LAeq), the standard way to summarise changing noise. Guideline values come from "
@@ -1382,8 +1381,7 @@ class ReportGeneratorV2:
         end_str   = ts_valid.max().strftime('%d %b %Y') if not ts_valid.empty else ''
         n_days_v  = int(round((ts_valid.max() - ts_valid.min()).total_seconds() / 86400)) if not ts_valid.empty else 0
 
-        expected_s = max(0.0, (ts_valid.max() - ts_valid.min()).total_seconds()) if not ts_valid.empty else 0
-        completeness = 100.0 * len(self.df) / max(1, expected_s) if expected_s > 0 else None
+        completeness = data_completeness_pct(ts_valid, actual_count=len(self.df))
 
         summary_text = ReportGeneratorV2.generate_plain_english_summary(
             laeq=laeq_v,
@@ -1515,60 +1513,76 @@ class ReportGeneratorV2:
     # ── Top 10 Peak Noise Events ──────────────────────────────────────────────
 
     @staticmethod
-    def _compute_top_noise_events(ts: pd.Series, leq: pd.Series, top_n: int = 10, gap_minutes: int = 5) -> list[dict]:
-        """Detect discrete noise events and return the top N by peak level.
+    def _compute_top_noise_events(ts: pd.Series, leq: pd.Series, top_n: int = 10,
+                                  min_separation_minutes: float = 5.0) -> list[dict]:
+        """Detect discrete loud noise events and return the top N by peak level.
 
-        An event is a contiguous run of readings at or above the 90th percentile
-        (L10 threshold). Events separated by >= gap_minutes of quiet are treated
-        as distinct. Returns a list of dicts sorted by peak level descending.
+        An event is a **contiguous** run of readings at or above the 90th-percentile
+        (L10) threshold: a reading below the threshold ends it, and only brief
+        missing-sample time gaps are bridged — quiet periods are never merged into
+        an event. For each event we record the exact moment its PEAK level occurred
+        (``peak_time``, so it can be located in the raw data), the peak level, the
+        event start/end, and the contiguous duration above the threshold.
+
+        Events whose peak falls within ``min_separation_minutes`` of an
+        already-selected louder event are skipped so the list contains distinct
+        events. Returned sorted by peak level descending.
         """
-        ts   = ts.dropna()
-        leq  = leq.reindex(ts.index).dropna()
-        ts   = ts.reindex(leq.index)
-        if len(ts) < 2:
+        ts  = ts.dropna()
+        leq = pd.to_numeric(leq, errors='coerce').reindex(ts.index)
+        df_tmp = pd.DataFrame({'ts': ts.values, 'leq': leq.values}).dropna()
+        df_tmp = df_tmp.sort_values('ts').reset_index(drop=True)
+        if len(df_tmp) < 2:
             return []
 
-        df_tmp = pd.DataFrame({'ts': ts.values, 'leq': leq.values}).sort_values('ts').reset_index(drop=True)
-
         threshold = float(np.percentile(df_tmp['leq'], 90))
-        above = df_tmp['leq'] >= threshold
+        times  = df_tmp['ts'].to_numpy()
+        levels = df_tmp['leq'].to_numpy()
+        above  = levels >= threshold
         if not above.any():
             return []
 
-        gap = pd.Timedelta(minutes=gap_minutes)
-        events, cur_start, cur_levels, cur_times = [], None, [], []
+        # Bridge only short missing-sample gaps, never quiet (below-threshold)
+        # periods — otherwise an all-day stretch of intermittent noise collapses
+        # into one multi-hour "event" whose start bears no relation to the peak.
+        diffs = np.diff(times).astype('timedelta64[s]').astype(float)
+        interval_s = float(np.median(diffs)) if len(diffs) else 1.0
+        bridge_s = max(interval_s * 3.0, 3.0)
 
-        for i, row in df_tmp.iterrows():
-            in_event = cur_start is not None
-            if above.iloc[i]:
-                if not in_event:
-                    cur_start, cur_levels, cur_times = row['ts'], [row['leq']], [row['ts']]
-                else:
-                    time_since_last = row['ts'] - cur_times[-1]
-                    if time_since_last > gap:
-                        events.append({'start': cur_start, 'end': cur_times[-1],
-                                       'peak': max(cur_levels),
-                                       'duration_s': (cur_times[-1] - cur_start).total_seconds()})
-                        cur_start, cur_levels, cur_times = row['ts'], [row['leq']], [row['ts']]
-                    else:
-                        cur_levels.append(row['leq'])
-                        cur_times.append(row['ts'])
-            else:
-                if in_event:
-                    time_since_last = row['ts'] - cur_times[-1]
-                    if time_since_last > gap:
-                        events.append({'start': cur_start, 'end': cur_times[-1],
-                                       'peak': max(cur_levels),
-                                       'duration_s': (cur_times[-1] - cur_start).total_seconds()})
-                        cur_start, cur_levels, cur_times = None, [], []
-
-        if cur_start is not None and cur_times:
-            events.append({'start': cur_start, 'end': cur_times[-1],
-                           'peak': max(cur_levels),
-                           'duration_s': (cur_times[-1] - cur_start).total_seconds()})
+        events: list[dict] = []
+        n = len(df_tmp)
+        i = 0
+        while i < n:
+            if not above[i]:
+                i += 1
+                continue
+            j = i
+            while (j + 1 < n and above[j + 1]
+                   and (times[j + 1] - times[j]) / np.timedelta64(1, 's') <= bridge_s):
+                j += 1
+            seg_lv = levels[i:j + 1]
+            seg_ts = times[i:j + 1]
+            k = int(np.argmax(seg_lv))
+            events.append({
+                'start':      seg_ts[0],
+                'end':        seg_ts[-1],
+                'peak_time':  seg_ts[k],
+                'peak':       float(seg_lv[k]),
+                'duration_s': float((seg_ts[-1] - seg_ts[0]) / np.timedelta64(1, 's')),
+            })
+            i = j + 1
 
         events.sort(key=lambda e: e['peak'], reverse=True)
-        return events[:top_n]
+
+        # Keep only distinct events — peaks at least min_separation apart.
+        sep = np.timedelta64(int(min_separation_minutes * 60), 's')
+        selected: list[dict] = []
+        for e in events:
+            if all(abs(e['peak_time'] - s['peak_time']) > sep for s in selected):
+                selected.append(e)
+            if len(selected) >= top_n:
+                break
+        return selected
 
     @staticmethod
     def _fmt_duration(seconds: float) -> str:
@@ -1596,25 +1610,26 @@ class ReportGeneratorV2:
         story.append(Spacer(1, 0.1 * inch))
         story.append(Paragraph("<b>Top Peak Noise Events</b>", styles['h2']))
         story.append(Paragraph(
-            "The table below lists the highest-level discrete noise events detected during the "
-            "monitoring period. An event is a contiguous period where levels exceeded the 90th "
-            "percentile (L10 threshold), with events separated by at least 5 minutes of quiet. "
-            "Duration is shown only for events lasting more than 60 seconds.",
+            "The table below lists the loudest discrete noise events detected during the "
+            "monitoring period. Each event is a contiguous period at or above the 90th-percentile "
+            "(L10) threshold; <b>Peak Time</b> is the exact moment the peak level occurred (so it can be "
+            "located directly in the raw data), and <b>Duration</b> is how long levels stayed "
+            "continuously above the threshold. Listed events are at least 5 minutes apart.",
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.06 * inch))
 
-        header = ['#', 'Date', 'Day', 'Start Time', 'Peak Level', 'Duration']
+        header = ['#', 'Date', 'Day', 'Peak Time', 'Peak Level', 'Duration']
         rows   = [header]
         for i, ev in enumerate(events, 1):
-            dt_start  = pd.Timestamp(ev['start'])
+            dt_peak   = pd.Timestamp(ev['peak_time'])
             dur_s     = ev['duration_s']
             dur_str   = self._fmt_duration(dur_s) if dur_s >= 60 else 'Brief (<1 min)'
             rows.append([
                 str(i),
-                dt_start.strftime('%d %b %Y'),
-                dt_start.strftime('%A'),
-                dt_start.strftime('%H:%M:%S'),
+                dt_peak.strftime('%d %b %Y'),
+                dt_peak.strftime('%A'),
+                dt_peak.strftime('%H:%M:%S'),
                 f"{ev['peak']:.1f} dB(A)",
                 dur_str,
             ])
@@ -1649,7 +1664,7 @@ class ReportGeneratorV2:
 
         rows_html = ''
         for i, ev in enumerate(events, 1):
-            dt  = pd.Timestamp(ev['start'])
+            dt  = pd.Timestamp(ev['peak_time'])
             dur = self._fmt_duration(ev['duration_s']) if ev['duration_s'] >= 60 else 'Brief (&lt;1 min)'
             bg  = '#fff' if i % 2 == 0 else '#f8fafc'
             rows_html += (
@@ -1667,16 +1682,17 @@ class ReportGeneratorV2:
             "<div class='card'>"
             "<h2>Top Peak Noise Events</h2>"
             "<p style='font-size:12px;color:#4b5563;margin-bottom:8px'>"
-            "Highest-level discrete events detected during the monitoring period. "
-            "An event is a contiguous period with levels at or above the 90th percentile (L10), "
-            "separated by at least 5 minutes of quiet. Duration shown only for events &gt;60 seconds."
+            "Loudest discrete events detected during the monitoring period. Each event is a "
+            "contiguous period at or above the 90th percentile (L10); <b>Peak Time</b> is the exact "
+            "moment the peak level occurred (locatable in the raw data) and <b>Duration</b> is how long "
+            "levels stayed continuously above the threshold. Listed events are at least 5 minutes apart."
             "</p>"
             "<table style='width:100%;border-collapse:collapse;font-size:13px'>"
             "<thead><tr style='background:#1e3a5f;color:#fff'>"
             "<th style='padding:7px 6px'>#</th>"
             "<th style='padding:7px 6px;text-align:left'>Date</th>"
             "<th style='padding:7px 6px;text-align:left'>Day</th>"
-            "<th style='padding:7px 6px;text-align:left'>Start Time</th>"
+            "<th style='padding:7px 6px;text-align:left'>Peak Time</th>"
             "<th style='padding:7px 6px'>Peak Level</th>"
             "<th style='padding:7px 6px'>Duration</th>"
             "</tr></thead>"
@@ -1696,12 +1712,19 @@ class ReportGeneratorV2:
         start = ts_valid.min()
         end = ts_valid.max()
         expected_seconds = max(0.0, (end - start).total_seconds())
-        expected_samples = int(expected_seconds) + 1  # Assume 1 Hz sampling
+        # Detect the actual logging interval instead of assuming 1 Hz, so a
+        # logger sampling every 2 s / every minute is not falsely flagged as
+        # having lost data.
+        interval_s = _modal_interval_seconds(ts_valid)
+        interval_s = interval_s if interval_s and interval_s > 0 else 1.0
+        expected_samples = int(expected_seconds / interval_s) + 1
         actual_samples = len(self.df)
-        uptime_pct = (100.0 * actual_samples / max(1, expected_samples))
+        uptime_pct = min(100.0, (100.0 * actual_samples / max(1, expected_samples)))
+        interval_label = (f"{interval_s:.0f} s" if interval_s >= 1 else f"{interval_s:.3f} s")
 
         story.append(Paragraph(f"<b>Measurement Span:</b> {escape(start.strftime('%Y-%m-%d %H:%M:%S'))} to {escape(end.strftime('%Y-%m-%d %H:%M:%S'))}", styles['BodyText']))
-        story.append(Paragraph(f"<b>Expected Samples (1 Hz polling):</b> {expected_samples:,}", styles['BodyText']))
+        story.append(Paragraph(f"<b>Detected Logging Interval:</b> {escape(interval_label)}", styles['BodyText']))
+        story.append(Paragraph(f"<b>Expected Samples:</b> {expected_samples:,}", styles['BodyText']))
         story.append(Paragraph(f"<b>Actual Samples in Dataset:</b> {actual_samples:,}", styles['BodyText']))
         story.append(Paragraph(f"<b>Uptime (Data Completeness):</b> {self._fmt_float(uptime_pct, 1)}%", styles['BodyText']))
         story.append(Spacer(1, 0.1 * inch))

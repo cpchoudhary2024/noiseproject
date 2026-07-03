@@ -10,11 +10,33 @@ Gap categories (as per MODULE 6 spec):
 """
 from __future__ import annotations
 
+import logging
 import math
 import pandas as pd
 from dataclasses import dataclass, field
 
+from analysis.timestamp_utils import parse_timestamps_robust
+
+logger = logging.getLogger(__name__)
+
 MINOR_GAP_THRESHOLD_MIN: float = 15.0   # minutes below which a gap is "Minor"
+
+
+def _warn_if_dropped(before: int, after: int, where: str) -> None:
+    """Loudly log when timestamp de-duplication removes a non-trivial fraction.
+
+    Guarantees mass row loss can never happen *silently*: a logger that stored
+    sub-interval samples at a coarser time resolution must have its timestamps
+    expanded (see ``_expand_tied_timestamps``) before merging, otherwise up to
+    59/60 of the data could be discarded here.
+    """
+    dropped = before - after
+    if dropped > 0 and before > 0 and (dropped / before) > 0.02:
+        logger.warning(
+            "[MERGE] %s: dropped %d/%d rows (%.1f%%) as duplicate timestamps — "
+            "verify sub-minute timestamp expansion ran; no measurement rows should be lost.",
+            where, dropped, before, 100.0 * dropped / before,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +77,38 @@ def _modal_interval_seconds(ts: pd.Series) -> float:
     return float(mode.iloc[0]) if not mode.empty else float(positives.median())
 
 
+def data_completeness_pct(ts: pd.Series, actual_count: int | None = None) -> float | None:
+    """Interval-aware data completeness (%) — robust to non-1 Hz logging.
+
+    ``expected = span / modal_interval + 1``, so a logger sampling every 2 s
+    (or every minute) is **not** falsely reported as having lost data, which a
+    fixed "1 Hz" assumption would do.
+
+    Parameters
+    ----------
+    ts : pd.Series
+        Timestamps in any parseable form.
+    actual_count : int, optional
+        Number of samples actually present. Defaults to the count of valid
+        (non-NaT) timestamps.
+
+    Returns
+    -------
+    float | None
+        Completeness percentage capped at 100, or None when undeterminable.
+    """
+    ts = pd.to_datetime(ts, errors='coerce').dropna().sort_values()
+    if len(ts) < 2:
+        return None
+    interval = _modal_interval_seconds(ts)
+    span = (ts.iloc[-1] - ts.iloc[0]).total_seconds()
+    if span <= 0 or interval <= 0:
+        return None
+    expected = span / interval + 1.0
+    actual = float(actual_count) if actual_count is not None else float(len(ts))
+    return round(min(100.0, 100.0 * actual / max(1.0, expected)), 1)
+
+
 def _fmt_duration(seconds: float) -> str:
     """Human-readable duration string."""
     if seconds < 60:
@@ -78,7 +132,7 @@ def detect_gaps(df: pd.DataFrame, time_col: str) -> GapReport:
     """
     report = GapReport()
 
-    ts = pd.to_datetime(df[time_col], errors='coerce', dayfirst=True).dropna()
+    ts = parse_timestamps_robust(df[time_col])[0].dropna()
     ts = ts.sort_values().reset_index(drop=True)
 
     report.total_rows = len(ts)
@@ -251,9 +305,11 @@ def merge_dataframes(dfs: list[pd.DataFrame]) -> tuple[pd.DataFrame, str | None]
         time_col, _, _, _ = _identify_acoustic_columns(dfs[0])
         if time_col and time_col in dfs[0].columns:
             df = dfs[0].copy()
-            df[time_col] = pd.to_datetime(df[time_col], errors='coerce', dayfirst=True)
+            df[time_col] = parse_timestamps_robust(df[time_col])[0]
             df = df.dropna(subset=[time_col])
+            _before = len(df)
             df = df.sort_values(time_col).drop_duplicates(subset=[time_col]).reset_index(drop=True)
+            _warn_if_dropped(_before, len(df), "single-file")
             return df, time_col
         return dfs[0].copy(), None
 
@@ -268,9 +324,11 @@ def merge_dataframes(dfs: list[pd.DataFrame]) -> tuple[pd.DataFrame, str | None]
     time_col = _CANONICAL_TIME if _CANONICAL_TIME in merged.columns else None
 
     if time_col:
-        merged[time_col] = pd.to_datetime(merged[time_col], errors='coerce', dayfirst=True)
+        merged[time_col] = parse_timestamps_robust(merged[time_col])[0]
         merged = merged.dropna(subset=[time_col])
+        _before = len(merged)
         merged = merged.sort_values(time_col).drop_duplicates(subset=[time_col]).reset_index(drop=True)
+        _warn_if_dropped(_before, len(merged), "merge")
 
     # Rename canonical columns back to original names so downstream code can find them
     back_rename: dict[str, str] = {}
