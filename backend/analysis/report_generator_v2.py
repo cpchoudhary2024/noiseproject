@@ -39,6 +39,27 @@ from xml.sax.saxutils import escape
 # reader can still verify byte-for-byte which file produced the report — without
 # disclosing who it belongs to.
 
+# Instrument provenance statement.
+#
+# Each logger is factory-calibrated and ships with its own individual certificate,
+# which the study team retains. The report states this positively and offers the
+# certificates on request rather than listing them: with a fleet of units, what a
+# reader needs is to know WHICH device produced the data so the right certificate
+# can be requested — hence the device identifier printed alongside. The
+# manufacturer's IEC 61672-1 position is stated rather than glossed, because
+# "meets the accuracy requirements of" is not the same as certified Class 1.
+DEFAULT_INSTRUMENT_NOTE = (
+    "Measurements were made with a Convergence Instruments NSRT_W_mk4 sound level "
+    "logger, A-weighted. Each unit is factory-calibrated and supplied with its own "
+    "individual manufacturer's certificate of calibration. Certificates are retained "
+    "by the study team and are available on request; the device identifier above "
+    "indicates which unit produced this dataset. The manufacturer states that these "
+    "units meet the accuracy requirements of IEC 61672-1 but does not certify them as "
+    "Class 1 or Class 2 instruments. Where a formal Class 1 determination is required, "
+    "a certified meter with documented field calibration before and after the survey "
+    "should be used."
+)
+
 # Labels that are safe to print: study codes, home letters, device serials.
 _SAFE_LABEL_RE = re.compile(
     r'^(?:'
@@ -83,7 +104,7 @@ class ReportGeneratorV2:
     def __init__(self, df, filepath, analysis=None, standards=None, daily_summary=None, hourly_summary=None,
                  device_id: str = '', source_files: list | None = None, merge_gap_report: dict | None = None,
                  custom_section_heading: str = '', custom_section_body: str = '', environment: str = 'outdoor',
-                 deidentify: bool = True):
+                 deidentify: bool = True, instrument_note: str | None = None):
         """
         Initialize report generator with ONLY the uploaded data.
         NO external CSV file loading - all summaries computed from df.
@@ -94,6 +115,7 @@ class ReportGeneratorV2:
         self.df = df.copy()
         self.filepath = filepath
         self.deidentify = bool(deidentify)
+        self.instrument_note = (instrument_note or DEFAULT_INSTRUMENT_NOTE).strip()
 
         # Strip personal identifiers ONCE, here, so every render path (PDF, HTML,
         # DOCX, provenance) is covered and no future section can reintroduce a
@@ -549,9 +571,20 @@ class ReportGeneratorV2:
                 "No immediate action is indicated, but periodic re-monitoring is advisable."
             ),
             "MODERATE": (
-                "Noise levels are within WHO guidelines but above the LOAEL for nighttime sleep "
-                "effects. Continued monitoring is recommended, particularly for sensitive occupants "
-                "such as children or elderly residents."
+                "Noise levels are within WHO guidelines but above the lowest level at which sleep "
+                "effects are observed. Continued monitoring is recommended, particularly for "
+                "sensitive occupants such as children or elderly residents."
+            ),
+            # A guideline exceedance of less than 5 dB. This tier existed in the
+            # severity ranking but had no text, so it fell through to the
+            # "within WHO guidelines" wording above — directly contradicting the
+            # bullets immediately preceding it, which read "Exceeds ... by 2.0 dB".
+            "MODERATE-HIGH": (
+                "WHO 2018 health-based guidelines are exceeded, by less than 5 dB. Exceedances of "
+                "this size are close to the 1-3 dB combined measurement uncertainty that ISO 1996-2 "
+                "associates with environmental noise measurement, so the margin should not be read "
+                "as precise. Continued monitoring is recommended, and a certified acoustic "
+                "assessment would establish the exceedance more firmly."
             ),
             "HIGH": (
                 "WHO 2018 health-based guidelines are exceeded. Based on WHO evidence, prolonged "
@@ -786,6 +819,11 @@ class ReportGeneratorV2:
         lden_v   = env.get('Lden')
         lnight_v = env.get('Lnight')
         peak_v   = float(leq_clean.max()) if not leq_clean.empty else None
+        # True instantaneous peak comes from the L-Max stream. peak_v is the
+        # loudest LEQ *interval average*, which is always lower — reporting it
+        # as the "loudest single moment" contradicted the summary above, which
+        # correctly quotes L-Max (77.8 vs 84.7 dB on one record).
+        lamax_v  = self._lamax_value(lmax_col)
         exc = exceedance_levels_db(leq_clean.to_numpy()) or {} if not leq_clean.empty else {}
         l90_v = exc.get('L90')
 
@@ -994,7 +1032,13 @@ class ReportGeneratorV2:
         # must go through the same guard rather than printing the raw filename.
         source_label = (_esc(", ".join(self.source_files)) if self.source_files
                         else _esc(self._figure_source_label()))
-        completeness_str = f"{completeness:.0f}%" if completeness is not None else "N/A"
+        # Floor, never round. Rounding 99.6% to "100%" contradicted the summary
+        # directly below, which reports the same figure as 99.6% with gaps, and
+        # erased a real one-hour outage from the header a reader sees first.
+        completeness_str = (
+            f"{math.floor(completeness * 10) / 10:.1f}%".replace(".0%", "%")
+            if completeness is not None else "N/A"
+        )
         place = _esc(self.device_id) if self.device_id else "this location"
 
         def _section(title, intro, body):
@@ -1110,7 +1154,8 @@ class ReportGeneratorV2:
             # ── How your noise compares ──
             _section(
                 "How your noise compares",
-                "The bar below places your average noise level next to everyday sounds and the World "
+                "The bar below places your day-evening-night average (Lden) next to everyday sounds "
+                "and the World "
                 "Health Organization (WHO) health guideline, so you can see where your location sits.",
                 f"<div class='verdict' style='background:{verdict_bg};color:{verdict_clr}'>{verdict_txt}</div>"
                 + _chart_html(fig_compare)
@@ -1119,8 +1164,12 @@ class ReportGeneratorV2:
             # ── Day-by-day ──
             _section(
                 "Day by day",
-                "Each point is the average noise level for one day of monitoring. The dashed line is the "
-                "WHO health guideline (53 dB) — days above it were louder than recommended.",
+                "Each point is the average level (LAeq) for one day of monitoring, so you can see "
+                "which days were louder and whether the level is steady across the period. The dashed "
+                "line marks 53 dB for reference. It is the WHO guideline value, but that guideline "
+                "applies to Lden — a whole-period average that adds a penalty to evening and night "
+                "hours — so a single day rising above the line is a louder day, not a breach. Your "
+                "guideline comparison is the one shown above.",
                 _chart_html(fig_daily)
                 + "<div class='chart-note'>A higher line means a louder day overall.</div>"
             ),
@@ -1147,10 +1196,12 @@ class ReportGeneratorV2:
             "    <h2>About this measurement</h2>",
             "    <div class='about'>",
             f"      <div><b>Location / device</b><span>{place}</span></div>",
-            f"      <div><b>Monitoring period</b><span>{_esc(start_str)} to {_esc(end_str)} ({n_days_v} day(s))</span></div>",
+            f"      <div><b>Monitoring period</b><span>{_esc(start_str)} to {_esc(end_str)} ({n_days_v} days)</span></div>",
             f"      <div><b>Data captured</b><span>{completeness_str} of the period</span></div>",
             f"      <div><b>Source file(s)</b><span>{source_label}</span></div>",
-            f"      <div><b>Loudest single moment</b><span>{_hfmt(peak_v)} dB</span></div>",
+            (f"      <div><b>Loudest single moment (L-Max)</b><span>{_hfmt(lamax_v)} dB</span></div>"
+             if lamax_v is not None else
+             f"      <div><b>Loudest interval average (LAeq)</b><span>{_hfmt(peak_v)} dB</span></div>"),
             f"      <div><b>Quiet background level</b><span>{_hfmt(l90_v)} dB (the noise stays above this 90% of the time)</span></div>",
             "    </div>",
             "    <p class='disclaimer'>Noise is measured in A-weighted decibels (dB), matched to how human hearing works. "
@@ -1410,11 +1461,12 @@ class ReportGeneratorV2:
         """Data provenance and chain of custody.
 
         A report offered as evidence must let a reader establish what was
-        measured, by what instrument, and that the file analysed is the file
-        they hold. Instrument identity and calibration status are NOT recoverable
-        from these logger exports, so rather than omit them silently — which
-        leaves a reader to assume they were verified — they are listed explicitly
-        as not supplied, with the effect that has on the report's standing.
+        measured, by what instrument, and that the file analysed is the file they
+        hold. Logger exports carry no instrument metadata, so the serial number
+        and calibration date cannot be read from the data. They are not invented
+        or passed over in silence either: the report names the instrument, states
+        that each unit carries its own certificate, offers those on request, and
+        prints the device identifier so a reader knows which one to ask for.
         """
         story.append(Paragraph("Data Provenance &amp; Chain of Custody", styles['h2']))
 
@@ -1461,15 +1513,14 @@ class ReportGeneratorV2:
             story.append(Spacer(1, 0.10 * inch))
 
         story.append(Paragraph(
-            "<b>Instrument and calibration.</b> Logger exports do not carry instrument metadata, so "
-            "the following are not recorded in this file and are not reproduced here: instrument "
-            "make, model and serial number; IEC 61672 accuracy class; date of the most recent "
-            "calibration and the certificate reference; microphone height, orientation and distance "
-            "from any reflecting facade; and the weather during the measurement period. "
-            "This is a limitation of the export format, not a statement that the equipment was "
-            "uncalibrated. Where calibration certificates exist they should be cited or attached "
-            "alongside this report, which establishes measurement traceability; the levels here are "
-            "reproducible from the source file independently of that.",
+            f"<b>Instrument and calibration.</b> {escape(self.instrument_note)} "
+            "The data file itself carries no instrument metadata, so the serial number, the "
+            "calibration date and the deployment geometry (microphone height, orientation and "
+            "distance from any reflecting facade) are not reproduced in this report and are held "
+            "with the study records. The device identifier above is the key to those records: it "
+            "identifies which unit produced this dataset, and therefore which certificate applies. "
+            "Levels reported here are reproducible from the source file independently of that "
+            "documentation.",
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.12 * inch))
@@ -1499,10 +1550,9 @@ class ReportGeneratorV2:
         # Measurement uncertainty.
         story.append(Paragraph("<b>Measurement Uncertainty</b>", styles['h2']))
         story.append(Paragraph(
-            "No uncertainty budget is stated in this report, because the instrument class and "
-            "calibration history are not recorded in the data file and so are not available to this "
-            "software; where they are held separately they should accompany this report. "
-            "For context, ISO 1996-2 notes that the combined "
+            "No numerical uncertainty budget is stated in this report: deriving one requires the "
+            "deployment geometry and meteorological conditions, which are held with the study "
+            "records rather than in the data file. For context, ISO 1996-2 notes that the combined "
             "standard uncertainty of an environmental noise measurement is typically of the order of "
             "1 to 3 dB once instrument tolerance, microphone position, source variability and "
             "meteorological conditions are accounted for. Differences between values in this report "
