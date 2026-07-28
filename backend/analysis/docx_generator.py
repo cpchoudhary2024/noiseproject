@@ -49,6 +49,42 @@ class WordReportGenerator:
         self.filepath = filepath
         self.doc = Document()
         
+    def _primary_stats(self) -> dict:
+        """Statistics for the LEQ stream.
+
+        ``next(iter(statistics.values()))`` returned whichever column came first
+        in the file. These loggers export L-Max, LEQ, L-Min in that order, so the
+        report was publishing the L-MAX column's figures under the labels LAeq,
+        LAmin and LAmax: 53.90 dB reported as LAeq where the true LEQ energy
+        average was 52.78 dB.
+        """
+        stats = self.analysis.get('statistics') or {}
+        if not stats:
+            return {}
+
+        def _norm(c):
+            return ''.join(ch for ch in str(c).lower() if ch.isalnum())
+
+        for col in stats:
+            n = _norm(col)
+            if ('leq' in n or 'laeq' in n) and 'max' not in n and 'min' not in n:
+                return stats[col] or {}
+        # No LEQ-like column: prefer one that is neither L-Max nor L-Min.
+        for col in stats:
+            n = _norm(col)
+            if 'max' not in n and 'min' not in n:
+                return stats[col] or {}
+        return next(iter(stats.values()), {}) or {}
+
+    def _stats_for(self, kind: str) -> dict:
+        """Statistics for the 'lmax' or 'lmin' stream, empty if absent."""
+        stats = self.analysis.get('statistics') or {}
+        for col in stats:
+            n = ''.join(ch for ch in str(col).lower() if ch.isalnum())
+            if kind in n:
+                return stats[col] or {}
+        return {}
+
     def _source_label(self) -> str:
         """De-identified label for the source file.
 
@@ -95,23 +131,26 @@ class WordReportGenerator:
         metadata_para = self.doc.add_paragraph()
         metadata_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
+        # A literal "\n" inside a run is not a line break in Word: the title block
+        # rendered as "Device / Location ID: Home ASource File: Home AGenerated:".
+        # add_break() emits a real <w:br/>.
+        def _meta_line(text, size=11, bold=False):
+            r = metadata_para.add_run(text)
+            r.font.size = Pt(size)
+            r.font.bold = bold
+            metadata_para.add_run().add_break()
+
         if self.device_id:
-            run = metadata_para.add_run(f"Device / Location ID: {self.device_id}\n")
-            run.font.size = Pt(12)
-            run.font.bold = True
+            _meta_line(f"Device / Location ID: {self.device_id}", size=12, bold=True)
 
         import os as _os
         if self.source_files:
-            run = metadata_para.add_run(
-                f"Source Files ({len(self.source_files)}): " + ", ".join(self.source_files) + "\n"
-            )
-            run.font.size = Pt(11)
+            _meta_line(f"Source Files ({len(self.source_files)}): " + ", ".join(self.source_files))
         elif self.filepath:
-            run = metadata_para.add_run(f"Source File: {self._source_label()}\n")
-            run.font.size = Pt(11)
+            _meta_line(f"Source File: {self._source_label()}")
 
-        metadata_para.add_run(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n").font.size = Pt(11)
-        metadata_para.add_run("Platform: Noise Analysis Platform v1.0\n").font.size = Pt(11)
+        _meta_line(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        _meta_line("Platform: Noise Analysis Platform v1.0")
         metadata_para.add_run("Standard: WHO 2018 Environmental Noise Guidelines").font.size = Pt(11)
 
         # Data loss warning on title page (for merged datasets)
@@ -138,7 +177,7 @@ class WordReportGenerator:
         
         # Key findings
         if self.analysis.get('statistics'):
-            stats = next(iter(self.analysis['statistics'].values()), {})
+            stats = self._primary_stats()
             mean_val = stats.get('laeq_db', stats.get('mean', 0))
             
             summary_text = f"""This noise analysis report presents a comprehensive assessment of acoustic environment 
@@ -164,28 +203,43 @@ for noise mitigation and health protection."""
             self.doc.add_paragraph("No statistical data available.")
             return
         
-        stats = next(iter(self.analysis['statistics'].values()), {})
+        stats = self._primary_stats()
         
-        # Metrics table
-        table = self.doc.add_table(rows=9, cols=2)
+        # LAmax and LAmin must come from their own streams, not from the LEQ
+        # column's extremes. The loudest LEQ interval is an interval average and
+        # is always below the true instantaneous peak.
+        lmax_stats = self._stats_for('lmax')
+        lmin_stats = self._stats_for('lmin')
+        n_samples = (self.analysis.get('data_summary') or {}).get('total_records')
+
+        metrics = [
+            ('LAeq (energy average, LEQ stream)',
+             f"{self._fmt(stats.get('laeq_db', stats.get('mean')), 1)} dB(A)"),
+            ('Highest LEQ interval',
+             f"{self._fmt(stats.get('max'), 1)} dB(A)"),
+            ('Lowest LEQ interval',
+             f"{self._fmt(stats.get('min'), 1)} dB(A)"),
+            ('LAmax (highest single level)',
+             f"{self._fmt(lmax_stats.get('max'), 1)} dB(A)" if lmax_stats else 'Not recorded'),
+            ('LAmin (lowest single level)',
+             f"{self._fmt(lmin_stats.get('min'), 1)} dB(A)" if lmin_stats else 'Not recorded'),
+            ('Median (L50)', f"{self._fmt(stats.get('median'), 1)} dB(A)"),
+            ('Standard Deviation', f"{self._fmt(stats.get('std_dev'), 2)} dB"),
+            # Coefficient of variation is omitted: decibels are an interval scale
+            # with an arbitrary zero, so std/mean carries no physical meaning.
+            ('Measurement Count',
+             f"{n_samples:,} samples" if isinstance(n_samples, int) else 'N/A'),
+        ]
+
+        table = self.doc.add_table(rows=len(metrics) + 1, cols=2)
         table.style = 'Light Grid Accent 1'
         
         # Header
         hdr_cells = table.rows[0].cells
         hdr_cells[0].text = 'Metric'
         hdr_cells[1].text = 'Value'
-        
-        metrics = [
-            ('LAeq (Logarithmic Energy Average)', f"{self._fmt(stats.get('laeq_db', stats.get('mean')), 1)} dB(A)"),
-            ('Minimum Level (LAmin)', f"{self._fmt(stats.get('min'), 1)} dB(A)"),
-            ('Maximum Level (LAmax)', f"{self._fmt(stats.get('max'), 1)} dB(A)"),
-            ('Range', f"{self._fmt(stats.get('range', stats.get('max', 0) - stats.get('min', 0)), 1)} dB"),
-            ('Median (L50)', f"{self._fmt(stats.get('median'), 1)} dB(A)"),
-            ('Standard Deviation', f"{self._fmt(stats.get('std_dev'), 2)} dB"),
-            ('Coefficient of Variation', f"{self._fmt(stats.get('cv'), 1)}%"),
-            ('Measurement Count', f"{stats.get('count', 'N/A')} samples"),
-        ]
-        
+
+
         for i, (label, value) in enumerate(metrics, 1):
             row_cells = table.rows[i].cells
             row_cells[0].text = label
@@ -261,7 +315,7 @@ for noise mitigation and health protection."""
             return
         
         percentiles = self.analysis.get('percentiles', {})
-        stats = next(iter(self.analysis['statistics'].values()), {})
+        stats = self._primary_stats()
         first_col = next(iter(self.analysis.get('statistics', {}).keys()), 'LEQ')
         pcts = percentiles.get(first_col, {})
         

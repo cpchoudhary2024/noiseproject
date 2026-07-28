@@ -1911,6 +1911,23 @@ def _pick_primary_leq_column(df: pd.DataFrame) -> str | None:
     return None
 
 
+def _safe_compare_label(filename: str, idx: int) -> str:
+    """Positional label for a comparison dataset when the user supplies none.
+
+    Comparison results and the downloadable comparison PDF are shared onward, so
+    the filename must not become the location name. A file called
+    "PARTICIPANT home.xlsx" previously became the label and appeared ten times
+    in the generated report, including in the headline verdict.
+
+    A filename that is already a study code (CONV001, Home A, SITE-12) is kept,
+    since that is exactly what a user would want shown.
+    """
+    from analysis.report_generator_v2 import is_safe_label
+    stem = os.path.splitext(os.path.basename(filename or ''))[0]
+    stem = re.sub(r'^\d{8}_\d{6}_', '', stem).strip()
+    return stem if is_safe_label(stem) else f"Location {idx + 1}"
+
+
 def _resolve_noise_column(frame: pd.DataFrame, requested: str | None = None) -> str | None:
     """Resolve the noise measurement column to analyse.
 
@@ -2669,7 +2686,7 @@ def _compute_comparison_metrics(df: pd.DataFrame, original_name: str) -> dict:
         }
 
     return {
-        'name': os.path.basename(original_name),
+        'name': original_name,
         'n_records': int(len(df)),
         'date_range': date_range,
         'n_weeks': _safe(n_weeks),
@@ -2797,7 +2814,12 @@ def compare_files():
                 df = read_input_file(filepath)
                 if df.empty:
                     return jsonify({'error': f'File is empty: {file.filename}'}), 400
-                label = (str(labels[idx]).strip() if idx < len(labels) and labels[idx] else '') or file.filename
+                # A user-supplied label is used as given. Otherwise fall back to a
+                # positional label, never the filename: comparison output is shared
+                # with residents and regulators, and source filenames routinely
+                # carry a participant's name or address.
+                _given = (str(labels[idx]).strip() if idx < len(labels) and labels[idx] else '')
+                label = _given or _safe_compare_label(file.filename, idx)
                 metrics = _compute_comparison_metrics(df, label)
                 datasets.append(metrics)
             except Exception as e:

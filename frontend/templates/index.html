@@ -4,7 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Noise Analysis Platform | WHO Health-Based Assessment</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <!-- Pinned. "plotly-latest" is an alias frozen at v1.58.5 (July 2021) and is
+         never updated again, so the browser was rendering with a five-year-old
+         library while the server generated PDF figures with Plotly 6.x. -->
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
@@ -43,7 +46,7 @@
                 <div class="upload-card">
                     <div class="upload-header">
                         <h2>Upload Noise Data</h2>
-                        <p>Compatible with <strong>NSRTW MK4</strong> sound level meter &nbsp;·&nbsp; Accepted formats: CSV &nbsp;·&nbsp; XLSX &nbsp;·&nbsp; WLG</p>
+                        <p>Compatible with <strong>NSRTW MK4</strong> sound level meter &nbsp;·&nbsp; Accepted formats: CSV &nbsp;·&nbsp; XLSX &nbsp;·&nbsp; XLS &nbsp;·&nbsp; WLG</p>
                     </div>
 
                     <!-- Drop zone (always visible, always clickable) -->
@@ -614,7 +617,7 @@
                     <!-- Daily pattern -->
                     <div class="compare-results-card">
                         <h3><i class="fas fa-chart-line" style="color:#3D5A80;"></i> Daily pattern — when is each location loudest?</h3>
-                        <p class="compare-results-note">Average noise for each hour of the day, combined across all monitored days. Dotted lines mark the WHO day (53 dB) and night (45 dB) guidelines.</p>
+                        <p class="compare-results-note">Average level (LAeq) for each hour of the day, combined across all monitored days, so you can see when each location is loudest and how the locations differ hour by hour. The dashed lines mark 53 and 45 dB for reference only: those are the WHO Lden and Lnight guideline values, which apply to whole-period penalty-weighted averages rather than to individual hours. The guideline verdict for each location is in the cards above.</p>
                         <div id="compareDiurnalChart" class="compare-chart-box"></div>
                     </div>
 
