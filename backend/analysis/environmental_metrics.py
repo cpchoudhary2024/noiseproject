@@ -32,14 +32,14 @@ class EnvironmentalMetricsCalculator:
     
     def _identify_time_column(self):
         """Find datetime column"""
-        datetime_cols = [c for c in self.df.columns 
-                        if any(k in c.lower() for k in ['datetime', 'timestamp', 'time'])]
-        return datetime_cols[0] if datetime_cols else None
+        from analysis.timestamp_utils import resolve_time_column
+        return resolve_time_column(self.df)
     
     def _prepare_data(self):
         """Prepare temporal features"""
         if self.time_column:
-            self.df[self.time_column] = pd.to_datetime(self.df[self.time_column], errors='coerce')
+            from analysis.timestamp_utils import parse_timestamps_robust
+            self.df[self.time_column], _ = parse_timestamps_robust(self.df[self.time_column])
             self.df['hour'] = self.df[self.time_column].dt.hour
             self.df['day_of_week'] = self.df[self.time_column].dt.dayofweek
             self.df['is_weekend'] = self.df['day_of_week'].isin([5, 6])
@@ -66,19 +66,52 @@ class EnvironmentalMetricsCalculator:
         
         data = self.df[noise_col].dropna()
         metrics = {}
-        
+
+        # A sample count is NOT a duration. These loggers record at 1 Hz, so
+        # reporting the number of exceeding samples as "hours_above" overstated
+        # duration by a factor of 3600. Convert using the measured logging
+        # interval instead.
+        interval_s = self._logging_interval_seconds()
+
         for std_name, limit in standards.items():
             exceeds = data > limit
+            n_above = int(exceeds.sum())
+            n_below = int((~exceeds).sum())
             metrics[std_name] = {
-                'exceedance_count': int(exceeds.sum()),
+                'exceedance_count': n_above,
                 'exceedance_frequency_pct': float((exceeds.sum() / len(data) * 100)),
+                # Mean amount by which the limit is exceeded, in dB.
                 'avg_exceedance_amount': float((data[exceeds] - limit).mean()) if exceeds.any() else 0,
                 'max_exceedance': float((data[exceeds] - limit).max()) if exceeds.any() else 0,
-                'hours_above': int(exceeds.sum()),
-                'hours_below': int((~exceeds).sum()),
+                'samples_above': n_above,
+                'samples_below': n_below,
+                'logging_interval_seconds': interval_s,
+                'hours_above': (round(n_above * interval_s / 3600.0, 2)
+                                if interval_s is not None else None),
+                'hours_below': (round(n_below * interval_s / 3600.0, 2)
+                                if interval_s is not None else None),
             }
-        
+
         return metrics
+
+    def _logging_interval_seconds(self) -> float | None:
+        """Modal spacing between consecutive samples, in seconds.
+
+        Returns None when there is no usable timestamp column, in which case
+        sample counts cannot be converted to durations and the duration fields
+        are reported as None rather than guessed.
+        """
+        if not self.time_column or self.time_column not in self.df.columns:
+            return None
+        ts = pd.to_datetime(self.df[self.time_column], errors='coerce').dropna().sort_values()
+        if len(ts) < 2:
+            return None
+        deltas = ts.diff().dt.total_seconds().dropna()
+        deltas = deltas[deltas > 0]
+        if deltas.empty:
+            return None
+        mode = deltas.mode()
+        return float(mode.iloc[0]) if not mode.empty else float(deltas.median())
     
     def calculate_percentile_metrics(self, noise_col):
         """
@@ -98,8 +131,13 @@ class EnvironmentalMetricsCalculator:
         for p in percentiles:
             metrics[f'L{p}'] = float(np.percentile(data, p))
         
-        # Add special metrics
-        metrics['LAeq'] = float(data.mean())  # Energy average
+        # Energy average (LAeq) — 10*log10(mean(10^(L/10))). An arithmetic mean of
+        # decibels is not the equivalent continuous level and understates any
+        # record containing loud events; on these datasets the two differ by
+        # several dB.
+        _laeq = _emean(data)
+        metrics['LAeq'] = float(_laeq) if _laeq is not None else float('nan')
+        metrics['L_arithmetic_mean'] = float(data.mean())
         metrics['Lmax'] = float(data.max())
         metrics['Lmin'] = float(data.min())
         metrics['Lrange'] = float(data.max() - data.min())
@@ -144,10 +182,17 @@ class EnvironmentalMetricsCalculator:
             'count': len(night_data)
         }
         
-        metrics['day_night_ratio'] = float(
-            metrics['day']['mean'] / metrics['night']['mean'] 
-            if metrics['night']['mean'] > 0 else 0
-        )
+        # Decibels are a logarithmic interval scale with an arbitrary zero, so the
+        # RATIO of two dB values is meaningless (55/45 is not "22% louder").
+        # The physically meaningful comparison is the difference in dB, which
+        # corresponds to an energy ratio of 10^(diff/10).
+        _d, _n = metrics['day']['mean'], metrics['night']['mean']
+        if _d is not None and _n is not None and np.isfinite(_d) and np.isfinite(_n):
+            metrics['day_night_difference_db'] = float(_d - _n)
+            metrics['day_night_energy_ratio'] = float(10.0 ** ((_d - _n) / 10.0))
+        else:
+            metrics['day_night_difference_db'] = None
+            metrics['day_night_energy_ratio'] = None
         
         # Weekday vs Weekend
         if 'day_of_week' in self.df.columns:
@@ -168,10 +213,12 @@ class EnvironmentalMetricsCalculator:
                 'min': float(weekend.min())
             }
             
-            metrics['weekday_weekend_ratio'] = float(
-                metrics['weekday']['mean'] / metrics['weekend']['mean']
-                if metrics['weekend']['mean'] > 0 else 0
-            )
+            # Difference in dB, not a ratio — see day_night_difference_db above.
+            _wd, _we = metrics['weekday']['mean'], metrics['weekend']['mean']
+            if _wd is not None and _we is not None and np.isfinite(_wd) and np.isfinite(_we):
+                metrics['weekday_weekend_difference_db'] = float(_wd - _we)
+            else:
+                metrics['weekday_weekend_difference_db'] = None
         
         # Peak hours (find top 3 hours with highest average)
         if 'hour' in self.df.columns:

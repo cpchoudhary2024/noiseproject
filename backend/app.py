@@ -18,13 +18,16 @@ from analysis.chart_generator import AdvancedChartGenerator
 from analysis.environmental_viz import EnvironmentalVisualizationEngine
 from analysis.environmental_metrics import EnvironmentalMetricsCalculator
 from analysis.wlg_parser import parse_wlg_file, WLGParser
-from analysis.gap_detector import detect_gaps, gap_report_to_dict, merge_dataframes, data_completeness_pct
+from analysis.gap_detector import (detect_gaps, gap_report_to_dict, merge_dataframes,
+                                   data_completeness_pct, _modal_interval_seconds)
 from analysis.compliance_matrix import evaluate_compliance
-from analysis.acoustics import energetic_mean_db, compute_ldn_lden
-from analysis.timestamp_utils import assess_timestamp_integrity, primary_time_column, parse_timestamps_robust
+from analysis.acoustics import energetic_mean_db, compute_ldn_lden, energy_concentration
+from analysis.timestamp_utils import (assess_timestamp_integrity, primary_time_column,
+                                      parse_timestamps_robust, resolve_time_column)
 import io
 import logging
 import threading
+from collections import OrderedDict
 import math
 import uuid
 
@@ -102,8 +105,45 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 # Never cache static files — ensures browsers always load the latest JS/CSS
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
-# Simple in-memory cache to avoid re-reading and re-analyzing the same file.
-_DATA_CACHE = {}
+# In-memory cache to avoid re-reading and re-analyzing the same file.
+#
+# Entries hold full DataFrames — a single 11-day 1 Hz record is ~950k rows and
+# tens of MB. An unbounded dict therefore grows until the process is OOM-killed,
+# which for a shared portal means the server dies for everyone as soon as enough
+# distinct files have been opened. Bounded by both entry count and an approximate
+# memory budget, evicting least-recently-used first, under a lock so concurrent
+# requests cannot interleave a read and an eviction.
+_DATA_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_CACHE_LOCK = threading.RLock()
+_CACHE_MAX_ENTRIES = int(os.environ.get('NOISE_CACHE_MAX_ENTRIES', '6'))
+_CACHE_MAX_BYTES = int(os.environ.get('NOISE_CACHE_MAX_MB', '1024')) * 1024 * 1024
+
+
+def _entry_nbytes(entry: dict) -> int:
+    """Approximate resident size of a cache entry, in bytes."""
+    df = entry.get('df')
+    try:
+        return int(df.memory_usage(deep=False).sum()) if df is not None else 0
+    except Exception:
+        return 0
+
+
+def _evict_if_needed() -> None:
+    """Drop least-recently-used entries until the cache is within budget.
+
+    Caller must hold ``_CACHE_LOCK``.
+    """
+    while len(_DATA_CACHE) > _CACHE_MAX_ENTRIES:
+        path, entry = _DATA_CACHE.popitem(last=False)
+        logger.info("[CACHE] EVICT (entry count): %s (~%.1f MB)",
+                    path, _entry_nbytes(entry) / 1e6)
+
+    total = sum(_entry_nbytes(e) for e in _DATA_CACHE.values())
+    while total > _CACHE_MAX_BYTES and len(_DATA_CACHE) > 1:
+        path, entry = _DATA_CACHE.popitem(last=False)
+        freed = _entry_nbytes(entry)
+        total -= freed
+        logger.info("[CACHE] EVICT (memory budget): %s (~%.1f MB freed)", path, freed / 1e6)
 
 # Bump this when parser/analysis behavior changes in a way that should invalidate
 # cached results (e.g., WLG decode/scaling fixes).
@@ -119,40 +159,60 @@ def _cache_mtime(filepath: str) -> float | None:
 
 def _get_cache_entry(filepath: str):
     abs_path = os.path.abspath(filepath)
-    entry = _DATA_CACHE.get(abs_path)
-    if not entry:
-        logger.info(f"[CACHE] MISS: {abs_path} - not in cache")
-        return None
+    with _CACHE_LOCK:
+        entry = _DATA_CACHE.get(abs_path)
+        if not entry:
+            logger.info(f"[CACHE] MISS: {abs_path} - not in cache")
+            return None
 
-    if entry.get('cache_version') != _CACHE_VERSION:
-        logger.info(f"[CACHE] MISS: {abs_path} - cache version changed")
-        return None
+        if entry.get('cache_version') != _CACHE_VERSION:
+            logger.info(f"[CACHE] MISS: {abs_path} - cache version changed")
+            _DATA_CACHE.pop(abs_path, None)
+            return None
 
-    current_mtime = _cache_mtime(abs_path)
-    stored_mtime = entry.get('mtime')
-    if stored_mtime != current_mtime:
-        logger.info(f"[CACHE] MISS: {abs_path} - file modified (stored: {stored_mtime}, current: {current_mtime})")
-        return None
-    logger.info(f"[CACHE] HIT: {abs_path} - cache valid")
-    return entry
+        current_mtime = _cache_mtime(abs_path)
+        stored_mtime = entry.get('mtime')
+        if stored_mtime != current_mtime:
+            logger.info(f"[CACHE] MISS: {abs_path} - file modified (stored: {stored_mtime}, current: {current_mtime})")
+            _DATA_CACHE.pop(abs_path, None)
+            return None
+
+        # Mark as most-recently-used so eviction drops genuinely cold entries.
+        _DATA_CACHE.move_to_end(abs_path)
+        logger.info(f"[CACHE] HIT: {abs_path} - cache valid")
+        return entry
 
 
 def _store_cache_entry(filepath: str, df=None, analysis=None, standards=None, daily_summary=None, hourly_summary=None):
     abs_path = os.path.abspath(filepath)
     mtime = _cache_mtime(abs_path)
-    _DATA_CACHE[abs_path] = {
-        'cache_version': _CACHE_VERSION,
-        'mtime': mtime,
-        'df': df,
-        'analysis': analysis,
-        'standards': standards,
-        'daily_summary': daily_summary,
-        'hourly_summary': hourly_summary,
-    }
+    with _CACHE_LOCK:
+        # Preserve anything already cached for this file that this call does not
+        # supply, so storing an analysis does not silently discard the DataFrame.
+        existing = _DATA_CACHE.get(abs_path) or {}
+        merged = {
+            'cache_version': _CACHE_VERSION,
+            'mtime': mtime,
+            'df': df if df is not None else existing.get('df'),
+            'analysis': analysis if analysis is not None else existing.get('analysis'),
+            'standards': standards if standards is not None else existing.get('standards'),
+            'daily_summary': daily_summary if daily_summary is not None else existing.get('daily_summary'),
+            'hourly_summary': hourly_summary if hourly_summary is not None else existing.get('hourly_summary'),
+        }
+        # A stale-mtime entry must not keep results computed from older content.
+        if existing and existing.get('mtime') != mtime:
+            merged.update({k: locals()[k] for k in
+                           ('df', 'analysis', 'standards', 'daily_summary', 'hourly_summary')})
+        _DATA_CACHE[abs_path] = merged
+        _DATA_CACHE.move_to_end(abs_path)
+        _evict_if_needed()
+
     logger.info(
-        f"[CACHE] STORE: {abs_path} - mtime={mtime}, has_df={df is not None}, "
-        f"has_analysis={analysis is not None}, has_standards={standards is not None}, "
-        f"has_daily_summary={daily_summary is not None}, has_hourly_summary={hourly_summary is not None}"
+        f"[CACHE] STORE: {abs_path} - mtime={mtime}, has_df={merged['df'] is not None}, "
+        f"has_analysis={merged['analysis'] is not None}, has_standards={merged['standards'] is not None}, "
+        f"has_daily_summary={merged['daily_summary'] is not None}, "
+        f"has_hourly_summary={merged['hourly_summary'] is not None}, "
+        f"entries={len(_DATA_CACHE)}"
     )
 
 
@@ -193,15 +253,10 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
     if not filters or df.empty:
         return df
 
-    time_candidates = [
-        c for c in df.columns
-        if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])
-    ]
-    if not time_candidates:
+    time_col = resolve_time_column(df)
+    if not time_col:
         return df
-
-    time_col = time_candidates[0]
-    ts = pd.to_datetime(df[time_col], errors='coerce', dayfirst=True)
+    ts, _ = parse_timestamps_robust(df[time_col])
     valid_ts = ts.notna()
 
     keep = pd.Series(True, index=df.index)
@@ -260,8 +315,12 @@ def _resolve_uploaded_filepath(filepath: str) -> str:
     ]
 
     def _within_allowed(p: str) -> bool:
-        ap = os.path.abspath(p)
-        return any(ap == root or ap.startswith(root + os.sep) for root in allowed_roots)
+        # realpath, not abspath: abspath normalises '..' but does not follow
+        # symlinks, so a symlink planted inside uploads/ could still point at an
+        # arbitrary file outside the allowed roots.
+        ap = os.path.realpath(p)
+        return any(ap == os.path.realpath(root) or ap.startswith(os.path.realpath(root) + os.sep)
+                   for root in allowed_roots)
 
     # Bare basename → look up inside the upload folders only.
     if os.path.basename(filepath) == filepath:
@@ -425,7 +484,53 @@ def read_excel_file(filepath):
             "Unsupported or corrupt Excel file. The file does not look like a real .xls or .xlsx. "
             "If you renamed the file extension, please re-save it as a true .xlsx or .csv."
         )
+    df = _flag_spreadsheet_row_limit_truncation(df, filepath)
     return _maybe_add_absolute_timestamp(df, None, filepath=filepath)
+
+
+# Worksheet row ceilings. A logger export that lands within a couple of rows of
+# one of these was almost certainly cut off by the spreadsheet, not by the device.
+_XLSX_ROW_LIMIT = 1_048_576   # Excel 2007+ (.xlsx)
+_XLS_ROW_LIMIT = 65_536       # Excel 97-2003 (.xls)
+_ROW_LIMIT_TOLERANCE = 5      # allow for header + metadata rows
+
+
+def _flag_spreadsheet_row_limit_truncation(df: pd.DataFrame, filepath: str) -> pd.DataFrame:
+    """Detect silent truncation at a spreadsheet row ceiling.
+
+    Excel drops every row past its worksheet limit **without warning**. Several
+    files in this project sit at exactly 1,048,573 data rows: days of monitoring
+    were lost at export, yet the file opens cleanly and reports a shorter period
+    than its own filename claims. Reporting that period as the monitoring window
+    would understate coverage in a document intended for public release.
+
+    Records the finding in ``df.attrs['ingest_warnings']`` and logs it. Does not
+    raise: the surviving data is still valid, it is the *extent* that is wrong.
+    """
+    n = len(df)
+    warnings_found: list[str] = []
+    for limit, label in ((_XLSX_ROW_LIMIT, 'xlsx'), (_XLS_ROW_LIMIT, 'xls')):
+        if limit - _ROW_LIMIT_TOLERANCE - 1 <= n <= limit:
+            warnings_found.append(
+                f"This file contains {n:,} rows, which is exactly the {label.upper()} worksheet "
+                f"limit of {limit:,}. Excel discards every row beyond that limit without warning, "
+                f"so this export is truncated: the recording continued past the last timestamp "
+                f"shown. All results below describe the period actually present in the file, which "
+                f"is shorter than the deployment. Where the original logger data is no longer "
+                f"available the shortfall cannot be recovered and should be stated as a coverage "
+                f"limitation; where it is, re-export as CSV, which has no row limit."
+            )
+            logger.warning(
+                "[INGEST] Row-limit truncation suspected in %s: %d rows (%s limit %d)",
+                os.path.basename(filepath), n, label, limit
+            )
+            break
+
+    if warnings_found:
+        existing = list(df.attrs.get('ingest_warnings', []))
+        df.attrs['ingest_warnings'] = existing + warnings_found
+        df.attrs['truncated_at_row_limit'] = True
+    return df
 
 
 def read_input_file(filepath):
@@ -564,6 +669,37 @@ def _parse_date_range_from_filename(filename: str) -> tuple[datetime | None, dat
     return None, None
 
 
+def _parse_start_time_from_filename(filename: str) -> tuple[int | None, int | None]:
+    """Extract a start clock time from a filename, e.g. '... 11.22-20.15' -> (11, 22).
+
+    Several exports encode the recording window in the filename as
+    ``HH.MM-HH.MM``. Using it beats anchoring at midnight, which fabricates a
+    time of day and shifts every sample into the wrong day/night window.
+
+    Only accepts values that are valid clock times AND where the second value
+    reads as a later time than the first, so a ``month.day-month.day`` range is
+    not mistaken for a time range.
+
+    Returns
+    -------
+    tuple[int | None, int | None]
+        ``(hour, minute)`` of the start time, or ``(None, None)``.
+    """
+    name = os.path.splitext(os.path.basename(filename or ''))[0]
+    name = re.sub(r'^\d{8}_\d{6}_', '', name)
+
+    for m in re.finditer(r'(?<!\d)(\d{1,2})\.(\d{2})\s*[-–]\s*(\d{1,2})\.(\d{2})(?!\d)', name):
+        h1, m1, h2, m2 = (int(g) for g in m.groups())
+        if not (0 <= h1 <= 23 and 0 <= m1 <= 59 and 0 <= h2 <= 23 and 0 <= m2 <= 59):
+            continue
+        # A same-day recording window runs forwards. Reject date-like pairs
+        # (e.g. '03.12-03.15', where both halves are equal-hour month.day).
+        if (h2, m2) <= (h1, m1):
+            continue
+        return h1, m1
+    return None, None
+
+
 def _maybe_add_absolute_timestamp(
     df: pd.DataFrame,
     start_dt: datetime | None,
@@ -641,14 +777,34 @@ def _maybe_add_absolute_timestamp(
 
         # Choose a base datetime.
         base_dt = start_dt
+        tod_known = start_dt is not None
         if base_dt is None and filepath:
             start_date, _end_date = _parse_date_range_from_filename(filepath)
             if start_date is not None:
-                # Anchor the first sample at 00:MM:SS on the start date.
+                # The filename gives a DATE but no time of day. Anchoring at
+                # hour 0 invents a clock: one file here truly began at 11:24 and
+                # was placed at 00:24, shifting every sample 11 hours and moving
+                # daytime measurements into the night window — which silently
+                # corrupts Lnight, Ldn/Lden and the whole diurnal profile.
+                #
+                # Prefer a start time parsed from the filename when present;
+                # otherwise anchor the date but mark the time of day as
+                # unreliable so hour-dependent metrics can be suppressed rather
+                # than fabricated.
+                fname_hour, fname_minute = _parse_start_time_from_filename(filepath)
                 first_within = float(within.dropna().iloc[0]) if within.notna().any() else 0.0
                 mm = int(first_within // 60)
                 ss = first_within - mm * 60
-                base_dt = start_date.replace(hour=0, minute=mm % 60, second=int(ss), microsecond=int(round((ss % 1) * 1_000_000)))
+                if fname_hour is not None:
+                    base_dt = start_date.replace(
+                        hour=fname_hour, minute=fname_minute if fname_minute is not None else mm % 60,
+                        second=int(ss), microsecond=int(round((ss % 1) * 1_000_000)))
+                    tod_known = True
+                else:
+                    base_dt = start_date.replace(
+                        hour=0, minute=mm % 60, second=int(ss),
+                        microsecond=int(round((ss % 1) * 1_000_000)))
+                    tod_known = False
 
         if base_dt is None:
             return df
@@ -665,6 +821,17 @@ def _maybe_add_absolute_timestamp(
 
         df = df.copy()
         df['Timestamp'] = base_dt + pd.to_timedelta(elapsed, unit='s')
+        if not tod_known:
+            df.attrs['time_of_day_reliable'] = False
+            df.attrs['ingest_warnings'] = list(df.attrs.get('ingest_warnings', [])) + [
+                "This file carried no clock time — only minutes and seconds. The calendar date "
+                "was recovered, but the time of day is UNKNOWN and has been anchored at 00:00. "
+                "Hour-dependent results (Lnight, Ldn, Lden, day/night split, diurnal profile, "
+                "heatmap) are therefore not reliable for this file. Re-export it with the full "
+                "'YYYY-MM-DD HH:MM:SS' timestamp column."
+            ]
+            logger.warning("[INGEST] Time of day unknown for %s — anchored at 00:00.",
+                           os.path.basename(filepath or ''))
         return df
 
     # Try HH:MM:SS(.sss)
@@ -826,9 +993,9 @@ def upload_file():
         # Compute date range for the uploaded file
         start_date = end_date = None
         try:
-            time_cols = [c for c in df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
+            time_cols = [c for c in [resolve_time_column(df)] if c]
             if time_cols:
-                ts = pd.to_datetime(df[time_cols[0]], errors='coerce', dayfirst=True).dropna()
+                ts, _ = parse_timestamps_robust(df[time_cols[0]]); ts = ts.dropna()
                 if not ts.empty:
                     start_date = ts.min().isoformat()
                     end_date = ts.max().isoformat()
@@ -907,17 +1074,60 @@ def analyze_data():
         # and suppress time-dependent metrics instead of showing fabricated values.
         timestamp_integrity: dict = {"status": "ok", "time_metrics_valid": True}
         try:
-            _tcol = primary_time_column(df)
+            _tcol = resolve_time_column(df)
             if _tcol is not None:
                 timestamp_integrity = assess_timestamp_integrity(df[_tcol]).to_dict()
         except Exception as ts_err:
             logger.warning(f"[ANALYZE] Timestamp integrity check skipped: {ts_err}")
 
+        # Ingestion-level data-integrity warnings (e.g. spreadsheet row-limit
+        # truncation). These describe what is MISSING from the file, which the
+        # timestamp check cannot see — the surviving rows parse perfectly.
+        ingest_warnings: list[str] = list(df.attrs.get('ingest_warnings', []) or [])
+
+        # ── Suppress time-dependent metrics when the timeline is not real ──────
+        # When timestamps are unusable, pandas still yields *a* timeline (it
+        # parses a bare '24:44.0' as a time on the processing date), so every
+        # hour-dependent metric computes successfully and looks authoritative
+        # while describing a day that never happened.
+        #
+        # These values must be removed on the SERVER. Relying on the client to
+        # hide them leaves the fabricated numbers in the API response, in any
+        # exported payload, and in the narrative text itself.
+        time_metrics_suppressed = not bool(timestamp_integrity.get('time_metrics_valid', True))
+        if time_metrics_suppressed:
+            _TIME_DEPENDENT = (
+                'Lden', 'Ldn', 'Lnight', 'LAeq_day', 'LAeq_night', 'LAeq_evening',
+                'LAeq_day_ldn', 'LAeq_night_ldn', 'LAeq_day_lden',
+                'LAeq_night_lden', 'LAeq_evening_lden',
+            )
+            for _col, _vals in (analysis_results.get('environmental_metrics') or {}).items():
+                for _k in _TIME_DEPENDENT:
+                    _vals.pop(_k, None)
+            # Strip the same values from the per-column compliance block.
+            for _col, _vals in (analysis_results.get('compliance') or {}).items():
+                if isinstance(_vals, dict):
+                    for _k in list(_vals):
+                        if any(t in str(_k) for t in ('Lden', 'Lnight', 'LAmax night')):
+                            _vals.pop(_k, None)
+                    _vals['current_Lden'] = 'N/A'
+                    _vals['current_Lnight'] = 'N/A'
+            analysis_results['data_summary']['measurement_period'] = {
+                'start': 'Unknown (timestamps unreadable)',
+                'end': 'Unknown (timestamps unreadable)',
+            }
+            ingest_warnings.append(
+                timestamp_integrity.get('message')
+                or 'Timestamps are unreliable; time-dependent metrics have been suppressed.'
+            )
+            logger.warning('[ANALYZE] Timestamps unusable (%s) — time-dependent metrics suppressed.',
+                           timestamp_integrity.get('method'))
+
         # ── Forensic gap analysis ──────────────────────────────────────────────
         _set_progress(job_id, 65, 'Detecting data gaps…')
         gap_data: dict = {}
         try:
-            time_candidates = [c for c in df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
+            time_candidates = [c for c in [resolve_time_column(df)] if c]
             if time_candidates:
                 gap_rpt = detect_gaps(df, time_candidates[0])
                 gap_data = gap_report_to_dict(gap_rpt)
@@ -934,9 +1144,23 @@ def analyze_data():
             stats     = analysis_results.get('statistics', {})
             stat_first = stats.get(first_col or next(iter(stats), ''), {}) or {}
 
-            # Day/Night LAeq from env_metrics if available, else estimate from overall
-            laeq_day   = env_first.get('LAeq_day')
-            laeq_night = env_first.get('LAeq_night') or env_first.get('Lnight')
+            # COMAR rows are defined on 07:00-22:00 and 22:00-07:00. Use the Ldn
+            # windows explicitly rather than the generic aliases, so the metric
+            # always matches the averaging period the legal limit specifies.
+            laeq_day   = env_first.get('LAeq_day_ldn', env_first.get('LAeq_day'))
+            laeq_night = env_first.get('LAeq_night_ldn', env_first.get('LAeq_night'))
+
+            # LAmax must come from the L-Max stream. Taking max() of the LEQ
+            # column understates the true peak, since LEQ is already averaged
+            # over each logging interval.
+            lamax_val = None
+            _lmax_col = next(
+                (c for c in stats
+                 if 'lmax' in ''.join(ch for ch in str(c).lower() if ch.isalnum())),
+                None
+            )
+            if _lmax_col:
+                lamax_val = float(stats.get(_lmax_col, {}).get('max') or 0) or None
 
             compliance_matrix = evaluate_compliance(
                 lden        = env_first.get('Lden'),
@@ -944,7 +1168,7 @@ def analyze_data():
                 laeq        = float(stat_first.get('laeq_db') or stat_first.get('mean') or 0) or None,
                 laeq_day    = laeq_day,
                 laeq_night  = laeq_night,
-                lamax       = float(stat_first.get('max') or 0) or None,
+                lamax       = lamax_val,
                 environment = environment,
             )
         except Exception as cm_err:
@@ -962,15 +1186,40 @@ def analyze_data():
                 if not leq_series.empty:
                     key_findings['avg_laeq'] = energetic_mean_db(leq_series)
                     key_findings['peak'] = float(leq_series.max())
-                    key_findings['pct_within_guideline'] = round(100.0 * float((leq_series <= 53.0).mean()), 0)
-                    key_findings['n_days'] = int(len(pd.to_datetime(
-                        df[next((c for c in df.columns if any(t in c.lower()
-                                 for t in ['timestamp', 'datetime', 'time', 'date'])), prim)],
+                    # Share of individual logged samples at or below 53 dB(A).
+                    # This is NOT a WHO compliance figure: 53 dB(A) is an Lden
+                    # limit — a duration-weighted, penalty-adjusted long-term
+                    # average — and cannot be evaluated against instantaneous
+                    # samples. Named and labelled as a plain distribution
+                    # statistic so it cannot be read as a compliance rate.
+                    key_findings['pct_samples_at_or_below_53db'] = round(
+                        100.0 * float((leq_series <= 53.0).mean()), 1)
+                    key_findings['pct_samples_note'] = (
+                        'Share of individual logged samples at or below 53 dB(A). '
+                        'Not a WHO compliance rate — WHO limits apply to Lden/Lnight, '
+                        'not to individual samples.'
+                    )
+                    # Lden/Lnight are the metrics the WHO guidelines are defined
+                    # on, so the guideline headline card must read from these.
+                    # Suppressed automatically when the timeline is not real,
+                    # because the block above strips them from environmental_metrics.
+                    _env_kf = (analysis_results.get('environmental_metrics') or {})
+                    _env_first_kf = _env_kf.get(next(iter(_env_kf), ''), {}) if _env_kf else {}
+                    if _env_first_kf.get('Lden') is not None:
+                        key_findings['lden'] = _env_first_kf['Lden']
+                    if _env_first_kf.get('Lnight') is not None:
+                        key_findings['lnight'] = _env_first_kf['Lnight']
+                    _tcol_kf = resolve_time_column(df)
+                    # Calendar dates touched by the record. A recording that runs
+                    # 20:00-08:00 touches 2 dates but covers 0.5 days, so this is
+                    # explicitly a date count, not a duration.
+                    key_findings['n_calendar_dates'] = int(len(pd.to_datetime(
+                        df[_tcol_kf or prim],
                         errors='coerce').dropna().dt.normalize().unique())) if cols else 0
                     # Loudest / quietest hour by energy average
-                    tcands = [c for c in df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
+                    tcands = [c for c in [_tcol_kf] if c]
                     if tcands:
-                        tser = pd.to_datetime(df[tcands[0]], errors='coerce')
+                        tser, _ = parse_timestamps_robust(df[tcands[0]])
                         tmp = pd.DataFrame({'h': tser.dt.hour, 'v': pd.to_numeric(df[prim], errors='coerce')}).dropna()
                         if not tmp.empty:
                             hourly = tmp.groupby('h')['v'].apply(lambda s: energetic_mean_db(s)).dropna()
@@ -994,13 +1243,45 @@ def analyze_data():
             pct_pe = analysis_results.get('percentiles', {})
             pct_first_pe = pct_pe.get(first_col_pe or next(iter(pct_pe), ''), {}) if pct_pe else {}
 
-            ts_candidates_pe = [c for c in df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
-            ts_pe = pd.to_datetime(df[ts_candidates_pe[0]], errors='coerce') if ts_candidates_pe else pd.Series(dtype='datetime64[ns]')
-            ts_valid_pe = ts_pe.dropna()
+            ts_candidates_pe = [c for c in [resolve_time_column(df)] if c]
+            ts_pe = parse_timestamps_robust(df[ts_candidates_pe[0]])[0] if ts_candidates_pe else pd.Series(dtype='datetime64[ns]')
+            # A fabricated timeline must not produce dates, day counts, or
+            # completeness figures in the prose.
+            ts_valid_pe = ts_pe.dropna() if not time_metrics_suppressed else pd.Series(dtype='datetime64[ns]')
+            # Elapsed monitoring duration in whole days. Reported alongside
+            # key_findings['n_calendar_dates'], which counts calendar dates
+            # touched — the two legitimately differ and must not be conflated.
             n_days_pe = int(round((ts_valid_pe.max() - ts_valid_pe.min()).total_seconds() / 86400)) if not ts_valid_pe.empty else 0
             start_pe = ts_valid_pe.min().strftime('%d %b %Y') if not ts_valid_pe.empty else ''
             end_pe   = ts_valid_pe.max().strftime('%d %b %Y') if not ts_valid_pe.empty else ''
             completeness_pe = data_completeness_pct(ts_valid_pe, actual_count=len(df))
+
+            # True LAmax from the L-Max column, and the measured logging interval,
+            # so the narrative names the stream each peak came from.
+            _lmax_col_pe = next(
+                (c for c in df.columns
+                 if 'lmax' in ''.join(ch for ch in str(c).lower() if ch.isalnum())), None)
+            _lamax_pe = None
+            if _lmax_col_pe:
+                _s = pd.to_numeric(df[_lmax_col_pe], errors='coerce').dropna()
+                _lamax_pe = float(_s.max()) if not _s.empty else None
+            _interval_pe = _modal_interval_seconds(ts_valid_pe) if not ts_valid_pe.empty else None
+
+            # Flag when a handful of samples carry the average (see acoustics.energy_concentration).
+            _dominance_pe = None
+            try:
+                _prim_pe = _resolve_noise_column(df)
+                if _prim_pe:
+                    _dominance_pe = energy_concentration(pd.to_numeric(df[_prim_pe], errors='coerce').dropna())
+            except Exception:
+                pass
+
+            # Real gap inventory, so the narrative can state interruptions
+            # instead of asserting an unbroken record.
+            n_gaps_pe = int((gap_data or {}).get('gap_count') or 0)
+            gap_hours_pe = float((gap_data or {}).get('missing_seconds') or 0.0) / 3600.0
+            if time_metrics_suppressed:
+                n_gaps_pe, gap_hours_pe = 0, 0.0
 
             plain_english_summary = ReportGeneratorV2.generate_plain_english_summary(
                 laeq        = env_first_pe.get('LAeq_24h') or float(stat_first_pe.get('laeq_db') or stat_first_pe.get('mean') or 0) or None,
@@ -1017,6 +1298,15 @@ def analyze_data():
                 duration_label = '',
                 data_completeness_pct = completeness_pe,
                 n_days      = n_days_pe,
+                n_gaps      = n_gaps_pe,
+                total_gap_hours = gap_hours_pe,
+                environment = environment,
+                truncation_warning = bool(df.attrs.get('truncated_at_row_limit')),
+                timestamps_unusable = time_metrics_suppressed,
+                # LAmax must come from the L-Max stream, not max(LEQ).
+                lamax = _lamax_pe,
+                logging_interval_s = _interval_pe,
+                energy_dominance = _dominance_pe,
             )
         except Exception as _pe_err:
             logger.warning(f"[ANALYZE] Plain-English summary failed: {_pe_err}")
@@ -1030,6 +1320,7 @@ def analyze_data():
             'compliance_matrix': compliance_matrix,
             'plain_english_summary': plain_english_summary,
             'timestamp_integrity': timestamp_integrity,
+            'ingest_warnings': ingest_warnings,
             'key_findings': key_findings,
             'filepath': filepath
         })
@@ -1042,11 +1333,11 @@ def analyze_data():
 
 def _df_date_range(df: pd.DataFrame) -> tuple[str | None, str | None]:
     """Return (start_iso, end_iso) for the primary time column of a dataframe."""
-    time_cols = [c for c in df.columns if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
+    time_cols = [c for c in [resolve_time_column(df)] if c]
     if not time_cols:
         return None, None
     try:
-        ts = pd.to_datetime(df[time_cols[0]], errors='coerce', dayfirst=True).dropna()
+        ts, _ = parse_timestamps_robust(df[time_cols[0]]); ts = ts.dropna()
         if ts.empty:
             return None, None
         return ts.min().isoformat(), ts.max().isoformat()
@@ -1620,6 +1911,55 @@ def _pick_primary_leq_column(df: pd.DataFrame) -> str | None:
     return None
 
 
+def _resolve_noise_column(frame: pd.DataFrame, requested: str | None = None) -> str | None:
+    """Resolve the noise measurement column to analyse.
+
+    Endpoints previously defaulted to a hardcoded ``'Noise_Level_dB'`` that does
+    not exist in any real logger export, and several duplicated this logic
+    inline. Preference order: an exact match on the requested name, then an
+    LEQ-like column (the correct default for environmental metrics), then any
+    other level column, then the first numeric column.
+
+    Parameters
+    ----------
+    frame : pd.DataFrame
+        Data to inspect.
+    requested : str, optional
+        Column name asked for by the client.
+
+    Returns
+    -------
+    str | None
+        Column name, or None when the frame has no usable numeric column.
+    """
+    if requested:
+        requested_lower = str(requested).lower()
+        for column in frame.columns:
+            if str(column).lower() == requested_lower:
+                return column
+
+    def _norm(c) -> str:
+        return ''.join(ch for ch in str(c).lower() if ch.isalnum())
+
+    # Prefer LEQ over L-Max/L-Min: environmental metrics are defined on LEQ.
+    for column in frame.columns:
+        n = _norm(column)
+        if ('leq' in n or 'laeq' in n) and 'max' not in n and 'min' not in n:
+            if pd.to_numeric(frame[column], errors='coerce').notna().any():
+                return column
+
+    for token in ('lmax', 'lmin', 'noise', 'level', 'sound', 'db'):
+        for column in frame.columns:
+            if token in _norm(column):
+                if pd.to_numeric(frame[column], errors='coerce').notna().any():
+                    return column
+
+    numeric_cols = frame.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols
+                    if not any(t in _norm(c) for t in ('time', 'date', 'hour', 'index'))]
+    return numeric_cols[0] if numeric_cols else None
+
+
 def _get_datetime_series(df: pd.DataFrame) -> tuple[pd.DataFrame, str] | tuple[None, None]:
     """Return (prepared_df, time_col) with a reliable datetime series."""
     summarizer = DataSummarizer(df)
@@ -1627,7 +1967,7 @@ def _get_datetime_series(df: pd.DataFrame) -> tuple[pd.DataFrame, str] | tuple[N
     if not time_col or time_col not in summarizer.df.columns:
         return None, None
     prepared = summarizer.df.copy()
-    prepared[time_col] = pd.to_datetime(prepared[time_col], errors='coerce', dayfirst=True, cache=True)
+    prepared[time_col], _ = parse_timestamps_robust(prepared[time_col])
     return prepared, time_col
 
 
@@ -1821,7 +2161,7 @@ def get_environmental_metrics():
     try:
         data = request.json
         filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col', 'Noise_Level_dB')
+        noise_col = data.get('noise_col')
         
         if not filepath:
             return jsonify({'error': 'No filepath provided'}), 400
@@ -1834,6 +2174,10 @@ def get_environmental_metrics():
         # Read data
         df = _get_cached_df(filepath)
         
+        noise_col = _resolve_noise_column(df, noise_col)
+        if not noise_col:
+            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
+
         # Calculate environmental metrics
         calc = EnvironmentalMetricsCalculator(df, [noise_col])
         metrics = calc.calculate_all_metrics(noise_col)
@@ -1854,7 +2198,7 @@ def get_exceedance_analysis():
     try:
         data = request.json
         filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col', 'Noise_Level_dB')
+        noise_col = data.get('noise_col')
         
         if not filepath:
             return jsonify({'error': 'No filepath provided'}), 400
@@ -1866,9 +2210,13 @@ def get_exceedance_analysis():
         
         df = _get_cached_df(filepath)
         
+        noise_col = _resolve_noise_column(df, noise_col)
+        if not noise_col:
+            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
+
         # Generate exceedance chart
         viz = EnvironmentalVisualizationEngine(df, noise_col)
-        fig = viz.generate_exceedance_analysis()
+        fig = viz.generate_exceedance_analysis(noise_col)
         
         # Convert to JSON for browser
         chart_json = fig.to_json()
@@ -1889,7 +2237,7 @@ def get_temporal_heatmap():
     try:
         data = request.json
         filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col', 'Noise_Level_dB')
+        noise_col = data.get('noise_col')
         resolution = data.get('resolution', 'hourly')  # 'hourly' or 'daily'
         
         if not filepath:
@@ -1904,18 +2252,6 @@ def get_temporal_heatmap():
         filters = (data or {}).get('filters')
         if filters:
             df = _apply_temporal_filters(df, filters)
-
-        def _resolve_noise_column(frame, requested: str):
-            requested_lower = str(requested).lower()
-            for column in frame.columns:
-                if str(column).lower() == requested_lower:
-                    return column
-            for token in ('leq', 'laeq', 'l-max', 'lmax', 'l-min', 'lmin', 'noise', 'level', 'sound'):
-                for column in frame.columns:
-                    if token in str(column).lower():
-                        return column
-            numeric_cols = frame.select_dtypes(include=[np.number]).columns.tolist()
-            return numeric_cols[0] if numeric_cols else None
 
         noise_col = _resolve_noise_column(df, noise_col)
         if not noise_col:
@@ -1957,18 +2293,6 @@ def get_diurnal_boxplot():
         if filters:
             df = _apply_temporal_filters(df, filters)
 
-        def _resolve_noise_column(frame, requested: str):
-            requested_lower = str(requested).lower()
-            for column in frame.columns:
-                if str(column).lower() == requested_lower:
-                    return column
-            for token in ('leq', 'laeq', 'l-max', 'lmax', 'l-min', 'lmin', 'noise', 'level', 'sound'):
-                for column in frame.columns:
-                    if token in str(column).lower():
-                        return column
-            numeric_cols = frame.select_dtypes(include=[np.number]).columns.tolist()
-            return numeric_cols[0] if numeric_cols else None
-
         noise_col = _resolve_noise_column(df, noise_col)
         if not noise_col:
             return jsonify({'error': 'No usable noise column found'}), 400
@@ -1997,7 +2321,7 @@ def get_distribution_analysis():
     try:
         data = request.json
         filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col', 'Noise_Level_dB')
+        noise_col = data.get('noise_col')
         
         if not filepath:
             return jsonify({'error': 'No filepath provided'}), 400
@@ -2010,8 +2334,12 @@ def get_distribution_analysis():
         df = _get_cached_df(filepath)
         
         # Generate violin plot
+        noise_col = _resolve_noise_column(df, noise_col)
+        if not noise_col:
+            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
+
         viz = EnvironmentalVisualizationEngine(df, noise_col)
-        fig = viz.generate_violin_distribution()
+        fig = viz.generate_violin_distribution(noise_col)
         
         chart_json = fig.to_json()
         
@@ -2031,7 +2359,7 @@ def get_compliance_dashboard():
     try:
         data = request.json
         filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col', 'Noise_Level_dB')
+        noise_col = data.get('noise_col')
         
         if not filepath:
             return jsonify({'error': 'No filepath provided'}), 400
@@ -2052,8 +2380,12 @@ def get_compliance_dashboard():
             analysis = analyzer.comprehensive_analysis()
         
         # Generate compliance dashboard
+        noise_col = _resolve_noise_column(df, noise_col)
+        if not noise_col:
+            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
+
         viz = EnvironmentalVisualizationEngine(df, noise_col)
-        fig = viz.generate_compliance_dashboard(analysis)
+        fig = viz.generate_compliance_dashboard(noise_col=noise_col, analysis=analysis)
         
         chart_json = fig.to_json()
         
@@ -2073,7 +2405,7 @@ def get_anomaly_detection():
     try:
         data = request.json
         filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col', 'Noise_Level_dB')
+        noise_col = data.get('noise_col')
         threshold = data.get('threshold_std', 2.5)
         
         if not filepath:
@@ -2087,8 +2419,12 @@ def get_anomaly_detection():
         df = _get_cached_df(filepath)
         
         # Generate anomaly detection
+        noise_col = _resolve_noise_column(df, noise_col)
+        if not noise_col:
+            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
+
         viz = EnvironmentalVisualizationEngine(df, noise_col)
-        fig = viz.generate_anomaly_detection(threshold_std=threshold)
+        fig = viz.generate_anomaly_detection(noise_col, threshold_std=threshold)
         
         chart_json = fig.to_json()
         
@@ -2108,7 +2444,7 @@ def get_cumulative_distribution():
     try:
         data = request.json
         filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col', 'Noise_Level_dB')
+        noise_col = data.get('noise_col')
         
         if not filepath:
             return jsonify({'error': 'No filepath provided'}), 400
@@ -2121,8 +2457,12 @@ def get_cumulative_distribution():
         df = _get_cached_df(filepath)
         
         # Generate CDF
+        noise_col = _resolve_noise_column(df, noise_col)
+        if not noise_col:
+            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
+
         viz = EnvironmentalVisualizationEngine(df, noise_col)
-        fig = viz.generate_cumulative_distribution()
+        fig = viz.generate_cumulative_distribution(noise_col)
         
         chart_json = fig.to_json()
         
@@ -2150,14 +2490,11 @@ def get_data_date_range():
             return jsonify({'error': 'File not found', 'filepath': filepath}), 404
 
         df = _get_cached_df(filepath)
-        time_candidates = [
-            c for c in df.columns
-            if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])
-        ]
-        if not time_candidates:
+        _tc = resolve_time_column(df)
+        if not _tc:
             return jsonify({'error': 'No timestamp column found'}), 400
 
-        ts = pd.to_datetime(df[time_candidates[0]], errors='coerce', dayfirst=True)
+        ts, _ = parse_timestamps_robust(df[_tc])
         ts = ts.dropna()
         if ts.empty:
             return jsonify({'error': 'No valid timestamps in file'}), 400
@@ -2235,10 +2572,10 @@ def _compute_comparison_metrics(df: pd.DataFrame, original_name: str) -> dict:
         non_peak = [c for c in noise_cols if c != lmax_col and c != lmin_col]
         leq_col = non_peak[0] if non_peak else (noise_cols[0] if noise_cols else None)
 
-    ts_candidates = [c for c in df.columns if any(t in c.lower() for t in ["timestamp", "datetime", "date", "time"])]
+    ts_candidates = [c for c in [resolve_time_column(df)] if c]
     ts_col = ts_candidates[0] if ts_candidates else None
 
-    ts = pd.to_datetime(df[ts_col], errors="coerce", dayfirst=True) if ts_col else pd.Series(dtype='datetime64[ns]')
+    ts = parse_timestamps_robust(df[ts_col])[0] if ts_col else pd.Series(dtype='datetime64[ns]')
     leq = pd.to_numeric(df[leq_col], errors="coerce").dropna() if leq_col else pd.Series(dtype=float)
     lmax_s = pd.to_numeric(df[lmax_col], errors="coerce").dropna() if lmax_col else pd.Series(dtype=float)
     lmin_s = pd.to_numeric(df[lmin_col], errors="coerce").dropna() if lmin_col else pd.Series(dtype=float)

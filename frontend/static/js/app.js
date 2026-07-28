@@ -807,11 +807,19 @@ function renderMetricsPanel() {
     cards.push(card(fmt(avg, 1), 'dB(A)', 'Average noise level',
         `${word} — the steady level with the same energy as the real noise`, avgCls));
 
-    if (Number.isFinite(Number(kf.pct_within_guideline))) {
-        const p = Number(kf.pct_within_guideline);
-        cards.push(card(fmt(p, 0), '%', 'Time within health guideline',
-            'share of time at or below the WHO 53 dB level',
-            p >= 90 ? 'metric-ok' : (p >= 60 ? 'metric-warn' : 'metric-danger')));
+    // Guideline comparison must use Lden, the metric the WHO 53 dB guideline is
+    // defined on. This card previously showed the share of individual samples at
+    // or below 53 dB under the label "Time within health guideline" — a category
+    // error that read as high compliance ("73%") for homes whose Lden actually
+    // exceeded the guideline.
+    const ldenVal = Number(kf.lden);
+    if (timeValid && Number.isFinite(ldenVal)) {
+        const excess = ldenVal - 53;
+        cards.push(card(
+            (excess > 0 ? '+' : '') + fmt(excess, 1), 'dB',
+            excess > 0 ? 'Above health guideline' : 'Below health guideline',
+            `24-hour weighted average (Lden) ${fmt(ldenVal, 1)} dB vs the WHO guideline of 53 dB`,
+            excess <= 0 ? 'metric-ok' : (excess < 5 ? 'metric-warn' : 'metric-danger')));
     }
 
     if (timeValid && Number.isFinite(Number(kf.quietest_hour))) {
@@ -1287,15 +1295,39 @@ function displayExecutiveSummary(statistics) {
     const laeqDay    = Number(envFirst?.LAeq_day   ?? NaN);
     const laeqNight  = Number(envFirst?.LAeq_night ?? NaN);
 
-    // Concern level based on WHO 2018 thresholds
-    let level = 'LOW', levelBg = '#f0fdf4', levelFg = '#166534', levelBdr = '#86efac';
-    if (Number.isFinite(lden) && lden > 53) {
-        level = 'HIGH'; levelBg = '#fef2f2'; levelFg = '#991b1b'; levelBdr = '#fca5a5';
-    } else if (Number.isFinite(lnight) && lnight > 45) {
-        level = 'HIGH'; levelBg = '#fef2f2'; levelFg = '#991b1b'; levelBdr = '#fca5a5';
-    } else if (Number.isFinite(laeq) && laeq > 55) {
-        level = 'MODERATE'; levelBg = '#fffbeb'; levelFg = '#92400e'; levelBdr = '#fcd34d';
+    // Concern level from WHO 2018 thresholds, graduated to match the report.
+    //
+    // 'LOW' must NOT be the default. Lden and Lnight are absent whenever the
+    // timestamps could not be read (the server strips them rather than publish a
+    // fabricated timeline), and the previous default rendered a reassuring "LOW"
+    // verdict in exactly that case — a conclusion drawn from no evidence, and a
+    // false negative in the direction that matters most.
+    const THEME = {
+        SERIOUS:  { bg: '#fef2f2', fg: '#7f1d1d', bdr: '#f87171' },
+        HIGH:     { bg: '#fef2f2', fg: '#991b1b', bdr: '#fca5a5' },
+        MODERATE: { bg: '#fffbeb', fg: '#92400e', bdr: '#fcd34d' },
+        LOW:      { bg: '#f0fdf4', fg: '#166534', bdr: '#86efac' },
+        'NOT ASSESSABLE': { bg: '#f1f5f9', fg: '#475569', bdr: '#cbd5e1' },
+    };
+
+    let level;
+    const haveGuidelineMetrics = Number.isFinite(lden) || Number.isFinite(lnight);
+    if (!haveGuidelineMetrics) {
+        // LAeq cannot stand in: Lden applies +5 dB evening and +10 dB night
+        // penalties, so it is always higher — judging by LAeq produces false passes.
+        level = 'NOT ASSESSABLE';
+    } else {
+        const ldenExcess   = Number.isFinite(lden)   ? lden - 53   : -Infinity;
+        const lnightExcess = Number.isFinite(lnight) ? lnight - 45 : -Infinity;
+        const worst = Math.max(ldenExcess, lnightExcess);
+        if (worst >= 10)      level = 'SERIOUS';
+        else if (worst >= 5)  level = 'HIGH';
+        else if (worst > 0)   level = 'HIGH';
+        else if (Number.isFinite(lnight) && lnight > 40) level = 'MODERATE';  // WHO NNG 2009 LOAEL
+        else level = 'LOW';
     }
+    const _t = THEME[level] || THEME.LOW;
+    const levelBg = _t.bg, levelFg = _t.fg, levelBdr = _t.bdr;
 
     function metricRow(label, val, limit, unit = 'dB(A)') {
         if (!Number.isFinite(val)) return '';
@@ -1336,7 +1368,7 @@ function displayExecutiveSummary(statistics) {
                 </tr>
             </thead>
             <tbody>
-                ${metricRow('LAeq — 24-hr Energy Average', laeq, NaN)}
+                ${metricRow('LAeq — Whole-record Energy Average', laeq, NaN)}
                 ${metricRow('Lden — Day-Evening-Night Weighted', lden, 53)}
                 ${metricRow('Lnight — Nighttime (23:00–07:00)', lnight, 45)}
                 ${metricRow('LAeq Day (07:00–22:00)', laeqDay, NaN)}
@@ -1810,19 +1842,20 @@ function displayCharts(analysis) {
         plot_bgcolor: '#fafafa',
         paper_bgcolor: 'white',
         shapes: [
-            { type: 'rect', xref: 'paper', yref: 'y', x0: 0, x1: 1, y0: 53, y1: tYMax,
-              fillcolor: 'rgba(239,68,68,0.04)', line: { width: 0 } },
-            { type: 'rect', xref: 'paper', yref: 'y', x0: 0, x1: 1, y0: 45, y1: 53,
-              fillcolor: 'rgba(245,158,11,0.04)', line: { width: 0 } },
+            // Shaded "exceedance" bands removed. The traces here are daily LAeq
+            // values; the 53 and 45 dB lines are the WHO Lden and Lnight guideline
+            // VALUES, which are penalty-weighted long-term averages. Colouring the
+            // area above them made each day read as a pass or fail against a
+            // guideline that does not apply to a single day's LAeq.
             { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 53, y1: 53,
               line: { color: 'rgba(239,68,68,0.65)', width: 1.5, dash: 'dash' } },
             { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 45, y1: 45,
               line: { color: 'rgba(245,158,11,0.65)', width: 1.5, dash: 'dash' } },
         ],
         annotations: [
-            { xref: 'paper', x: 0.01, y: 53, text: 'WHO Lden 53 dB(A)', showarrow: false,
+            { xref: 'paper', x: 0.01, y: 53, text: '53 dB(A) reference', showarrow: false,
               font: { size: 10, color: 'rgba(220,38,38,0.85)' }, xanchor: 'left', yanchor: 'bottom', yshift: 3 },
-            { xref: 'paper', x: 0.01, y: 45, text: 'WHO Lnight 45 dB(A)', showarrow: false,
+            { xref: 'paper', x: 0.01, y: 45, text: '45 dB(A) reference', showarrow: false,
               font: { size: 10, color: 'rgba(180,100,0,0.85)' }, xanchor: 'left', yanchor: 'bottom', yshift: 3 },
         ],
     };
@@ -2139,10 +2172,10 @@ function displayRollingMedianChart() {
         ];
 
         const annotations = [
-            { xref: 'paper', x: 0.99, y: 53, text: 'WHO Lden 53 dB',
+            { xref: 'paper', x: 0.99, y: 53, text: '53 dB reference',
               showarrow: false, font: { size: 10, color: 'rgba(220,38,38,0.85)' },
               xanchor: 'right', yanchor: 'bottom', yshift: 3 },
-            { xref: 'paper', x: 0.99, y: 45, text: 'WHO Lnight 45 dB',
+            { xref: 'paper', x: 0.99, y: 45, text: '45 dB reference',
               showarrow: false, font: { size: 10, color: 'rgba(180,100,0,0.85)' },
               xanchor: 'right', yanchor: 'bottom', yshift: 3 },
         ];
@@ -3130,13 +3163,13 @@ function _renderCompareDiurnalChart(datasets) {
 
     // WHO reference bands
     traces.push({
-        type: 'scatter', mode: 'lines', name: 'WHO Lnight 45 dB',
+        type: 'scatter', mode: 'lines', name: '45 dB reference',
         x: hours, y: Array(24).fill(45),
         line: { color: '#8e44ad', dash: 'dash', width: 1.5 },
         showlegend: true
     });
     traces.push({
-        type: 'scatter', mode: 'lines', name: 'WHO Lden 53 dB',
+        type: 'scatter', mode: 'lines', name: '53 dB reference',
         x: hours, y: Array(24).fill(53),
         line: { color: '#c0392b', dash: 'dot', width: 1.5 },
         showlegend: true

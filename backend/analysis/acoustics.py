@@ -59,6 +59,76 @@ def exceedance_levels_db(levels_db: Iterable[float] | pd.Series | np.ndarray) ->
     }
 
 
+def energy_concentration(levels_db: Iterable[float] | pd.Series | np.ndarray) -> dict | None:
+    """Report how much of the total acoustic energy sits in the loudest samples.
+
+    LAeq is an energy average, so a very small number of very loud samples can
+    dominate it completely. In one test record a SINGLE one-second sample of
+    120 dB(A), out of 86,400, carried 98% of the total energy and moved LAeq from
+    53.5 to 70.7 dB — flipping the reported verdict from "low concern" to
+    "significantly exceeds WHO guidelines". The level was real arithmetic, but a
+    conclusion resting on one unverified sample is not defensible, and nothing in
+    the report disclosed that it did.
+
+    This is also the signature of a sensor artefact: a handling knock, a dropped
+    microphone, or clipping produces exactly one enormous reading. Whether the
+    event is genuine or spurious cannot be settled from level data alone, so the
+    platform's obligation is to surface the dependency rather than resolve it.
+
+    A useful diagnostic is ``LAeq > L5``: because L5 is exceeded 5% of the time,
+    an energy mean above it means the average is being carried by the top few
+    percent of samples.
+
+    Parameters
+    ----------
+    levels_db : array-like
+        Sound levels in dB(A).
+
+    Returns
+    -------
+    dict | None
+        ``laeq``, ``l5``, ``laeq_minus_l5``, ``top1_energy_pct`` (energy share of
+        the single loudest sample), ``top01pct_energy_pct`` (share of the loudest
+        0.1% of samples), ``laeq_excluding_top01pct``, ``n`` and ``dominated``
+        (True when the average is being driven by a handful of samples).
+        None when there are too few finite values.
+    """
+    arr = _to_float_array(levels_db)
+    if arr.size < 20:
+        return None
+
+    energy = np.power(10.0, arr / 10.0)
+    total = float(energy.sum())
+    if total <= 0:
+        return None
+
+    order = np.sort(energy)[::-1]
+    n_top = max(1, int(round(arr.size * 0.001)))     # loudest 0.1%
+    top1_pct = 100.0 * float(order[0]) / total
+    top01_pct = 100.0 * float(order[:n_top].sum()) / total
+
+    cut = np.sort(arr)[::-1][n_top - 1] if n_top <= arr.size else arr.max()
+    remainder = arr[arr < cut]
+    laeq_excl = energetic_mean_db(remainder) if remainder.size else None
+
+    laeq = float(10.0 * math.log10(total / arr.size))
+    l5 = float(np.percentile(arr, 95))
+
+    return {
+        "n": int(arr.size),
+        "laeq": laeq,
+        "l5": l5,
+        "laeq_minus_l5": laeq - l5,
+        "top1_energy_pct": top1_pct,
+        "top01pct_energy_pct": top01_pct,
+        "n_top01pct": int(n_top),
+        "laeq_excluding_top01pct": float(laeq_excl) if laeq_excl is not None else None,
+        # Either a single sample carrying a large share, or an energy mean that
+        # has risen above the level exceeded 5% of the time.
+        "dominated": bool(top1_pct >= 10.0 or (laeq - l5) > 1.0),
+    }
+
+
 @dataclass(frozen=True)
 class DayEveningNightDefinition:
     """Definition for day/evening/night hour ranges.
@@ -150,16 +220,53 @@ def compute_ldn_lden(
     laeq_day_ldn = energetic_mean_db(y[day_mask_ldn])
     laeq_night_ldn = energetic_mean_db(y[night_mask_ldn])
 
-    # Ldn: +10 dB penalty during night hours
-    y_ldn = y.copy()
-    y_ldn.loc[night_mask_ldn] = y_ldn.loc[night_mask_ldn] + 10.0
-    ldn = energetic_mean_db(y_ldn)
+    # Ldn and Lden are DURATION-weighted by definition (ISO 1996-1; EU 2002/49/EC
+    # Annex I): each period contributes in proportion to its length in hours, not
+    # in proportion to how many samples happened to land in it.
+    #
+    # Penalising per-sample and energy-averaging the pooled series instead makes
+    # the result depend on sample density. A record that starts mid-morning and
+    # ends mid-evening over-represents daytime, biasing Ldn/Lden low — measured at
+    # up to 0.24 dB on partial-day datasets here. Weighting by window duration
+    # removes that dependency and matches the published definition exactly.
+    def _weighted_db(components: list[tuple[float, float | None]]) -> float | None:
+        """Combine (hours, level_dB) pairs into a duration-weighted level.
 
-    # Lden: +5 dB evening, +10 dB night
-    y_lden = y.copy()
-    y_lden.loc[evening_mask] = y_lden.loc[evening_mask] + 5.0
-    y_lden.loc[night_mask_lden] = y_lden.loc[night_mask_lden] + 10.0
-    lden = energetic_mean_db(y_lden)
+        Returns None unless EVERY constituent period has data.
+
+        Renormalising over only the periods present was unsafe. A night-only
+        record has no day and no evening samples at all, yet renormalisation
+        still produced an Lden — structurally just Lnight plus its penalty —
+        which the report then declared "within the WHO guideline of 53 dB". That
+        is a false pass on a metric that could not be computed: the daytime
+        contribution is unknown, not zero, and it can only raise the result.
+
+        Ldn and Lden are defined across the whole 24 hours. If any period is
+        missing the metric is not determined, and the honest output is no value
+        rather than a value that reads as a verdict.
+        """
+        if any(lvl is None for _, lvl in components):
+            return None
+        total_hours = sum(h for h, _ in components)
+        if total_hours <= 0:
+            return None
+        energy = sum(h * (10.0 ** (lvl / 10.0)) for h, lvl in components)
+        if energy <= 0:
+            return None
+        return 10.0 * math.log10(energy / total_hours)
+
+    # Ldn: 15 h day (07-22) + 9 h night (22-07) with a +10 dB night penalty.
+    ldn = _weighted_db([
+        (15.0, laeq_day_ldn),
+        (9.0, (laeq_night_ldn + 10.0) if laeq_night_ldn is not None else None),
+    ])
+
+    # Lden: 12 h day (07-19) + 4 h evening (19-23, +5 dB) + 8 h night (23-07, +10 dB).
+    lden = _weighted_db([
+        (12.0, laeq_day_lden),
+        (4.0, (laeq_evening_lden + 5.0) if laeq_evening_lden is not None else None),
+        (8.0, (laeq_night_lden + 10.0) if laeq_night_lden is not None else None),
+    ])
 
     out: dict[str, float] = {}
     if laeq_24h is not None:
@@ -179,14 +286,21 @@ def compute_ldn_lden(
         out["LAeq_night_lden"] = float(laeq_night_lden)
         out["Lnight"] = float(laeq_night_lden)
 
-    # Backward-compatible aliases used by older UI/report code.
-    # These refer to the Lden/Lnight (23:00–07:00) night window.
-    if laeq_day_lden is not None:
-        out["LAeq_day"] = float(laeq_day_lden)
+    # ``LAeq_day`` / ``LAeq_night`` are the generic day/night averages consumed by
+    # the narrative text and by the Maryland COMAR compliance rows, both of which
+    # DOCUMENT them as 07:00–22:00 and 22:00–07:00. They must therefore carry the
+    # **Ldn** windows.
+    #
+    # These previously aliased the Lden windows (07:00–19:00 / 23:00–07:00), so the
+    # report printed "Daytime levels (07:00-22:00) averaged X" where X was actually
+    # the 07:00–19:00 figure, and compared a 23:00–07:00 average against COMAR's
+    # 22:00–07:00 legal limit. Use ``LAeq_*_lden`` explicitly for Lden components.
+    if laeq_day_ldn is not None:
+        out["LAeq_day"] = float(laeq_day_ldn)
     if laeq_evening_lden is not None:
         out["LAeq_evening"] = float(laeq_evening_lden)
-    if laeq_night_lden is not None:
-        out["LAeq_night"] = float(laeq_night_lden)
+    if laeq_night_ldn is not None:
+        out["LAeq_night"] = float(laeq_night_ldn)
     if ldn is not None:
         out["Ldn"] = float(ldn)
     if lden is not None:

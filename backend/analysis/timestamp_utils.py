@@ -210,10 +210,80 @@ def assess_timestamp_integrity(
     )
 
 
-def primary_time_column(df: pd.DataFrame) -> str | None:
-    """Return the most likely timestamp column name, or None."""
-    for c in df.columns:
+# Column-name preference, most authoritative first. A reconstructed absolute
+# timeline is always written to 'Timestamp', so it must outrank the raw source
+# column it was derived from — that raw column may still hold unparseable text
+# (e.g. a bare 'MM:SS.s' clock) even after recovery succeeded.
+_TIME_COL_PRIORITY = ("timestamp", "datetime", "date_time", "date", "time")
+
+
+def resolve_time_column(df: pd.DataFrame) -> str | None:
+    """Return the single authoritative timestamp column for ``df``.
+
+    Every module must use this one resolver. Selecting "the first column whose
+    name mentions time" is unsafe: ingestion appends the *reconstructed* absolute
+    timeline as ``Timestamp`` at the END of the frame, so a positional pick would
+    return the raw, possibly-unparseable source column instead and silently
+    compute Lden/Lnight/diurnal metrics on a different timeline than the rest of
+    the report.
+
+    Selection order:
+      1. Exact ``Timestamp`` / ``DateTime`` (case-insensitive) — reconstructed or
+         canonical columns.
+      2. Any datetime64-typed column.
+      3. Name-priority match (``timestamp`` > ``datetime`` > ``date`` > ``time``).
+      4. Among equal-priority candidates, the one that actually parses best.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Frame to inspect.
+
+    Returns
+    -------
+    str | None
+        Column name, or None when the frame carries no time-like column.
+    """
+    if df is None or len(df.columns) == 0:
+        return None
+
+    cols = list(df.columns)
+
+    # 1. Canonical reconstructed column wins outright.
+    for want in ("timestamp", "datetime"):
+        for c in cols:
+            if str(c).strip().lower() == want:
+                return c
+
+    # 2. A real datetime64 column beats any string column.
+    datetime_cols = [c for c in cols if pd.api.types.is_datetime64_any_dtype(df[c])]
+    if datetime_cols:
+        return datetime_cols[0]
+
+    # 3/4. Name priority, tie-broken by how well the column actually parses.
+    candidates: list[tuple[int, float, str]] = []
+    for c in cols:
         cl = str(c).lower()
-        if any(t in cl for t in ("timestamp", "datetime", "date", "time")):
-            return c
-    return None
+        for rank, token in enumerate(_TIME_COL_PRIORITY):
+            if token in cl:
+                try:
+                    parsed, _ = parse_timestamps_robust(df[c].head(2000))
+                    score = float(parsed.notna().mean())
+                except Exception:
+                    score = 0.0
+                candidates.append((rank, -score, str(c)))
+                break
+
+    if not candidates:
+        return None
+    candidates.sort()
+    best = candidates[0][2]
+    return next(c for c in cols if str(c) == best)
+
+
+def primary_time_column(df: pd.DataFrame) -> str | None:
+    """Deprecated alias — use :func:`resolve_time_column`.
+
+    Retained so external callers keep working; delegates to the safe resolver.
+    """
+    return resolve_time_column(df)

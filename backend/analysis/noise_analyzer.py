@@ -1,8 +1,11 @@
+import logging
 import pandas as pd
 import numpy as np
 from scipy import stats
 from datetime import datetime
 import json
+
+logger = logging.getLogger(__name__)
 
 from analysis.acoustics import compute_ldn_lden, energetic_mean_db, exceedance_levels_db
 from analysis.standards_reference import who_2018_environmental_noise_guideline_levels
@@ -33,9 +36,8 @@ class NoiseAnalyzer:
         need it, so we memoize the result on the instance.
         """
         if time_col is None:
-            cands = [c for c in self.df.columns
-                     if any(t in c.lower() for t in ['timestamp', 'datetime', 'time', 'date'])]
-            time_col = cands[0] if cands else None
+            from analysis.timestamp_utils import resolve_time_column
+            time_col = resolve_time_column(self.df)
         if time_col is None:
             return pd.Series(dtype='datetime64[ns]')
         if self._ts_cache is not None and self._ts_cache_col == time_col:
@@ -113,11 +115,23 @@ class NoiseAnalyzer:
         for col in self.noise_columns:
             self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
         
-        # Remove rows with NaN values
+        # Drop only rows where EVERY noise column is missing. Dropping a row when
+        # ANY column was NaN meant a single gap in, say, L-Max also deleted the
+        # perfectly valid LEQ sample on that row — silently discarding good
+        # measurements and biasing every downstream metric.
+        # Per-column NaNs are handled at each computation via .dropna().
         initial_rows = len(self.df)
-        self.df = self.df.dropna(subset=self.noise_columns)
-        if len(self.df) < initial_rows:
-            print(f"Removed {initial_rows - len(self.df)} rows with missing values")
+        self.df = self.df.dropna(subset=self.noise_columns, how='all')
+        self.rows_dropped = int(initial_rows - len(self.df))
+        self.dropped_per_column = {
+            col: int(pd.to_numeric(self.df[col], errors='coerce').isna().sum())
+            for col in self.noise_columns
+        }
+        if self.rows_dropped:
+            logger.warning(
+                "Dropped %d row(s) with no usable measurement in any noise column "
+                "(of %d total).", self.rows_dropped, initial_rows
+            )
 
         # It's possible that a dataset contains candidate columns that are non-numeric
         # or fully missing after coercion; don't proceed with an empty cleaned frame.
@@ -156,11 +170,10 @@ class NoiseAnalyzer:
     
     def _get_measurement_period(self):
         """Try to identify the measurement period"""
-        # Look for time/date columns
-        time_cols = [col for col in self.df.columns if any(term in col.lower() for term in ['time', 'date', 'timestamp', 'datetime'])]
-        
-        if time_cols:
-            time_col = time_cols[0]
+        from analysis.timestamp_utils import resolve_time_column
+        time_col = resolve_time_column(self.df)
+
+        if time_col:
             try:
                 ts = self._parsed_timestamps(time_col)
                 ts = ts.dropna()
@@ -248,14 +261,11 @@ class NoiseAnalyzer:
         Adds LAeq_day/LAeq_night and penalty-based Ldn/Lden.
         """
         # Find a usable timestamp column.
-        time_cols = [
-            col for col in self.df.columns
-            if any(term in col.lower() for term in ['timestamp', 'datetime', 'time', 'date'])
-        ]
-        if not time_cols:
+        from analysis.timestamp_utils import resolve_time_column
+        time_col = resolve_time_column(self.df)
+        if not time_col:
             return {}
 
-        time_col = time_cols[0]
         ts = self._parsed_timestamps(time_col)
         if ts.notna().sum() == 0:
             return {}
@@ -307,12 +317,22 @@ class NoiseAnalyzer:
             from scipy.signal import find_peaks
             peaks, properties = find_peaks(data.values, prominence=data.std())
             
+            # Rank by magnitude. Slicing peaks[-5:] returned the last five peaks
+            # in time order, not the loudest five, while labelling them "Top 5".
+            peak_levels = data.iloc[peaks] if len(peaks) else data.iloc[[]]
+            top5 = sorted((round(float(v), 2) for v in peak_levels), reverse=True)[:5]
+            top_decile = data[data > data.quantile(0.9)]
+
             peaks_dict[col] = {
                 'number_of_peaks': int(len(peaks)),
-                'peak_values': [round(float(data.iloc[p]), 2) for p in peaks[-5:]],  # Top 5 peaks
-                'average_peak': round(float(energetic_mean_db(data[data > data.quantile(0.9)]) or data[data > data.quantile(0.9)].mean()), 2),
+                'peak_values_top5_by_level': top5,
+                'last5_peaks_chronological': [round(float(data.iloc[p]), 2) for p in peaks[-5:]],
+                # Energy average of the loudest decile of samples.
+                'average_top_decile_db': round(
+                    float(energetic_mean_db(top_decile) or (top_decile.mean() if len(top_decile) else float('nan'))), 2
+                ) if len(top_decile) else None,
                 'max_peak': round(float(data.max()), 2),
-                'peak_frequency': round(float(len(peaks) / len(data)) * 1000, 2)  # Peaks per 1000 measurements
+                'peaks_per_1000_samples': round(float(len(peaks) / len(data)) * 1000, 2),
             }
         
         return peaks_dict
@@ -321,19 +341,26 @@ class NoiseAnalyzer:
         """Analyze temporal patterns if time data exists"""
         analysis = {}
         
-        time_cols = [col for col in self.df.columns if any(term in col.lower() for term in ['time', 'date', 'timestamp', 'datetime'])]
-        
-        if not time_cols or not self.noise_columns:
+        from analysis.timestamp_utils import resolve_time_column
+        time_col = resolve_time_column(self.df)
+
+        if not time_col or not self.noise_columns:
             return {'status': 'No time data available'}
-        
+
         try:
-            time_col = time_cols[0]
-            self.df[time_col] = pd.to_datetime(self.df[time_col], errors='coerce')
-            
+            # Use the memoized robust parse. Never re-parse with a naive
+            # pd.to_datetime here, and never write back into self.df — an
+            # in-place coercion would silently replace the raw column with a
+            # differently-parsed timeline for every method that runs after this.
+            ts_parsed = self._parsed_timestamps(time_col)
+
             for noise_col in self.noise_columns:
                 # Calculate hourly averages if possible
-                test_df = self.df[[time_col, noise_col]].dropna()
-                test_df = test_df.set_index(time_col)
+                test_df = pd.DataFrame({
+                    '_ts': ts_parsed,
+                    noise_col: self.df[noise_col],
+                }).dropna()
+                test_df = test_df.set_index('_ts')
                 
                 hourly = test_df.resample('h').agg({noise_col: ['mean', 'std', 'min', 'max', 'count']})
                 
@@ -473,13 +500,11 @@ class NoiseAnalyzer:
         leq_cols = set(_leq_columns())
 
         # Attempt to compute environmental metrics once (timestamps required).
+        from analysis.timestamp_utils import resolve_time_column
         env_metrics_by_col: dict[str, dict[str, float]] = {}
-        time_cols = [
-            c for c in self.df.columns
-            if any(term in c.lower() for term in ["timestamp", "datetime", "time", "date"])
-        ]
-        if time_cols:
-            time_col = time_cols[0]
+        time_col = resolve_time_column(self.df)
+        ts = pd.Series(dtype='datetime64[ns]')
+        if time_col:
             ts = self._parsed_timestamps(time_col)
             if ts.notna().sum() > 0:
                 # Only compute Lden/Lnight metrics for LEQ-like columns.
@@ -551,7 +576,7 @@ class NoiseAnalyzer:
 
             # Single-event sleep disturbance (LAmax) should come from L-Max streams.
             # This is not a WHO 2018 Lden/Lnight guideline comparison.
-            if time_cols and _is_lmax(col):
+            if time_col and ts.notna().any() and _is_lmax(col):
                 try:
                     y = pd.to_numeric(self.df[col], errors="coerce")
                     h = ts.dt.hour

@@ -123,10 +123,9 @@ class AdvancedChartGenerator:
         return scored[0][2]
     
     def _identify_time_column(self):
-        """Identify the time/date column"""
-        time_cols = [col for col in self.df.columns if any(term in col.lower() 
-                     for term in ['time', 'date', 'timestamp', 'datetime'])]
-        return time_cols[0] if time_cols else None
+        """Identify the time/date column via the shared authoritative resolver."""
+        from analysis.timestamp_utils import resolve_time_column
+        return resolve_time_column(self.df)
     
     def _prepare_data(self):
         """Prepare and clean data"""
@@ -135,7 +134,10 @@ class AdvancedChartGenerator:
 
         self.time_col = self._ensure_datetime_column()
         if self.time_col and self.time_col in self.df.columns:
-            self.df[self.time_col] = pd.to_datetime(self.df[self.time_col], errors='coerce')
+            # Robust parse: charts must sit on the SAME timeline as the tables
+            # and the narrative, or a figure will disagree with the text beside it.
+            from analysis.timestamp_utils import parse_timestamps_robust
+            self.df[self.time_col], _ = parse_timestamps_robust(self.df[self.time_col])
 
     def _generate_date_hour_heatmap(self, df, noise_col, title):
         """Internal helper to build a Date (X) × Hour (Y) heatmap.

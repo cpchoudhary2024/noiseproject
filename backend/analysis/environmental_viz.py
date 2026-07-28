@@ -40,13 +40,12 @@ class EnvironmentalVisualizationEngine:
         self._prepare_temporal_features()
     
     def _identify_time_column(self):
-        """Identify datetime column"""
-        datetime_cols = [c for c in self.df.columns 
-                        if any(k in c.lower() for k in ['datetime', 'timestamp', 'time'])]
-        self.time_col = datetime_cols[0] if datetime_cols else None
-        
+        """Identify datetime column via the shared authoritative resolver."""
+        from analysis.timestamp_utils import resolve_time_column, parse_timestamps_robust
+        self.time_col = resolve_time_column(self.df)
+
         if self.time_col:
-            self.df[self.time_col] = pd.to_datetime(self.df[self.time_col], errors='coerce')
+            self.df[self.time_col], _ = parse_timestamps_robust(self.df[self.time_col])
     
     def _prepare_temporal_features(self):
         """Add temporal features for analysis"""
@@ -662,9 +661,16 @@ class EnvironmentalVisualizationEngine:
         upper = data['rolling_mean'] + (threshold_std * data['rolling_std'])
         lower = data['rolling_mean'] - (threshold_std * data['rolling_std'])
         
+        # Build the closed band from plain lists.
+        #
+        # ``reversed(series)`` iterates a pandas Series by LABEL, not position.
+        # After the dropna() above the index has gaps, so reversing raised
+        # KeyError on the first missing label and the endpoint returned HTTP 500
+        # for any file containing a gap. Convert to lists first, then reverse.
+        x_fwd = data[self.time_col].tolist()
         fig.add_trace(go.Scatter(
-            x=list(data[self.time_col]) + list(reversed(data[self.time_col])),
-            y=list(upper) + list(reversed(lower)),
+            x=x_fwd + x_fwd[::-1],
+            y=upper.tolist() + lower.tolist()[::-1],
             fill='toself',
             fillcolor='rgba(0, 255, 0, 0.2)',
             line=dict(color='rgba(0,0,0,0)'),

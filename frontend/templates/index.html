@@ -370,7 +370,7 @@
                             <div class="chart-explainer">
                                 <strong>What it is:</strong> The energy-average LAeq for each hour of the day (00:00–23:00), averaged across all monitoring days in the dataset, with the WHO night window (23:00–07:00) shaded and WHO 2018 road-traffic reference lines (53 dB Lden, 45 dB Lnight).
                                 <strong>How it is calculated:</strong> Each hourly point is the logarithmic energy average (LAeq) of all measurements taken during that hour across every recording day — not a simple arithmetic mean.
-                                <strong>How to read it:</strong> Morning peaks (06:00–09:00) and evening peaks (17:00–20:00) typically correspond to commuter traffic. Where the line enters the shaded night band above 45 dB (WHO Lnight limit), nighttime noise is capable of causing sleep disturbance. The filled area shows the overall acoustic load profile throughout the day.
+                                <strong>How to read it:</strong> Peaks show the hours at which levels are consistently highest; what produces them cannot be determined from level data alone. The 45 dB line is drawn for orientation and is the WHO Lnight guideline value, which applies to the average across the whole 23:00–07:00 period rather than to any single hour. The filled area shows the level profile across the day.
                             </div>
                         </div>
 
@@ -386,7 +386,7 @@
                             <div class="chart-explainer">
                                 <strong>What it is:</strong> Statistical spread of LEQ noise levels for each clock hour (00:00–23:00), pooled across all measurement days in the dataset.
                                 <strong>How it is calculated:</strong> The box spans the interquartile range (IQR: 25th–75th percentile); the centre line is the median (L50); whiskers extend to 1.5 × IQR; individual dots beyond whiskers are statistical outliers (e.g., isolated events such as sirens).
-                                <strong>How to read it:</strong> A tall box at a given hour means noise is unpredictable and highly variable — a health concern. A consistently high median in the 23:00–07:00 band indicates chronic nighttime disturbance above WHO Lnight 45 dB. Short, low boxes denote acoustically stable, quiet periods.
+                                <strong>How to read it:</strong> A tall box at a given hour means levels at that hour vary widely between days; a short box means they are consistent. The line inside each box is the median and the box spans the interquartile range (IQR), the middle 50% of readings. A consistently high median through 23:00–07:00 indicates raised night levels; whether the WHO Lnight guideline is met is determined in the Compliance section, which evaluates the night-period average rather than individual hours.
                             </div>
                         </div>
 
@@ -422,16 +422,16 @@
                         <!-- Daily Acoustic Trend Chart -->
                         <div class="chart-section">
                             <div class="chart-section-header">
-                                <h4>Daily Acoustic Trend — 24-hr LAeq &amp; Nighttime LAeq vs. WHO Limits</h4>
+                                <h4>Daily Acoustic Trend — 24-hr LAeq &amp; Nighttime LAeq</h4>
                                 <button class="btn-chart-dl" onclick="downloadChartImage('timeSeriesChart', 'Daily_Acoustic_Trend')">
                                     <i class="fas fa-download"></i> Download PNG
                                 </button>
                             </div>
                             <div id="timeSeriesChart" class="chart-box" style="min-height: 460px;"></div>
                             <div class="chart-explainer">
-                                <strong>What it is:</strong> Day-by-day acoustic trend showing the 24-hr energy-average LAeq and the nighttime LAeq (22:00–07:00) for each calendar day in the monitoring period, plotted against WHO 2018 road traffic reference levels (Lden 53 dB, Lnight 45 dB).
+                                <strong>What it is:</strong> Day-by-day acoustic trend showing the 24-hr energy-average LAeq and the nighttime LAeq (22:00–07:00) for each calendar day in the monitoring period. The dashed 53 dB and 45 dB lines are drawn for visual orientation only: they are the WHO 2018 Lden and Lnight guideline values, and those guidelines apply to penalty-weighted long-term averages, not to a single day's LAeq. A day's trace rising above a line is therefore not an exceedance — the compliance verdict is given in the Compliance section, which evaluates Lden and Lnight directly.
                                 <strong>How it is calculated:</strong> Each daily point is the logarithmic energy average (LAeq) of all measurements within that calendar day. Nighttime points use only samples between 22:00–07:00. WHO reference lines are drawn at 53 dB(A) (Lden limit) and 45 dB(A) (Lnight limit).
-                                <strong>How to read it:</strong> Points above the red dotted line indicate days where daytime acoustic load exceeds the WHO Lden threshold. Points above the amber dotted line indicate nights with significant nighttime noise. Days where both lines are exceeded represent the highest health-risk periods in the dataset.
+                                <strong>How to read it:</strong> Compare days against each other to find the loudest and quietest in the record, and compare the two traces to see how far each day's level falls after dark. The dashed lines are fixed reference levels, not per-day limits: a point above one is a louder day, not a guideline exceedance.
                             </div>
                         </div>
                     </div>

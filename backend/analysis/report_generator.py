@@ -191,12 +191,9 @@ class ReportGenerator:
         def _norm(name: str) -> str:
             return "".join(ch for ch in (name or "").lower() if ch.isalnum())
 
-        # Timestamp
-        ts_candidates = [
-            c for c in self.df.columns
-            if any(t in c.lower() for t in ["timestamp", "datetime", "date", "time"])
-        ]
-        ts_col = ts_candidates[0] if ts_candidates else None
+        # Timestamp — single authoritative resolver (never positional).
+        from analysis.timestamp_utils import resolve_time_column
+        ts_col = resolve_time_column(self.df)
 
         # Noise columns: reuse analyzer detection but keep stable ordering.
         noise_cols = list(self.analyzer.noise_columns)
@@ -231,7 +228,8 @@ class ReportGenerator:
 
     def _get_timestamp_series(self, ts_col: str | None) -> pd.Series:
         if ts_col and ts_col in self.df.columns:
-            ts = pd.to_datetime(self.df[ts_col], errors="coerce", dayfirst=True, cache=True)
+            from analysis.timestamp_utils import parse_timestamps_robust
+            ts, _ = parse_timestamps_robust(self.df[ts_col])
             if ts.notna().sum() > 0:
                 return ts
         # Fall back to an index-based timeline if none exists.
@@ -485,9 +483,11 @@ class ReportGenerator:
                 fillcolor='rgba(42,157,143,0.15)',
             ))
 
-        # WHO guideline reference lines
-        fig.add_hline(y=53.0, line_dash='dot', line_color='rgba(231,111,81,0.9)', annotation_text='WHO Lden 53', annotation_position='top left')
-        fig.add_hline(y=45.0, line_dash='dot', line_color='rgba(231,111,81,0.6)', annotation_text='WHO Lnight 45', annotation_position='bottom left')
+        # Fixed orientation levels, not per-point limits: the trace is LAeq, while
+        # 53/45 dB are the WHO Lden/Lnight guideline values, which apply to
+        # penalty-weighted long-term averages.
+        fig.add_hline(y=53.0, line_dash='dot', line_color='rgba(231,111,81,0.9)', annotation_text='53 dB reference', annotation_position='top left')
+        fig.add_hline(y=45.0, line_dash='dot', line_color='rgba(231,111,81,0.6)', annotation_text='45 dB reference', annotation_position='bottom left')
 
         fig.update_layout(
             title='Chart 1: Time Series (LEQ with L-Max/L-Min band)',

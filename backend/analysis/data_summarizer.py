@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 import numpy as np
 import re
@@ -6,6 +7,8 @@ import io
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+logger = logging.getLogger(__name__)
 
 
 class DataSummarizer:
@@ -135,10 +138,9 @@ class DataSummarizer:
         return scored[0][2]
     
     def _identify_time_column(self):
-        """Identify the time/date column"""
-        time_cols = [col for col in self.df.columns if any(term in col.lower() 
-                     for term in ['time', 'date', 'timestamp', 'datetime'])]
-        return time_cols[0] if time_cols else None
+        """Identify the time/date column via the shared authoritative resolver."""
+        from analysis.timestamp_utils import resolve_time_column
+        return resolve_time_column(self.df)
     
     def _prepare_data(self):
         """Prepare and clean data"""
@@ -149,41 +151,71 @@ class DataSummarizer:
         # Ensure time column is a real datetime (combine Date+Time if needed).
         self.time_col = self._ensure_datetime_column()
         if self.time_col and self.time_col in self.df.columns:
-            self.df[self.time_col] = pd.to_datetime(self.df[self.time_col], errors='coerce')
+            # Robust parse — a naive to_datetime here silently produced a THIRD
+            # timeline (different from the analyzer's and the report's) whenever
+            # the source used day-first or year-first slash dates.
+            from analysis.timestamp_utils import parse_timestamps_robust
+            self.df[self.time_col], _ = parse_timestamps_robust(self.df[self.time_col])
     
-    def fill_missing_values(self, method='interpolate'):
-        """Fill missing values intelligently
-        
-        Methods:
-        - 'interpolate': Linear interpolation
-        - 'forward_fill': Forward fill
-        - 'mean': Fill with column mean
-        - 'combined': Interpolation with mean fallback
+    def fill_missing_values(self, method='none'):
+        """Return the frame WITHOUT fabricating measurements (default).
+
+        This previously interpolated across gaps of unlimited length and then
+        mean-filled whatever remained, so an outage of any duration was replaced
+        by invented dB values that were indistinguishable from real measurements
+        in every exported summary. In a report intended for public or evidentiary
+        use, a measurement that was never taken must not appear as though it was.
+
+        Missing samples are now left as NaN and excluded from each statistic, so
+        an average is computed over the data that actually exists and the sample
+        count reported alongside it reflects real coverage.
+
+        Parameters
+        ----------
+        method : str
+            ``'none'`` (default) returns the data untouched. The interpolating
+            methods are retained only for explicit, caller-driven use — never for
+            report or export paths — and every filled value is recorded in
+            ``df.attrs['imputed_counts']`` so it can be disclosed.
+
+        Returns
+        -------
+        pd.DataFrame
+            Frame with gaps preserved as NaN unless imputation was requested.
         """
         df = self.df.copy()
-        
+        if method in (None, 'none'):
+            return df
+
+        imputed: dict[str, int] = {}
         for col in self.noise_columns:
-            if df[col].isna().sum() == 0:
+            missing = int(df[col].isna().sum())
+            if missing == 0:
                 continue
-            
+            imputed[col] = missing
+
             if method == 'interpolate':
                 df[col] = df[col].interpolate(method='linear', limit_direction='both')
-                df[col] = df[col].fillna(df[col].mean())
             elif method == 'forward_fill':
-                df[col] = df[col].fillna(method='ffill').fillna(method='bfill').fillna(df[col].mean())
+                df[col] = df[col].ffill().bfill()
             elif method == 'mean':
                 df[col] = df[col].fillna(df[col].mean())
             elif method == 'combined':
-                # First try interpolation, then forward fill, then mean
                 df[col] = df[col].interpolate(method='linear', limit_direction='both')
-                df[col] = df[col].fillna(method='ffill').fillna(method='bfill')
-                df[col] = df[col].fillna(df[col].mean())
-        
+                df[col] = df[col].ffill().bfill()
+
+        if imputed:
+            df.attrs['imputed_counts'] = imputed
+            logger.warning(
+                "fill_missing_values(method=%r) synthesised values for: %s. "
+                "These are NOT measurements and must be disclosed wherever used.",
+                method, imputed,
+            )
         return df
     
     def generate_hourly_summary(self):
         """Generate hourly summary with statistics"""
-        df = self.fill_missing_values(method='combined')
+        df = self.fill_missing_values(method='none')
         
         if not self.time_col:
             return None
@@ -213,7 +245,7 @@ class DataSummarizer:
         Output columns match the UI requirement:
         Date, Average, Emin Leq, Max Leq, Std Dev
         """
-        df = self.fill_missing_values(method='combined')
+        df = self.fill_missing_values(method='none')
         
         if not self.time_col:
             return None
@@ -236,7 +268,7 @@ class DataSummarizer:
     
     def generate_weekly_summary(self):
         """Generate weekly comparison summary"""
-        df = self.fill_missing_values(method='combined')
+        df = self.fill_missing_values(method='none')
         
         if not self.time_col:
             return None

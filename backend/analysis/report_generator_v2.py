@@ -1,7 +1,9 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import math
 import os
+import re
 import json
 import plotly.graph_objects as go
 import plotly.express as px
@@ -10,7 +12,8 @@ from analysis.noise_analyzer import NoiseAnalyzer
 from analysis.iso_epa_standards import StandardsAnalyzer
 from analysis.standards_reference import who_2018_environmental_noise_guideline_levels
 from analysis.chart_generator import AdvancedChartGenerator
-from analysis.acoustics import compute_ldn_lden, energetic_mean_db, exceedance_levels_db
+from analysis.acoustics import (compute_ldn_lden, energetic_mean_db,
+                                exceedance_levels_db, energy_concentration)
 from analysis.gap_detector import detect_gaps, gap_report_to_dict, data_completeness_pct, _modal_interval_seconds
 from analysis.compliance_matrix import evaluate_compliance
 import io
@@ -20,6 +23,47 @@ from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
 from xml.sax.saxutils import escape
+
+# ── De-identification ────────────────────────────────────────────────────────
+# Reports from this platform are distributed to residents and regulators, so
+# they fall under human-subjects protection: no resident name, address, or other
+# personal identifier may appear anywhere in them.
+#
+# The realistic leak is not the analysis — it is the FILENAME. Source files
+# routinely carry the participant's name (this project's own raw data sits in
+# directories such as "conv001"), and filenames were rendered verbatim in
+# the dataset-composition line, the merge list, and the provenance block.
+#
+# Identifiers are therefore stripped by default and files referred to positionally.
+# The SHA-256 of each file is retained, which preserves chain of custody — a
+# reader can still verify byte-for-byte which file produced the report — without
+# disclosing who it belongs to.
+
+# Labels that are safe to print: study codes, home letters, device serials.
+_SAFE_LABEL_RE = re.compile(
+    r'^(?:'
+    r'home\s*[A-Z]|'                      # Home A, Home D
+    r'(?:conv|pair|site|loc|dev|unit)\s*[-_]?\d{1,4}|'   # CONV001, SITE-12
+    r'[A-Z]{1,6}[-_]?\d{1,6}|'            # MON-4471, SLM12
+    r'\d{1,6}'                            # bare numeric id
+    r')$',
+    re.IGNORECASE,
+)
+
+
+def is_safe_label(value: str) -> bool:
+    """True when ``value`` is a study code rather than a personal identifier."""
+    v = str(value or '').strip()
+    return bool(v) and bool(_SAFE_LABEL_RE.match(v))
+
+
+def deidentify_label(value: str, fallback: str) -> tuple[str, bool]:
+    """Return ``(label, was_redacted)`` for a user-supplied identifier.
+
+    Study codes pass through unchanged; anything else is replaced by ``fallback``.
+    """
+    return (str(value).strip(), False) if is_safe_label(value) else (fallback, True)
+
 
 class ReportGeneratorV2:
     """
@@ -38,7 +82,8 @@ class ReportGeneratorV2:
     
     def __init__(self, df, filepath, analysis=None, standards=None, daily_summary=None, hourly_summary=None,
                  device_id: str = '', source_files: list | None = None, merge_gap_report: dict | None = None,
-                 custom_section_heading: str = '', custom_section_body: str = '', environment: str = 'outdoor'):
+                 custom_section_heading: str = '', custom_section_body: str = '', environment: str = 'outdoor',
+                 deidentify: bool = True):
         """
         Initialize report generator with ONLY the uploaded data.
         NO external CSV file loading - all summaries computed from df.
@@ -48,8 +93,34 @@ class ReportGeneratorV2:
         """
         self.df = df.copy()
         self.filepath = filepath
-        self.device_id = str(device_id or '').strip()
-        self.source_files = list(source_files or [])
+        self.deidentify = bool(deidentify)
+
+        # Strip personal identifiers ONCE, here, so every render path (PDF, HTML,
+        # DOCX, provenance) is covered and no future section can reintroduce a
+        # raw filename by reading the attribute directly.
+        raw_device_id = str(device_id or '').strip()
+        raw_sources = [str(f) for f in (source_files or [])]
+        self.redactions: list[str] = []
+
+        if self.deidentify:
+            if raw_device_id:
+                label, redacted = deidentify_label(raw_device_id, 'Monitoring location (identifier withheld)')
+                self.device_id = label
+                if redacted:
+                    self.redactions.append('device/location identifier')
+            else:
+                self.device_id = ''
+
+            self.source_files = []
+            for i, name in enumerate(raw_sources, start=1):
+                stem = os.path.splitext(os.path.basename(name))[0]
+                stem = re.sub(r'^\d{8}_\d{6}_', '', stem)   # strip upload prefix
+                self.source_files.append(stem if is_safe_label(stem) else f'Source file {i}')
+            if any(s.startswith('Source file ') for s in self.source_files):
+                self.redactions.append('source file names')
+        else:
+            self.device_id = raw_device_id
+            self.source_files = raw_sources
         self.merge_gap_report = merge_gap_report  # pre-computed gap dict from the merge step
         self.custom_section_heading = str(custom_section_heading or '').strip()
         self.custom_section_body = str(custom_section_body or '').strip()
@@ -104,6 +175,14 @@ class ReportGeneratorV2:
         duration_label: str = '',
         data_completeness_pct: float | None = None,
         n_days: int = 0,
+        n_gaps: int = 0,
+        total_gap_hours: float | None = None,
+        environment: str = 'outdoor',
+        truncation_warning: bool = False,
+        timestamps_unusable: bool = False,
+        lamax: float | None = None,
+        logging_interval_s: float | None = None,
+        energy_dominance: dict | None = None,
     ) -> str:
         """
         Returns a structured multi-paragraph plain-English summary.
@@ -126,6 +205,18 @@ class ReportGeneratorV2:
             except Exception:
                 return None
 
+        # Describe the LEQ averaging interval in words, so a peak attributed to
+        # the LEQ stream says what it is the average of.
+        _int_s = _v(logging_interval_s)
+        if _int_s is None or _int_s <= 0:
+            interval_word = "logged-interval"
+        elif _int_s < 1:
+            interval_word = f"{_int_s:.2f}-second"
+        elif _int_s < 60:
+            interval_word = f"{_int_s:.0f}-second"
+        else:
+            interval_word = f"{_int_s / 60.0:.0f}-minute"
+
         laeq_v = _v(laeq)
         if laeq_v is None:
             return (
@@ -135,6 +226,26 @@ class ReportGeneratorV2:
             )
 
         # ── 1. Opening paragraph ─────────────────────────────────────────────
+        # When the timeline is not real, state that plainly instead of naming
+        # dates that were invented by the parser.
+        if timestamps_unusable:
+            para_ts = (
+                "The date and time information in this file could not be read, so the "
+                "measurement period, the day-by-day breakdown, and every time-dependent "
+                "result (Lden, Ldn, Lnight, the day/night split, the diurnal profile and the "
+                "heatmap) have been withheld rather than estimated. The overall average level "
+                "and the statistical percentiles below remain valid, because they do not "
+                "depend on when each sample was taken. Re-export the file with a full "
+                "'YYYY-MM-DD HH:MM:SS' timestamp column to obtain the full assessment."
+            )
+            level_only = (
+                f"The whole-record energy-average level (LAeq) was {_f(laeq_v)} dB(A)."
+            )
+            parts_u = [para_ts, level_only]
+            if _v(laeq_max) is not None:
+                parts_u.append(f"The highest single recorded level was {_f(_v(laeq_max))} dB(A).")
+            return "\n\n".join(parts_u)
+
         date_ctx = ""
         if start_date and end_date:
             date_ctx = f" from {start_date} to {end_date}"
@@ -144,24 +255,54 @@ class ReportGeneratorV2:
         day_word = (f"{n_days} day{'s' if n_days != 1 else ''}" if n_days > 0
                     else duration_label or "the measurement period")
 
+        # Completeness must never round UP to "100%". A record that is 99.6%
+        # complete contains a real outage (1 hour, in one dataset here); printing
+        # "100%" erases it and, combined with the word "continuous", asserts an
+        # unbroken record that does not exist.
         completeness_note = ""
+        is_continuous = True
         if data_completeness_pct is not None:
             try:
                 cp = float(data_completeness_pct)
-                if cp < 90:
-                    completeness_note = (
-                        f" Data completeness was {cp:.0f}%, meaning gaps exist in the record; "
-                        f"averages may slightly under- or over-estimate true exposure."
-                    )
+                # Floor to 1 dp so 99.96 -> "99.9%", never "100%".
+                cp_shown = math.floor(cp * 10.0) / 10.0
+                if cp_shown >= 100.0:
+                    completeness_note = " The record is complete, with no detected gaps."
                 else:
-                    completeness_note = f" Data completeness was {cp:.0f}%."
+                    is_continuous = False
+                    severity = ("Averages may under- or over-estimate true exposure"
+                                if cp_shown < 90.0 else
+                                "The affected periods are excluded from all averages")
+                    completeness_note = (
+                        f" Data completeness was {cp_shown:.1f}%, so the record contains gaps. "
+                        f"{severity}."
+                    )
             except Exception:
                 pass
 
+        if n_gaps:
+            is_continuous = False
+            _ng = int(n_gaps)
+            gap_detail = (f" {_ng} interruption was detected" if _ng == 1
+                          else f" {_ng} interruptions were detected")
+            if total_gap_hours:
+                gap_detail += f", totalling {float(total_gap_hours):.1f} hours"
+            completeness_note += gap_detail + "."
+
+        # "continuous" is a factual claim about the record, not a figure of
+        # speech — only make it when the data actually support it.
+        monitoring_word = "continuous " if is_continuous else ""
+        placement = "indoor" if str(environment or "outdoor").strip().lower() == "indoor" else "outdoor"
+
         para1 = (
-            f"This dataset covers {day_word} of continuous outdoor noise monitoring{date_ctx}."
+            f"This dataset covers {day_word} of {monitoring_word}{placement} noise monitoring{date_ctx}."
             f"{completeness_note}"
         )
+        if truncation_warning:
+            para1 += (
+                " Note: the source file appears to have been truncated at the spreadsheet row "
+                "limit, so the true monitoring period is longer than the period reported here."
+            )
 
         # ── 2. Noise level paragraph ─────────────────────────────────────────
         # Level labels and analogies from ISO 226 reference levels and
@@ -185,8 +326,12 @@ class ReportGeneratorV2:
             level_label   = "very high"
             level_analogy = "comparable to a construction zone or an expressway at close range"
 
+        # Label the averaging period honestly: this is the energy average over the
+        # WHOLE record, which is rarely 24 hours.
+        period_label = (f"{n_days}-day" if n_days and n_days != 1 else
+                        ("24-hour" if n_days == 1 else "whole-record"))
         level_sentence = (
-            f"The overall 24-hour energy-average level (LAeq) was {_f(laeq_v)} dB(A), "
+            f"The {period_label} energy-average level (LAeq) was {_f(laeq_v)} dB(A), "
             f"placing the acoustic environment in the {level_label} range, {level_analogy}."
         )
 
@@ -198,33 +343,72 @@ class ReportGeneratorV2:
             nv = _v(laeq_night)
             if dv is not None and nv is not None:
                 diff = dv - nv
+                # A sound level meter records level, not source. Statements about
+                # WHAT caused the noise ("traffic-related", "a nocturnal source")
+                # are not supported by the measurement and must not appear in a
+                # report intended for public or evidentiary use. Describe the
+                # measured pattern only.
+                base = (f" Daytime levels (07:00–22:00) averaged {_f(dv)} dB(A) and nighttime "
+                        f"levels (22:00–07:00) averaged {_f(nv)} dB(A).")
                 if diff > 5:
-                    day_night_sentence = (
-                        f" Daytime levels (07:00–22:00) averaged {_f(dv)} dB(A) and nighttime "
-                        f"levels (22:00–07:00) averaged {_f(nv)} dB(A). The {_f(abs(diff))} dB "
-                        f"day-to-night difference is consistent with activity-driven or "
-                        f"traffic-related noise sources."
+                    day_night_sentence = base + (
+                        f" Daytime exceeded nighttime by {_f(abs(diff))} dB, indicating a "
+                        f"pronounced diurnal pattern."
                     )
                 elif diff < -3:
-                    day_night_sentence = (
-                        f" Daytime levels (07:00–22:00) averaged {_f(dv)} dB(A) and nighttime "
-                        f"levels (22:00–07:00) averaged {_f(nv)} dB(A). Nighttime is louder than "
-                        f"daytime by {_f(abs(diff))} dB, which suggests a nocturnal noise source."
+                    day_night_sentence = base + (
+                        f" Nighttime exceeded daytime by {_f(abs(diff))} dB, an inverted diurnal "
+                        f"pattern. Identifying the contributing source requires observations "
+                        f"beyond sound level data alone."
                     )
                 else:
-                    day_night_sentence = (
-                        f" Daytime levels (07:00–22:00) averaged {_f(dv)} dB(A) and nighttime "
-                        f"levels (22:00–07:00) averaged {_f(nv)} dB(A). The similar day and night "
-                        f"readings are consistent with a continuous or steady-state noise source."
+                    day_night_sentence = base + (
+                        f" The two differ by {_f(abs(diff))} dB, indicating a broadly steady "
+                        f"level across the day-night cycle."
                     )
         except Exception:
             pass
 
+        # Name the stream the peak came from. ``laeq_max`` is the maximum of the
+        # LEQ series — itself an average over each logging interval — so calling
+        # it "the highest single recorded level" understates the true peak and
+        # mislabels it. On one 126-day record the LEQ max was 104.0 dB while the
+        # instrument's L-Max stream reached 105.3 dB.
         peak_sentence = ""
-        if _v(laeq_max) is not None:
-            peak_sentence = f" The highest single recorded level was {_f(_v(laeq_max))} dB(A)."
+        lamax_v = _v(lamax)
+        if lamax_v is not None:
+            peak_sentence = (f" The highest single sound level recorded (L-Max) was "
+                             f"{_f(lamax_v)} dB(A).")
+        elif _v(laeq_max) is not None:
+            peak_sentence = (f" The highest {interval_word} average level recorded (LEQ) was "
+                             f"{_f(_v(laeq_max))} dB(A). Instantaneous peaks within those intervals "
+                             f"were higher; an L-Max stream is required to report them.")
 
-        para2 = level_sentence + day_night_sentence + peak_sentence
+        # Disclose when the average rests on a handful of samples. Without this a
+        # single unverified reading can carry the whole verdict silently.
+        dominance_sentence = ""
+        if energy_dominance and energy_dominance.get('dominated'):
+            top1 = energy_dominance.get('top1_energy_pct') or 0.0
+            excl = energy_dominance.get('laeq_excluding_top01pct')
+            n_top = energy_dominance.get('n_top01pct') or 0
+            n_all = energy_dominance.get('n') or 0
+            bits = []
+            if top1 >= 10.0:
+                bits.append(f"the single loudest sample alone accounts for {top1:.0f}% of the "
+                            f"total measured sound energy")
+            if excl is not None and n_all:
+                bits.append(f"excluding the loudest {n_top:,} of {n_all:,} samples, the average "
+                            f"falls to {_f(excl)} dB(A)")
+            detail = "; ".join(bits)
+            dominance_sentence = (
+                f" This average is driven by a small number of very loud samples: {detail}. "
+                f"Energy averaging is dominated by the loudest events, so a brief incident — or a "
+                f"single spurious reading from a knock or from clipping — moves it substantially. "
+                f"The levels above are reported as measured; before relying on them, confirm from "
+                f"the raw record that the loudest events are genuine acoustic events."
+            )
+
+        para2 = level_sentence + day_night_sentence + peak_sentence + dominance_sentence
 
         # ── 3. Variability paragraph ─────────────────────────────────────────
         para3 = ""
@@ -233,32 +417,39 @@ class ReportGeneratorV2:
             l90_v = _v(l90)
             if l10_v is not None and l90_v is not None:
                 spread = l10_v - l90_v
+                # Describe the measured spread; do not name sources the meter
+                # cannot identify (no "passing vehicles", no "heavy machinery").
                 if spread > 20:
                     para3 = (
-                        f"The noise environment was highly variable. Levels exceeded 10% of the "
-                        f"time (L10 = {_f(l10_v)} dB(A)) were {_f(spread)} dB above the quiet-hour "
-                        f"background (L90 = {_f(l90_v)} dB(A)), pointing to frequent loud transient "
-                        f"events such as passing vehicles or heavy machinery."
+                        f"The noise environment was highly variable. The level exceeded 10% of the "
+                        f"time (L10 = {_f(l10_v)} dB(A)) was {_f(spread)} dB above the residual "
+                        f"background level (L90 = {_f(l90_v)} dB(A)), indicating frequent loud "
+                        f"transient events above a much quieter baseline."
                     )
                 elif spread > 12:
                     para3 = (
                         f"The noise environment showed moderate variability "
                         f"(L10 = {_f(l10_v)} dB(A), L90 = {_f(l90_v)} dB(A), spread = {_f(spread)} dB), "
-                        f"suggesting intermittent noise sources alongside a steady background level."
+                        f"indicating intermittent events above a steady residual background level."
                     )
                 else:
                     para3 = (
                         f"The noise environment was relatively stable, with an L10-to-L90 spread "
                         f"of only {_f(spread)} dB (L10 = {_f(l10_v)} dB(A), L90 = {_f(l90_v)} dB(A)), "
-                        f"consistent with a continuous or steady noise source."
+                        f"indicating a largely steady level with few loud transient events."
                     )
         except Exception:
             pass
 
         # ── 4. WHO compliance bullet points ─────────────────────────────────
-        WHO_LDEN_LIMIT   = 53.0   # WHO 2018, Table 1
-        WHO_LNIGHT_LIMIT = 45.0   # WHO 2018, Table 1
-        WHO_LOAEL_NIGHT  = 40.0   # WHO 2018, Section 4.1
+        WHO_LDEN_LIMIT   = 53.0   # WHO 2018, Table 1 (road traffic, Lden)
+        WHO_LNIGHT_LIMIT = 45.0   # WHO 2018, Table 1 (road traffic, Lnight)
+        # 40 dB Lnight,outside is the LOAEL established in the WHO Night Noise
+        # Guidelines for Europe (2009), which WHO 2018 carries forward.
+        WHO_LOAEL_NIGHT  = 40.0
+
+        # Ordered severity so the worst finding wins, rather than the last one.
+        _RANK = {"LOW": 0, "MODERATE": 1, "MODERATE-HIGH": 2, "HIGH": 3, "SERIOUS": 4}
 
         concern_level = "LOW"
         bullets = []
@@ -272,7 +463,15 @@ class ReportGeneratorV2:
                     f"Exceeds the WHO 2018 road-traffic guideline of {WHO_LDEN_LIMIT} dB(A) "
                     f"by {_f(excess)} dB."
                 )
-                concern_level = "HIGH" if excess >= 8 else "MODERATE-HIGH"
+                # Graduated by how far the guideline is exceeded. Previously every
+                # tier here was rewritten to HIGH further down, so a 0.1 dB and a
+                # 15 dB exceedance produced an identical verdict.
+                if excess >= 10:
+                    concern_level = "SERIOUS"
+                elif excess >= 5:
+                    concern_level = "HIGH"
+                else:
+                    concern_level = "MODERATE-HIGH"
             else:
                 bullets.append(
                     f"24-hour weighted average (Lden): {_f(lden_v)} dB(A). "
@@ -284,50 +483,61 @@ class ReportGeneratorV2:
             if lnight_v > WHO_LNIGHT_LIMIT:
                 excess = lnight_v - WHO_LNIGHT_LIMIT
                 bullets.append(
-                    f"Nighttime level (Lnight): {_f(lnight_v)} dB(A). "
+                    f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
                     f"Exceeds the WHO 2018 sleep-protection limit of {WHO_LNIGHT_LIMIT} dB(A) "
                     f"by {_f(excess)} dB."
                 )
-                if concern_level == "LOW":
-                    concern_level = "MODERATE-HIGH"
+                night_tier = ("SERIOUS" if excess >= 10 else
+                              "HIGH" if excess >= 5 else "MODERATE-HIGH")
+                if _RANK.get(night_tier, 0) > _RANK.get(concern_level, 0):
+                    concern_level = night_tier
             elif lnight_v > WHO_LOAEL_NIGHT:
                 bullets.append(
-                    f"Nighttime level (Lnight): {_f(lnight_v)} dB(A). "
+                    f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
                     f"Within the WHO 2018 limit of {WHO_LNIGHT_LIMIT} dB(A) but above the "
                     f"lowest-observed-adverse-effect level (LOAEL) of {WHO_LOAEL_NIGHT} dB(A), "
                     f"at which initial sleep disturbance effects begin."
                 )
-                if concern_level == "LOW":
+                if _RANK.get("MODERATE", 0) > _RANK.get(concern_level, 0):
                     concern_level = "MODERATE"
             else:
                 bullets.append(
-                    f"Nighttime level (Lnight): {_f(lnight_v)} dB(A). "
-                    f"Below the WHO 2018 LOAEL of {WHO_LOAEL_NIGHT} dB(A). "
-                    f"No sleep effects are expected at this level."
+                    f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
+                    f"Below the {WHO_LOAEL_NIGHT} dB(A) lowest-observed-adverse-effect level "
+                    f"(WHO Night Noise Guidelines for Europe, 2009), the level below which WHO "
+                    f"does not identify adverse sleep effects in the general population."
                 )
 
         if not bullets:
+            # No Lden/Lnight available. LAeq is NOT comparable to the WHO limits:
+            # Lden adds +5 dB to evening and +10 dB to night samples, so Lden is
+            # always >= LAeq — often by 3-6 dB on these datasets. Declaring a
+            # record "below the WHO Lden threshold" on the strength of its LAeq
+            # therefore produces false passes. State the limitation instead of
+            # rendering a verdict that the available metric cannot support.
+            note = ("Lden and Lnight could not be computed for this dataset because usable "
+                    "timestamps were unavailable. WHO 2018 guidelines are defined on Lden and "
+                    "Lnight, which apply +5 dB (evening) and +10 dB (night) penalties, so they "
+                    "cannot be inferred from LAeq alone and no compliance verdict is issued here.")
             if laeq_v > 65:
                 concern_level = "HIGH"
                 bullets.append(
-                    f"Average level of {_f(laeq_v)} dB(A) suggests likely exceedance of WHO health "
-                    f"guidelines. Note: Lden/Lnight could not be computed as no timestamp data was available."
+                    f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). This is high enough "
+                    f"that a WHO guideline exceedance is likely once Lden/Lnight are available. {note}"
                 )
-            elif laeq_v > 53:
+            elif laeq_v > WHO_LDEN_LIMIT:
                 concern_level = "MODERATE"
                 bullets.append(
-                    f"Average level of {_f(laeq_v)} dB(A) falls in a range that may exceed WHO Lden "
-                    f"guidelines. Note: Lden/Lnight could not be computed from this dataset."
+                    f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). This already exceeds "
+                    f"the {WHO_LDEN_LIMIT} dB(A) Lden guideline value before any evening or night "
+                    f"penalty is applied, so an exceedance is likely. {note}"
                 )
             else:
-                concern_level = "LOW"
+                concern_level = "MODERATE"
                 bullets.append(
-                    f"Average level of {_f(laeq_v)} dB(A) is below the WHO Lden "
-                    f"threshold of {WHO_LDEN_LIMIT} dB(A)."
+                    f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). {note} "
+                    f"Re-export the file with a full date and time column to obtain a verdict."
                 )
-
-        if concern_level == "MODERATE-HIGH":
-            concern_level = "HIGH"
 
         bullet_lines = "\n".join(f"  • {b}" for b in bullets)
         para4 = f"WHO 2018 Health Guideline Compliance:\n{bullet_lines}"
@@ -501,30 +711,43 @@ class ReportGeneratorV2:
         self._add_section_3_compliance(story, styles, ts=ts, leq_col=leq_col)
         story.append(Spacer(1, 0.2 * inch))
         
-        # Section 4: Single-Event Sleep Disturbance
-        self._add_section_4_sleep_disturbance(story, styles, ts=ts, lmax_col=lmax_col)
-        story.append(Spacer(1, 0.2 * inch))
+        # Sections 4-6 and 8 are entirely date/time-based. With a synthetic index
+        # they would tabulate and plot dates that do not exist — the substituted
+        # index starts at datetime.now(), so a March recording was printed as a
+        # late-July one. Withhold them rather than caveat them.
+        time_based_ok = not getattr(self, 'timestamps_synthetic', False)
+
+        if time_based_ok:
+            # Section 4: Single-Event Sleep Disturbance
+            self._add_section_4_sleep_disturbance(story, styles, ts=ts, lmax_col=lmax_col)
+            story.append(Spacer(1, 0.2 * inch))
 
         # Optional custom section (user-provided notes) — inserted after Section 4
         if self.custom_section_heading or self.custom_section_body:
             self._add_custom_section(story, styles)
             story.append(Spacer(1, 0.2 * inch))
 
-        # Section 5: Daily Summary Matrix
-        self._add_section_5_daily_matrix(story, styles)
-        story.append(PageBreak())
-        
-        # Section 6: Diurnal Hourly Profile
-        self._add_section_6_hourly_profile(story, styles, ts=ts)
-        story.append(Spacer(1, 0.2 * inch))
-        
-        # Section 7: Statistical Profile
+        if time_based_ok:
+            # Section 5: Daily Summary Matrix
+            self._add_section_5_daily_matrix(story, styles)
+            story.append(PageBreak())
+
+            # Section 6: Diurnal Hourly Profile
+            self._add_section_6_hourly_profile(story, styles, ts=ts)
+            story.append(Spacer(1, 0.2 * inch))
+        else:
+            self._add_withheld_time_sections_notice(story, styles)
+            story.append(Spacer(1, 0.2 * inch))
+
+        # Section 7: Statistical Profile — level distribution only, no time
+        # dependence, so it remains valid and is always included.
         self._add_section_7_percentiles(story, styles, leq_col=leq_col)
         story.append(Spacer(1, 0.2 * inch))
-        
-        # Section 8: Advanced Visualizations
-        self._add_section_8_visualizations(story, styles, ts=ts, leq_col=leq_col, lmax_col=lmax_col, lmin_col=lmin_col)
-        story.append(PageBreak())
+
+        if time_based_ok:
+            # Section 8: Advanced Visualizations
+            self._add_section_8_visualizations(story, styles, ts=ts, leq_col=leq_col, lmax_col=lmax_col, lmin_col=lmin_col)
+            story.append(PageBreak())
         
         # Section 9: Methodological Limitations & Disclaimer
         self._add_section_9_disclaimer(story, styles)
@@ -566,10 +789,21 @@ class ReportGeneratorV2:
         exc = exceedance_levels_db(leq_clean.to_numpy()) or {} if not leq_clean.empty else {}
         l90_v = exc.get('L90')
 
-        # Participant-friendly headline numbers
-        WHO_DAY_GUIDELINE = 53.0   # WHO 2018 road-traffic Lden guideline
-        pct_within = (100.0 * float((leq_clean <= WHO_DAY_GUIDELINE).mean())
-                      if not leq_clean.empty else None)
+        # Participant-friendly headline numbers.
+        #
+        # The previous headline card showed the share of individual one-second
+        # samples at or below 53 dB and labelled it "Time within the health
+        # guideline". That is a category error with a misleading direction: 53 dB
+        # is the WHO 2018 **Lden** guideline — a duration-weighted annual average
+        # carrying +5 dB evening and +10 dB night penalties — so it cannot be
+        # evaluated against instantaneous samples. On a home whose Lden of 58.0 dB
+        # exceeds the guideline by 5 dB, that card read "73% within the health
+        # guideline", telling a resident they were largely compliant when they
+        # were not.
+        #
+        # The honest headline is the guideline comparison itself.
+        WHO_LDEN_GUIDELINE = 53.0   # WHO 2018 road-traffic Lden guideline
+        guideline_excess = (float(lden_v) - WHO_LDEN_GUIDELINE) if lden_v is not None else None
 
         # Loudest / quietest hour of day (from the precomputed hourly summary)
         loud_hr = quiet_hr = None
@@ -597,6 +831,12 @@ class ReportGeneratorV2:
             start_date=start_str, end_date=end_str,
             duration_label=self._compute_duration_label(ts),
             data_completeness_pct=completeness, n_days=n_days_v,
+            environment=getattr(self, 'environment', 'outdoor'),
+            truncation_warning=bool(getattr(self.df, 'attrs', {}).get('truncated_at_row_limit')),
+            timestamps_unusable=bool(getattr(self, 'timestamps_synthetic', False)),
+            lamax=self._lamax_value(lmax_col),
+            logging_interval_s=self._logging_interval_s(ts),
+            energy_dominance=energy_concentration(leq_clean),
         )
 
         # Concern level → colour
@@ -702,28 +942,37 @@ class ReportGeneratorV2:
         def _chart_html(fig):
             return (fig.to_html(full_html=False, include_plotlyjs=False) if fig is not None
                     else "<p style='color:#6b7280;font-style:italic'>Chart unavailable — not enough data.</p>")
-        fig_compare = self._fig_compare_to_references(laeq_v)
+        fig_compare = self._fig_compare_to_references(laeq_v, lden=lden_v)
         fig_daily   = self._fig_daily_simple()
         fig_typical = self._fig_typical_day()
 
         # ── Plain-language guidance ──
         health_points, action_points = self._participant_guidance(lden_v, lnight_v, laeq_v)
 
-        # ── Plain within-guideline verdict (uses Lden, the metric the guideline applies to) ──
-        guide_metric = lden_v if (lden_v is not None and np.isfinite(lden_v)) else laeq_v
-        if guide_metric is not None and np.isfinite(guide_metric):
-            if guide_metric <= WHO_DAY_GUIDELINE:
-                verdict_txt = (f"Your overall day-and-night noise level is {guide_metric:.0f} dB, which is "
+        # ── Plain within-guideline verdict ──
+        # Only Lden may be compared against the 53 dB guideline. Falling back to
+        # LAeq produces false passes: Lden applies +5 dB to evening and +10 dB to
+        # night samples, so it is always the higher figure — on these datasets by
+        # 3-6 dB. A home reading LAeq 52 / Lden 57 would have been declared
+        # "within the guideline" while exceeding it by 4 dB.
+        if lden_v is not None and np.isfinite(lden_v):
+            if lden_v <= WHO_LDEN_GUIDELINE:
+                verdict_txt = (f"Your overall day-and-night noise level (Lden) is {lden_v:.0f} dB, which is "
                                f"<strong>within</strong> the World Health Organization health guideline of "
-                               f"{WHO_DAY_GUIDELINE:.0f} dB.")
+                               f"{WHO_LDEN_GUIDELINE:.0f} dB.")
                 verdict_bg, verdict_clr = '#dcfce7', '#166534'
             else:
-                verdict_txt = (f"Your overall day-and-night noise level is {guide_metric:.0f} dB, which is "
-                               f"<strong>{guide_metric - WHO_DAY_GUIDELINE:.0f} dB above</strong> the World Health "
-                               f"Organization health guideline of {WHO_DAY_GUIDELINE:.0f} dB.")
+                verdict_txt = (f"Your overall day-and-night noise level (Lden) is {lden_v:.0f} dB, which is "
+                               f"<strong>{lden_v - WHO_LDEN_GUIDELINE:.0f} dB above</strong> the World Health "
+                               f"Organization health guideline of {WHO_LDEN_GUIDELINE:.0f} dB.")
                 verdict_bg, verdict_clr = '#fee2e2', '#991b1b'
         else:
-            verdict_txt = "An overall guideline comparison could not be computed for this dataset."
+            verdict_txt = (
+                "An overall guideline comparison could not be computed for this dataset. "
+                "The World Health Organization guideline applies to Lden, a day-evening-night "
+                "average that needs readable date and time information; that information could "
+                "not be read from this file, and it cannot be inferred from the average level alone."
+            )
             verdict_bg, verdict_clr = '#f1f5f9', '#475569'
 
         def _keycard(value, unit, label, sub):
@@ -741,8 +990,10 @@ class ReportGeneratorV2:
         # ════════════════════════════════════════════════════════════════════
         # PARTICIPANT-FRIENDLY ASSEMBLY
         # ════════════════════════════════════════════════════════════════════
+        # self.source_files is de-identified in __init__; the single-file fallback
+        # must go through the same guard rather than printing the raw filename.
         source_label = (_esc(", ".join(self.source_files)) if self.source_files
-                        else _esc(os.path.basename(self.filepath)))
+                        else _esc(self._figure_source_label()))
         completeness_str = f"{completeness:.0f}%" if completeness is not None else "N/A"
         place = _esc(self.device_id) if self.device_id else "this location"
 
@@ -758,9 +1009,18 @@ class ReportGeneratorV2:
                      (f"around {quiet_db:.0f} dB" if quiet_db is not None else "")),
             _keycard(loud_txt, "", "Loudest time of day",
                      (f"around {loud_db:.0f} dB" if loud_db is not None else "")),
-            _keycard((f"{pct_within:.0f}" if pct_within is not None else "N/A"), "%",
-                     "Time within the health guideline",
-                     "share of time at or below the WHO 53 dB level"),
+            _keycard(
+                (f"+{guideline_excess:.1f}" if guideline_excess is not None and guideline_excess > 0
+                 else f"{guideline_excess:.1f}" if guideline_excess is not None else "N/A"),
+                " dB",
+                ("Above the health guideline" if guideline_excess is not None and guideline_excess > 0
+                 else "Below the health guideline" if guideline_excess is not None
+                 else "Health guideline comparison"),
+                (f"your 24-hour weighted average (Lden) is {lden_v:.1f} dB against the WHO "
+                 f"guideline of {WHO_LDEN_GUIDELINE:.0f} dB"
+                 if lden_v is not None else
+                 "needs readable date and time information to calculate"),
+            ),
         ])
 
         # Health & action bullet lists
@@ -917,19 +1177,35 @@ class ReportGeneratorV2:
     # PARTICIPANT-FRIENDLY CHART BUILDERS (HTML report)
     # ============================================================
 
-    def _fig_compare_to_references(self, laeq):
-        """Horizontal bar placing the measured average next to everyday sounds."""
-        if laeq is None or not np.isfinite(laeq):
+    def _fig_compare_to_references(self, laeq, lden=None):
+        """Horizontal bar placing the measured level next to everyday sounds.
+
+        The WHO 53 dB bar is drawn only when Lden is available, and the home's
+        bar then shows Lden too. Previously this chart plotted the home's LAeq
+        beside the WHO guideline bar: on a home whose LAeq was 52.8 and whose
+        Lden was 58.0, the two bars rendered at equal length, showing a resident
+        sitting exactly at the guideline when they exceeded it by 5 dB. LAeq
+        omits the +5 dB evening and +10 dB night penalties that Lden applies, so
+        the two are not comparable.
+        """
+        have_lden = lden is not None and np.isfinite(lden)
+        measured = float(lden) if have_lden else (float(laeq) if laeq is not None and np.isfinite(laeq) else None)
+        if measured is None:
             return None
+
         refs = [
             ("Whisper / quiet bedroom", 30.0, '#cbd5e1'),
             ("Library / soft rain", 40.0, '#cbd5e1'),
             ("Normal conversation", 50.0, '#cbd5e1'),
-            ("WHO health guideline", 53.0, '#f59e0b'),
-            ("Your location", float(laeq), '#1e3a5f'),
             ("Busy street traffic", 70.0, '#cbd5e1'),
             ("Power tools (hearing risk)", 85.0, '#cbd5e1'),
         ]
+        if have_lden:
+            refs.append(("WHO health guideline (Lden)", 53.0, '#f59e0b'))
+            refs.append(("Your home (Lden)", measured, '#1e3a5f'))
+        else:
+            # No guideline bar without the metric it is defined on.
+            refs.append(("Your home (average level)", measured, '#1e3a5f'))
         refs.sort(key=lambda r: r[1])
         labels = [r[0] for r in refs]
         values = [r[1] for r in refs]
@@ -944,7 +1220,7 @@ class ReportGeneratorV2:
         ))
         fig.update_layout(
             height=340, margin=dict(l=10, r=60, t=20, b=40),
-            xaxis=dict(title='Noise level (dB)', range=[0, 95], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
+            xaxis=dict(title='Noise level, dB(A)', range=[0, 95], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
             yaxis=dict(automargin=True),
             plot_bgcolor='white', paper_bgcolor='white', showlegend=False,
         )
@@ -978,7 +1254,7 @@ class ReportGeneratorV2:
         fig.update_layout(
             height=360, margin=dict(l=55, r=30, t=30, b=60),
             xaxis=dict(title='Date', automargin=True, gridcolor='rgba(0,0,0,0.06)'),
-            yaxis=dict(title='Average noise (dB)', range=[ymin, ymax], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
+            yaxis=dict(title='Average noise, dB(A)', range=[ymin, ymax], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
             plot_bgcolor='white', paper_bgcolor='white', showlegend=False,
         )
         return fig
@@ -1020,7 +1296,7 @@ class ReportGeneratorV2:
         fig.update_layout(
             height=360, margin=dict(l=55, r=30, t=40, b=60), shapes=shapes,
             xaxis=dict(title='Hour of day', automargin=True, gridcolor='rgba(0,0,0,0.06)'),
-            yaxis=dict(title='Average noise (dB)', range=[ymin, ymax], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
+            yaxis=dict(title='Average noise, dB(A)', range=[ymin, ymax], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
             plot_bgcolor='white', paper_bgcolor='white', showlegend=False,
             annotations=[dict(xref='paper', yref='paper', x=0.01, y=0.98, showarrow=False,
                               text='Shaded = night (11 PM–7 AM)', font=dict(size=11, color='rgba(30,58,95,0.65)'),
@@ -1095,10 +1371,147 @@ class ReportGeneratorV2:
     # SECTION 9: METHODOLOGICAL LIMITATIONS & DISCLAIMER
     # ============================================================
 
+    def _add_withheld_time_sections_notice(self, story, styles):
+        """Explain which sections were withheld because there is no real timeline."""
+        story.append(Paragraph("Sections 4-6 and 8: Withheld", styles['h1']))
+        story.append(Paragraph(
+            "The single-event sleep-disturbance analysis, the daily summary matrix, the diurnal "
+            "hourly profile and the advanced time-based visualisations have all been withheld "
+            "from this report. Each depends on knowing when every sample was recorded, and the "
+            "date and time information in this file could not be read. Presenting them would "
+            "mean tabulating and plotting dates and hours that were generated by the software "
+            "rather than measured by the instrument. "
+            "The overall average level, the statistical percentile profile, and the level "
+            "distribution remain valid and are reported in full, because they do not depend on "
+            "the timing of individual samples. To obtain the complete assessment, re-export the "
+            "source file keeping the full 'YYYY-MM-DD HH:MM:SS' timestamp column.",
+            styles['BodyText']
+        ))
+        story.append(Spacer(1, 0.12 * inch))
+
+    @staticmethod
+    def _file_sha256(path: str) -> str | None:
+        """SHA-256 of the source file, for chain of custody.
+
+        Lets any reader confirm that the file this report was produced from is
+        byte-identical to the file they hold. Returns None if unreadable.
+        """
+        import hashlib
+        try:
+            h = hashlib.sha256()
+            with open(path, 'rb') as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
+
+    def _add_provenance_section(self, story, styles):
+        """Data provenance and chain of custody.
+
+        A report offered as evidence must let a reader establish what was
+        measured, by what instrument, and that the file analysed is the file
+        they hold. Instrument identity and calibration status are NOT recoverable
+        from these logger exports, so rather than omit them silently — which
+        leaves a reader to assume they were verified — they are listed explicitly
+        as not supplied, with the effect that has on the report's standing.
+        """
+        story.append(Paragraph("Data Provenance &amp; Chain of Custody", styles['h2']))
+
+        src = os.path.basename(self.filepath or '')
+        digest = self._file_sha256(self.filepath) if self.filepath else None
+
+        # The filename is the most common carrier of a participant identifier, so
+        # it is withheld under de-identification. The SHA-256 below is what makes
+        # the analysis verifiable — a reader holding the original file can confirm
+        # it is byte-for-byte the file analysed here — and it discloses nothing
+        # about whose home it is.
+        if self.deidentify and not is_safe_label(os.path.splitext(src)[0]):
+            src_label = "Withheld (see SHA-256 below for verification)"
+        else:
+            src_label = src or "Not recorded"
+
+        rows = [
+            ("Source file", src_label),
+            ("SHA-256 of source file", digest or "Not computed"),
+            ("Samples analysed", f"{len(self.df):,}"),
+            ("Device / location identifier", self.device_id or "Not supplied"),
+            ("Sensor placement", self.environment),
+            ("Report generated", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+        ]
+        if self.source_files:
+            rows.insert(1, ("Merged from", f"{len(self.source_files)} file(s): "
+                                           + ", ".join(str(f) for f in self.source_files)))
+
+        for label, value in rows:
+            story.append(Paragraph(f"<b>{escape(label)}:</b> {escape(str(value))}", styles['BodyText']))
+        story.append(Spacer(1, 0.10 * inch))
+
+        if self.deidentify:
+            detail = (" The following were withheld: " + ", ".join(self.redactions) + "."
+                      if self.redactions else "")
+            story.append(Paragraph(
+                "<b>De-identification.</b> This report contains no participant name, address or "
+                "other personal identifier. Files are referred to by position rather than by "
+                f"filename.{escape(detail)} Verification does not depend on those names: the "
+                "SHA-256 digest above identifies the analysed file uniquely, so a reader holding "
+                "the original can confirm it is the file this report was produced from.",
+                styles['BodyText']
+            ))
+            story.append(Spacer(1, 0.10 * inch))
+
+        story.append(Paragraph(
+            "<b>Instrument and calibration.</b> Logger exports do not carry instrument metadata, so "
+            "the following are not recorded in this file and are not reproduced here: instrument "
+            "make, model and serial number; IEC 61672 accuracy class; date of the most recent "
+            "calibration and the certificate reference; microphone height, orientation and distance "
+            "from any reflecting facade; and the weather during the measurement period. "
+            "This is a limitation of the export format, not a statement that the equipment was "
+            "uncalibrated. Where calibration certificates exist they should be cited or attached "
+            "alongside this report, which establishes measurement traceability; the levels here are "
+            "reproducible from the source file independently of that.",
+            styles['BodyText']
+        ))
+        story.append(Spacer(1, 0.12 * inch))
+
     def _add_section_9_disclaimer(self, story, styles):
         """Add Section 9: Methodological Limitations & Disclaimer"""
         story.append(Paragraph("Section 9: Methodological Limitations &amp; Disclaimer", styles['h1']))
         story.append(Spacer(1, 0.15 * inch))
+
+        self._add_provenance_section(story, styles)
+
+        # Averaging period — the most commonly overlooked limitation.
+        story.append(Paragraph("<b>Averaging Period</b>", styles['h2']))
+        story.append(Paragraph(
+            "The WHO 2018 Lden and Lnight guideline values are defined on a LONG-TERM average, "
+            "conventionally a full year. The Lden and Lnight reported here are computed over the "
+            "duration of this measurement only, which is very much shorter. They are therefore an "
+            "indication of conditions during the monitored period, not a determination of "
+            "long-term exposure, and a single unusually quiet or unusually busy week will move "
+            "them. Seasonal variation, weekday/weekend composition and weather during the "
+            "measurement all affect the result. Comparisons against the WHO values in this report "
+            "should be read with that limitation in mind.",
+            styles['BodyText']
+        ))
+        story.append(Spacer(1, 0.12 * inch))
+
+        # Measurement uncertainty.
+        story.append(Paragraph("<b>Measurement Uncertainty</b>", styles['h2']))
+        story.append(Paragraph(
+            "No uncertainty budget is stated in this report, because the instrument class and "
+            "calibration history are not recorded in the data file and so are not available to this "
+            "software; where they are held separately they should accompany this report. "
+            "For context, ISO 1996-2 notes that the combined "
+            "standard uncertainty of an environmental noise measurement is typically of the order of "
+            "1 to 3 dB once instrument tolerance, microphone position, source variability and "
+            "meteorological conditions are accounted for. Differences between values in this report "
+            "smaller than that should not be treated as meaningful, and any comparison close to a "
+            "guideline or limit should be interpreted accordingly rather than as a definitive "
+            "pass or fail.",
+            styles['BodyText']
+        ))
+        story.append(Spacer(1, 0.12 * inch))
 
         # Source Attribution
         story.append(Paragraph("<b>Source Attribution</b>", styles['h2']))
@@ -1201,11 +1614,8 @@ class ReportGeneratorV2:
         def _norm(name: str) -> str:
             return "".join(ch for ch in (name or "").lower() if ch.isalnum())
 
-        ts_candidates = [
-            c for c in self.df.columns
-            if any(t in c.lower() for t in ["timestamp", "datetime", "date", "time"])
-        ]
-        ts_col = ts_candidates[0] if ts_candidates else None
+        from analysis.timestamp_utils import resolve_time_column
+        ts_col = resolve_time_column(self.df)
 
         noise_cols = list(self.analyzer.noise_columns)
 
@@ -1252,6 +1662,40 @@ class ReportGeneratorV2:
         self.timestamps_synthetic = True
         return pd.Series(pd.date_range(start=datetime.now(), periods=len(self.df), freq="s"))
 
+    def _figure_source_label(self) -> str:
+        """Caption text identifying the data behind a figure.
+
+        Chart annotations are rendered into the image, so a raw filename here
+        survives every text-level de-identification check and reaches the reader
+        as pixels. Source files routinely carry a participant's name, so the
+        stem is printed only when it is a study code.
+        """
+        stem = os.path.splitext(os.path.basename(self.filepath or ""))[0]
+        stem = re.sub(r"^\d{8}_\d{6}_", "", stem)
+        if not self.deidentify or is_safe_label(stem):
+            return stem or "not recorded"
+        return self.device_id or "withheld"
+
+    def _lamax_value(self, lmax_col: str | None) -> float | None:
+        """Highest reading in the instrument's L-Max stream, or None if absent.
+
+        LAmax must come from L-Max. The maximum of the LEQ series is the loudest
+        interval *average*, which is always lower than the true peak.
+        """
+        if not lmax_col or lmax_col not in self.df.columns:
+            return None
+        s = pd.to_numeric(self.df[lmax_col], errors='coerce').dropna()
+        return float(s.max()) if not s.empty else None
+
+    @staticmethod
+    def _logging_interval_s(ts: pd.Series) -> float | None:
+        """Modal spacing between samples, in seconds."""
+        try:
+            v = _modal_interval_seconds(pd.to_datetime(ts, errors='coerce').dropna())
+            return float(v) if v and v > 0 else None
+        except Exception:
+            return None
+
     def _get_numeric_series(self, col: str | None) -> pd.Series:
         if not col or col not in self.df.columns:
             return pd.Series(dtype=float)
@@ -1297,7 +1741,7 @@ class ReportGeneratorV2:
             ))
         else:
             story.append(Paragraph(
-                f"<b>Source File:</b> {escape(os.path.basename(self.filepath))}",
+                f"<b>Source File:</b> {escape(self._figure_source_label())}",
                 styles['BodyText']
             ))
 
@@ -1315,8 +1759,19 @@ class ReportGeneratorV2:
             total_days = seconds / (24 * 3600)
             duration = f"{total_days:.2f} days ({hours:.2f} hours)"
 
-        story.append(Paragraph(f"<b>Measurement Date Range:</b> {escape(date_range)}", styles['BodyText']))
-        story.append(Paragraph(f"<b>Total Duration:</b> {escape(duration)}", styles['BodyText']))
+        # A synthetic index carries no real calendar information: it begins at
+        # datetime.now(), so printing it as a "Measurement Date Range" would
+        # attribute the recording to the day the report happened to be run.
+        if getattr(self, 'timestamps_synthetic', False):
+            story.append(Paragraph(
+                "<b>Measurement Date Range:</b> Not available — the date/time column in this "
+                "file could not be read. The number of samples and their levels are known; "
+                "when they were recorded is not.", styles['BodyText']))
+            story.append(Paragraph(
+                f"<b>Samples Analysed:</b> {len(self.df):,}", styles['BodyText']))
+        else:
+            story.append(Paragraph(f"<b>Measurement Date Range:</b> {escape(date_range)}", styles['BodyText']))
+            story.append(Paragraph(f"<b>Total Duration:</b> {escape(duration)}", styles['BodyText']))
         story.append(Spacer(1, 0.12 * inch))
 
         leq = self._get_numeric_series(leq_col)
@@ -1327,7 +1782,16 @@ class ReportGeneratorV2:
 
         laeq = energetic_mean_db(leq)
         laeq_str = self._fmt_db(laeq)
-        story.append(Paragraph(f"<b>24-Hour Energy Average (LAeq):</b> {escape(laeq_str)}", styles['BodyText']))
+        # The LAeq here spans the whole record, which is rarely 24 hours.
+        _n_days = None
+        try:
+            _tsv = ts.dropna()
+            if len(_tsv) > 1:
+                _n_days = int(round((_tsv.max() - _tsv.min()).total_seconds() / 86400.0))
+        except Exception:
+            pass
+        _perlbl = (f"{_n_days}-Day" if _n_days and _n_days > 1 else "24-Hour" if _n_days == 1 else "Whole-Record")
+        story.append(Paragraph(f"<b>{_perlbl} Energy Average (LAeq):</b> {escape(laeq_str)}", styles['BodyText']))
         story.append(Spacer(1, 0.1 * inch))
 
         # WHO compliance check
@@ -1342,8 +1806,9 @@ class ReportGeneratorV2:
             laeq_str = escape(self._fmt_float(laeq_v))
             if who_fails:
                 interp = (
-                    f"The environment exhibits an average continuous noise level of {laeq_str} dB(A), "
-                    "<b>characterized by acoustic loading that exceeds WHO health guidelines.</b>"
+                    f"The equivalent continuous sound level (LAeq) over the measurement period was "
+                    f"{laeq_str} dB(A). <b>The WHO 2018 guidelines are exceeded</b> — see Section 3, "
+                    f"which evaluates Lden and Lnight, the metrics those guidelines are defined on."
                 )
             else:
                 if laeq_v < 55:
@@ -1355,8 +1820,8 @@ class ReportGeneratorV2:
                 else:
                     loading = "very high"
                 interp = (
-                    f"The environment exhibits an average continuous noise level of {laeq_str} dB(A), "
-                    f"characterized by {loading} acoustic loading."
+                    f"The equivalent continuous sound level (LAeq) over the measurement period was "
+                    f"{laeq_str} dB(A), a {loading} level for a residential environment."
                 )
         else:
             interp = "The environment exhibits an average continuous noise level that could not be computed due to missing/invalid LEQ values."
@@ -1398,6 +1863,16 @@ class ReportGeneratorV2:
             duration_label=self._compute_duration_label(ts),
             data_completeness_pct=completeness,
             n_days=n_days_v,
+            environment=getattr(self, 'environment', 'outdoor'),
+            truncation_warning=bool(getattr(self.df, 'attrs', {}).get('truncated_at_row_limit')),
+            # A synthetic index is NOT a timeline. Without this gate the report
+            # printed invented dates and a full WHO verdict computed from
+            # datetime.now(), directly beside the warning saying the timestamps
+            # could not be read.
+            timestamps_unusable=bool(getattr(self, 'timestamps_synthetic', False)),
+            lamax=self._lamax_value(self._resolve_acoustic_columns()[2]),
+            logging_interval_s=self._logging_interval_s(ts),
+            energy_dominance=energy_concentration(leq.dropna()),
         )
 
         # Determine box colour by concern level
@@ -1504,7 +1979,18 @@ class ReportGeneratorV2:
         story.append(Spacer(1, 0.12 * inch))
 
         # ── Top 10 Peak Noise Events ──────────────────────────────────────────
-        self._add_top_noise_events(story, styles, ts=ts, leq_col=leq_col)
+        # Every row of this table is a timestamped event. With a synthetic index
+        # the levels would be real but the dates and times invented, which is
+        # exactly the combination a reader is least able to detect.
+        if not getattr(self, 'timestamps_synthetic', False):
+            self._add_top_noise_events(story, styles, ts=ts, leq_col=leq_col)
+        else:
+            story.append(Paragraph(
+                "<b>Top Noise Events:</b> Withheld. The loudest levels in this dataset are known, "
+                "but the time at which each occurred is not, and an event table without reliable "
+                "timestamps cannot be checked against the raw record.",
+                styles['BodyText']))
+            story.append(Spacer(1, 0.12 * inch))
 
     # ============================================================
     # SECTION 2: DATA QUALITY & COMPLETENESS
@@ -1722,8 +2208,14 @@ class ReportGeneratorV2:
         uptime_pct = min(100.0, (100.0 * actual_samples / max(1, expected_samples)))
         interval_label = (f"{interval_s:.0f} s" if interval_s >= 1 else f"{interval_s:.3f} s")
 
-        story.append(Paragraph(f"<b>Measurement Span:</b> {escape(start.strftime('%Y-%m-%d %H:%M:%S'))} to {escape(end.strftime('%Y-%m-%d %H:%M:%S'))}", styles['BodyText']))
-        story.append(Paragraph(f"<b>Detected Logging Interval:</b> {escape(interval_label)}", styles['BodyText']))
+        if getattr(self, 'timestamps_synthetic', False):
+            story.append(Paragraph(
+                "<b>Measurement Span:</b> Not available — timestamps unreadable. Sample counts "
+                "below are exact; completeness cannot be assessed without knowing the intended "
+                "recording period.", styles['BodyText']))
+        else:
+            story.append(Paragraph(f"<b>Measurement Span:</b> {escape(start.strftime('%Y-%m-%d %H:%M:%S'))} to {escape(end.strftime('%Y-%m-%d %H:%M:%S'))}", styles['BodyText']))
+            story.append(Paragraph(f"<b>Detected Logging Interval:</b> {escape(interval_label)}", styles['BodyText']))
         story.append(Paragraph(f"<b>Expected Samples:</b> {expected_samples:,}", styles['BodyText']))
         story.append(Paragraph(f"<b>Actual Samples in Dataset:</b> {actual_samples:,}", styles['BodyText']))
         story.append(Paragraph(f"<b>Uptime (Data Completeness):</b> {self._fmt_float(uptime_pct, 1)}%", styles['BodyText']))
@@ -1812,6 +2304,27 @@ class ReportGeneratorV2:
 
     def _add_section_3_compliance(self, story, styles, *, ts: pd.Series, leq_col: str | None):
         story.append(Paragraph("Section 3: Regulatory &amp; Health Compliance", styles['h1']))
+
+        # Every standard in this section (WHO Lden/Lnight, COMAR day/night) is
+        # defined on a specific time window. With no real timestamps there is no
+        # window, so a verdict here would be an assertion about a day that was
+        # invented by the parser. Withhold the whole section rather than print a
+        # PASS/FAIL that cannot be defended.
+        if getattr(self, 'timestamps_synthetic', False):
+            story.append(Paragraph(
+                "<b>Compliance assessment withheld.</b> Every standard applied in this report "
+                "(WHO 2018 Lden and Lnight, Maryland COMAR daytime and nighttime limits) is "
+                "defined over a specific time-of-day window. The date and time information in "
+                "this file could not be read, so those windows cannot be established and no "
+                "compliance verdict can be issued. The overall average level and the statistical "
+                "percentiles elsewhere in this report remain valid. Re-export the source file "
+                "with a full 'YYYY-MM-DD HH:MM:SS' timestamp column to obtain a compliance "
+                "assessment.",
+                styles['BodyText']
+            ))
+            story.append(Spacer(1, 0.12 * inch))
+            return
+
         story.append(Paragraph(
             "Standards sourced from WHO Environmental Noise Guidelines (2018), "
             "WHO Guidelines for Community Noise (1999), and Maryland COMAR 26.02.03.02. "
@@ -1996,12 +2509,23 @@ class ReportGeneratorV2:
         n_total = int(night.notna().sum())
         pct = (100.0 * n_events / max(1, n_total))
 
-        # Convert samples to minutes (1 Hz assumption)
-        sampling_rate_hz = 1.0
-        minutes_exceeding = n_events / (sampling_rate_hz * 60.0)
+        # Convert sample count to duration using the MEASURED logging interval.
+        # A hardcoded 1 Hz assumption reported the sample count divided by 60 as
+        # "minutes", which is wrong by the ratio of the true interval to 1 s — a
+        # logger recording every 2 s understated the duration twofold, and one
+        # recording every minute understated it sixtyfold.
+        interval_s = _modal_interval_seconds(ts.dropna())
+        interval_s = interval_s if interval_s and interval_s > 0 else None
+        minutes_exceeding = (n_events * interval_s / 60.0) if interval_s else None
 
         story.append(Paragraph(
             f"<b>Nighttime hours isolated:</b> 23:00–07:00. Peak extraction uses <b>{escape(lmax_col)}</b> only.",
+            styles['BodyText']
+        ))
+        story.append(Paragraph(
+            "This section uses the WHO night window of 23:00–07:00, which is the basis of the "
+            "Lnight guideline. The Maryland COMAR night limit assessed in Section 3 is defined "
+            "over 22:00–07:00, so the two windows differ by one hour by design.",
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.08 * inch))
@@ -2010,13 +2534,28 @@ class ReportGeneratorV2:
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.08 * inch))
+        if minutes_exceeding is not None:
+            duration_txt = (f"{self._fmt_float(minutes_exceeding, 1)} minutes "
+                            f"(measured logging interval {interval_s:.0f} s)")
+        else:
+            duration_txt = ("not calculable — the logging interval could not be determined, "
+                            "so the sample count cannot be converted to a duration")
         story.append(Paragraph(
-            f"<b>Cumulative nighttime exposure exceeding {self._fmt_float(exceed_threshold)} dB(A) (outdoor facade threshold):</b> {self._fmt_float(minutes_exceeding, 1)} minutes ({pct:.1f}% of nighttime samples)",
+            f"<b>Cumulative nighttime exposure exceeding {self._fmt_float(exceed_threshold)} dB(A) "
+            f"(outdoor facade):</b> {duration_txt}. "
+            f"{n_events:,} of {n_total:,} nighttime samples ({pct:.1f}%).",
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.08 * inch))
         story.append(Paragraph(
-            "An outdoor façade level of 60 dB(A) generally translates to ~45 dB(A) indoors with partially open windows, the WHO threshold for physiological sleep awakening.",
+            "The 60 dB(A) outdoor figure is used because WHO sets its single-event sleep-disturbance "
+            "guideline indoors, at 45 dB(A) LAmax (WHO Guidelines for Community Noise, 1999; carried "
+            "forward in the Night Noise Guidelines for Europe, 2009). Converting it to an outdoor "
+            "facade level assumes roughly 15 dB of attenuation through a partially open window, the "
+            "value WHO uses for that purpose. Actual attenuation depends on the construction, glazing "
+            "and window position of the specific dwelling and was not measured here, so this "
+            "comparison is indicative. A direct indoor measurement is required to establish indoor "
+            "exposure.",
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.12 * inch))
@@ -2245,11 +2784,14 @@ class ReportGeneratorV2:
             "<b>What it is:</b> This heatmap shows the LAeq noise intensity for every hour of every day in the "
             "filtered dataset. Each coloured cell represents one calendar hour on one date. "
             "<b>How it is calculated:</b> Each cell is computed using strict logarithmic energy averaging (LAeq) — "
-            "never an arithmetic mean. Green cells indicate quiet periods; red/orange cells exceed guideline levels. "
+            "never an arithmetic mean. Green cells indicate quieter hours; red and orange cells indicate louder "
+            "hours. Cell colour reflects the measured level only: a single hour cannot be compared against the "
+            "WHO guidelines, which are defined on Lden and Lnight rather than on individual hours. Blank cells "
+            "are hours with no data. "
             "<b>How to read it:</b> Scan vertically to identify the noisiest times of day; scan horizontally to "
-            "spot unusually loud or quiet individual days. A consistently red row at 07:00–09:00 indicates a "
-            "chronic morning traffic peak. The Y-axis tick for each hour aligns precisely to the centre of its "
-            "corresponding cell.",
+            "spot unusually loud or quiet individual days. A consistently red row at a given hour indicates a "
+            "recurring daily pattern; identifying what produces it requires observations beyond sound level data. "
+            "The Y-axis tick for each hour aligns precisely to the centre of its corresponding cell.",
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.2 * inch))
@@ -2272,10 +2814,15 @@ class ReportGeneratorV2:
             "plotted clockwise from midnight (00:00) around the circle. "
             "<b>How it is calculated:</b> All measurements falling within each clock hour are energy-averaged (LAeq) across "
             "every day in the dataset. "
-            "<b>How to read it:</b> The polygon shape is the site's acoustic fingerprint. "
-            "A lopsided polygon peaking at 07:00–09:00 and 17:00–19:00 signals commuter-traffic dominance. "
-            "A uniformly expanded polygon indicates a continuous source (industrial, motorway). "
-            "Dashed reference rings show WHO Lden 53 dB and Lnight 45 dB thresholds.",
+            "<b>How to read it:</b> The polygon shape summarises the site's daily level pattern. "
+            "A lopsided polygon with morning and late-afternoon peaks indicates activity concentrated at "
+            "those hours; a uniformly expanded polygon indicates a level that is broadly steady around the "
+            "clock. What produces either pattern cannot be determined from sound level data alone and "
+            "requires corroborating observation. "
+            "The dashed rings mark 45 dB and 53 dB for visual orientation only. They are the WHO guideline "
+            "VALUES, but those guidelines are defined on Lnight and Lden — a night-long and a 24-hour "
+            "penalty-weighted average respectively — so an individual hour rising above a ring is not an "
+            "exceedance. The compliance assessment in Section 3 evaluates the correct metrics.",
             styles['BodyText']
         ))
         c4_parts.append(Spacer(1, 0.15 * inch))
@@ -2306,9 +2853,10 @@ class ReportGeneratorV2:
             "(Monday–Sunday), with separate traces for daytime (07:00–22:00) and nighttime (22:00–07:00). "
             "<b>How it is calculated:</b> All measurements are grouped by day-of-week and time-of-day period, "
             "then energy-averaged (LAeq) across all occurrences of that combination in the dataset. "
-            "<b>How to read it:</b> A wider daytime polygon confirms daytime activity dominates. "
-            "Shorter weekend spokes vs weekday spokes indicate traffic/commercial noise. "
-            "Equal spokes indicate a continuous 24/7 source (industrial or heavy road).",
+            "<b>How to read it:</b> A wider daytime polygon shows that daytime levels exceed nighttime levels. "
+            "Shorter weekend than weekday spokes indicate a level that falls at weekends, and roughly equal "
+            "spokes indicate a level that does not vary by day of week. These are descriptions of the measured "
+            "pattern; attributing any of them to a particular source requires evidence beyond sound level data.",
             styles['BodyText']
         ))
         story.append(KeepTogether(c5_parts))
@@ -2352,15 +2900,25 @@ class ReportGeneratorV2:
         if 'lmin' in df.columns:
             agg['lmin'] = 'min'
 
-        df_plot = df.resample(freq).agg(agg).dropna(subset=['leq'])
-        if df_plot.empty:
+        # KEEP empty resample bins as NaN. Dropping them would hand plotly a
+        # gap-free series, and it would draw a straight line straight across an
+        # outage — rendering hours of missing data as though they were measured.
+        # A NaN breaks the line, so gaps are visible as gaps.
+        df_plot = df.resample(freq).agg(agg)
+        if df_plot['leq'].notna().sum() == 0:
             df_plot = df.copy()
 
         # Rolling smooth computed on the already-resampled series (fast path).
         # Window of 4 resampled points provides ~1-hour smoothing at the default
         # 15-min freq, and proportionally wider smoothing for coarser resolutions.
+        # Rolling smooth. min_periods=1 lets the window emit a value even where
+        # the underlying bin is empty, and the old .dropna() then removed the
+        # NaNs that would have broken the line — so this trace was drawn straight
+        # across every outage while the LAeq trace beneath it correctly broke.
+        # Keep the NaNs and mask the smooth wherever there is no measurement.
         roll_w = min(4, max(1, len(df_plot)))
-        rolling_1h = df_plot['leq'].rolling(window=roll_w, min_periods=1).median().dropna()
+        rolling_1h = df_plot['leq'].rolling(window=roll_w, min_periods=1).median()
+        rolling_1h = rolling_1h.where(df_plot['leq'].notna())
 
         fig = go.Figure()
 
@@ -2372,6 +2930,7 @@ class ReportGeneratorV2:
                 mode='lines',
                 name='L-Max envelope',
                 line=dict(color='rgba(244,162,97,0.55)', width=1.5, dash='dot'),
+                connectgaps=False,
                 hoverinfo='skip',
             ))
             fig.add_trace(go.Scatter(
@@ -2380,8 +2939,14 @@ class ReportGeneratorV2:
                 mode='lines',
                 name='L-Min envelope',
                 line=dict(color='rgba(42,157,143,0.55)', width=1.5, dash='dot'),
-                fill='tonexty',
-                fillcolor='rgba(42,157,143,0.12)',
+                connectgaps=False,
+                # No 'tonexty' fill. Plotly fills between this trace and the
+                # previous one by pairing points positionally, and once NaN gaps
+                # are present (which they must be, so outages are not drawn as
+                # data) that pairing breaks: the rendered figure showed a large
+                # triangular wedge spanning several days that corresponded to no
+                # measurement at all. The two dotted envelope lines carry the same
+                # information without inventing a shape.
                 hoverinfo='skip',
             ))
 
@@ -2391,37 +2956,44 @@ class ReportGeneratorV2:
             mode='lines',
             name='LAeq',
             line=dict(color='#111111', width=3),
+            connectgaps=False,
             hovertemplate='%{x|%d %b %Y %H:%M}<br>LAeq: %{y:.1f} dB(A)<extra></extra>',
         ))
 
-        if not rolling_1h.empty:
+        if rolling_1h.notna().any():
             fig.add_trace(go.Scatter(
                 x=rolling_1h.index,
                 y=rolling_1h.values,
                 mode='lines',
                 name='Rolling 1-Hour Median (L50)',
                 line=dict(color='#8E44AD', width=2.5),
+                connectgaps=False,
                 hovertemplate='%{x|%d %b %Y %H:%M}<br>Rolling 1-Hour Median: %{y:.1f} dB(A)<extra></extra>',
             ))
 
+        # Fixed orientation levels. Both lines previously read "WHO 24-Hr
+        # Threshold", which was wrong twice: 45 dB is the Lnight guideline, not a
+        # 24-hour one, and neither guideline applies to the LAeq trace plotted
+        # here — Lden and Lnight are penalty-weighted long-term averages.
         fig.add_hline(
             y=53.0,
             line_dash='dash',
             line_color='rgba(231,111,81,0.95)',
-            annotation_text='WHO 24-Hr Threshold',
+            annotation_text='53 dB reference',
             annotation_position='top left'
         )
         fig.add_hline(
             y=45.0,
             line_dash='dash',
             line_color='rgba(231,111,81,0.7)',
-            annotation_text='WHO 24-Hr Threshold',
+            annotation_text='45 dB reference',
             annotation_position='bottom left'
         )
 
         tickformat = '%d %b\n%H:%M' if span <= pd.Timedelta(days=3) else '%d %b'
         fig.update_layout(
-            title='Chart 1: Time Series (LAeq with L-Max/L-Min envelope & WHO limits)',
+            title=dict(text='Chart 1: Time Series — LAeq with L-Max/L-Min envelope',
+                       y=0.96, yanchor='top'),
             xaxis=dict(
                 title='Time',
                 tickformat=tickformat,
@@ -2443,21 +3015,21 @@ class ReportGeneratorV2:
             legend=dict(
                 orientation='h',
                 yanchor='bottom',
-                y=1.08,
+                y=1.02,
                 xanchor='left',
                 x=0,
                 bgcolor='rgba(255,255,255,0.85)',
                 bordercolor='rgba(0,0,0,0.08)',
                 borderwidth=1,
             ),
-            margin=dict(l=55, r=25, t=90, b=55),
+            margin=dict(l=55, r=25, t=115, b=55),
             autosize=True,
             height=420,
             hovermode='x unified',
             plot_bgcolor='white',
             paper_bgcolor='white',
             annotations=[dict(
-                text=f"Source file: {os.path.basename(self.filepath)}",
+                text=f"Source: {self._figure_source_label()}",
                 xref='paper',
                 yref='paper',
                 x=1,
@@ -2509,17 +3081,30 @@ class ReportGeneratorV2:
                     hovertemplate='Hour: %{x}<br>Median: %{median:.1f} dB(A)<extra></extra>',
                 ))
 
-                # Plot exact outliers (points beyond 1.5×IQR fences).
-                # Outliers are typically rare — all of them are preserved.
+                # Points beyond the 1.5×IQR fences.
+                #
+                # At 1 Hz an hour-of-day column holds ~45,000 samples across a
+                # multi-week record, so "outliers" number in the thousands and
+                # plotting every one rendered a solid vertical bar that hid the
+                # whiskers and the box itself. Thin them to a readable sample
+                # while ALWAYS keeping the extremes, so the plotted range still
+                # spans the true minimum and maximum and no reader is misled
+                # about how far the tail reaches.
                 outliers = hour_values[(hour_values < lf) | (hour_values > uf)]
                 if not outliers.empty:
+                    vals = np.sort(outliers.to_numpy())
+                    cap = 300
+                    if vals.size > cap:
+                        # Even coverage of the tail, endpoints pinned.
+                        idx = np.unique(np.linspace(0, vals.size - 1, cap).astype(int))
+                        vals = vals[idx]
                     fig.add_trace(go.Scatter(
-                        x=[label] * len(outliers),
-                        y=outliers.values,
+                        x=[label] * len(vals),
+                        y=vals,
                         mode='markers',
-                        marker=dict(color='#3D5A80', size=4, opacity=0.55),
+                        marker=dict(color='#3D5A80', size=3, opacity=0.35),
                         showlegend=False,
-                        hovertemplate='Hour: %{x}<br>LEQ: %{y:.1f} dB(A) (outlier)<extra></extra>',
+                        hovertemplate='Hour: %{x}<br>LEQ: %{y:.1f} dB(A) (beyond 1.5×IQR)<extra></extra>',
                     ))
 
             fig.update_layout(
@@ -2545,7 +3130,7 @@ class ReportGeneratorV2:
                 paper_bgcolor='white',
                 plot_bgcolor='white',
                 annotations=[dict(
-                    text=f"Source file: {os.path.basename(self.filepath)}",
+                    text=f"Source: {self._figure_source_label()}",
                     xref='paper',
                     yref='paper',
                     x=1,
@@ -2619,7 +3204,7 @@ class ReportGeneratorV2:
             plot_bgcolor='white',
             paper_bgcolor='white',
             annotations=[dict(
-                text=f"Source file: {os.path.basename(self.filepath)}",
+                text=f"Source: {self._figure_source_label()}",
                 xref='paper', yref='paper', x=1, y=-0.22,
                 xanchor='right', yanchor='top', showarrow=False,
                 font=dict(size=9, color='rgba(80,80,80,0.85)')
@@ -2694,12 +3279,20 @@ class ReportGeneratorV2:
 
         fig = go.Figure()
 
-        # WHO reference rings
-        who_lnight = 45.0
-        who_lden   = 53.0
+        # Orientation rings.
+        #
+        # These are drawn at the WHO guideline VALUES, but this chart plots the
+        # energy-average LAeq of each hour of day — and neither WHO guideline is a
+        # per-hour limit. Lden is a single 24-hour figure carrying +5 dB evening
+        # and +10 dB night penalties; Lnight is the average across 23:00-07:00 as
+        # a whole. An individual hour sitting above a ring is therefore NOT an
+        # exceedance, and labelling the rings "WHO Lnight" / "WHO Lden" invited
+        # exactly that reading — a category error in the most persuasive form,
+        # a picture. Named as reference levels instead; the actual verdict lives
+        # in the compliance section, computed on the correct metrics.
         for ref_val, ref_label, ref_color in [
-            (who_lnight, "WHO Lnight 45 dB", "rgba(52,152,219,0.5)"),
-            (who_lden,   "WHO Lden 53 dB",   "rgba(231,76,60,0.5)"),
+            (45.0, "45 dB reference", "rgba(52,152,219,0.5)"),
+            (53.0, "53 dB reference", "rgba(231,76,60,0.5)"),
         ]:
             r_ring = [ref_val] * 25
             fig.add_trace(go.Scatterpolar(
@@ -2714,13 +3307,16 @@ class ReportGeneratorV2:
         # Night band shading (22:00–07:00 spokes dimmed via a filled area near centre)
         night_hours = list(range(22, 24)) + list(range(0, 7))
         night_theta = [f"{h:02d}:00" for h in night_hours] + [f"{night_hours[0]:02d}:00"]
-        night_r = [r_min + 1] * len(night_theta)
+        # Draw the night wedge to the OUTER edge, not 1 dB above the axis
+        # minimum — at the centre it was invisible, so the legend advertised a
+        # band the reader could not see.
+        night_r = [r_max] * len(night_theta)
         fig.add_trace(go.Scatterpolar(
             r=night_r,
             theta=night_theta,
             mode='lines',
             fill='toself',
-            fillcolor='rgba(44,62,80,0.10)',
+            fillcolor='rgba(44,62,80,0.07)',
             line=dict(color='rgba(0,0,0,0)', width=0),
             name='Night (22:00–07:00)',
             showlegend=True,
@@ -2756,7 +3352,7 @@ class ReportGeneratorV2:
                 bgcolor='rgba(248,249,250,1)',
             ),
             title=dict(
-                text='Diurnal Noise Fingerprint — Mean LAeq by Hour of Day',
+                text='Mean LAeq by Hour of Day',
                 font=dict(size=14, color='#1a1a2e'),
                 x=0.5,
             ),
@@ -2816,10 +3412,13 @@ class ReportGeneratorV2:
 
         fig = go.Figure()
 
-        # WHO reference rings
+        # Orientation rings. These sit at the WHO guideline VALUES, but this chart
+        # plots per-day-of-week LAeq averages — not Lden or Lnight, which are
+        # penalty-weighted long-term averages. A spoke crossing a ring is not an
+        # exceedance. Same reasoning as the diurnal radar above.
         for ref_val, ref_label, ref_color in [
-            (45.0, "WHO Lnight 45 dB", "rgba(52,152,219,0.5)"),
-            (53.0, "WHO Lden 53 dB",   "rgba(231,76,60,0.5)"),
+            (45.0, "45 dB reference", "rgba(52,152,219,0.5)"),
+            (53.0, "53 dB reference", "rgba(231,76,60,0.5)"),
         ]:
             fig.add_trace(go.Scatterpolar(
                 r=[ref_val] * 8,
@@ -2969,7 +3568,7 @@ class ReportGeneratorV2:
             files_str = " | ".join(escape(f) for f in self.source_files)
             story.append(Paragraph(f"Source Files ({len(self.source_files)}): {files_str}", styles['SubTitle']))
         else:
-            story.append(Paragraph(f"Source File: {escape(os.path.basename(self.filepath))}", styles['SubTitle']))
+            story.append(Paragraph(f"Source File: {escape(self._figure_source_label())}", styles['SubTitle']))
 
         story.append(Paragraph(
             f"Report Type: {report_type.upper()} | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",

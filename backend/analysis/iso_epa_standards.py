@@ -1,3 +1,5 @@
+import math
+
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -101,86 +103,65 @@ class StandardsAnalyzer:
         }
     
     def _epa_analysis(self):
-        """Analyze against OSHA occupational limits and provide EPA context.
+        """Environmental context only — no occupational verdict.
 
-        EPA environmental noise guidance varies by document/program and is not
-        universally applicable without context (metric definition, averaging
-        period, land use, jurisdiction). This analyzer focuses on OSHA PEL/action
-        levels which are explicit occupational exposure limits.
+        This previously issued OSHA PEL "COMPLIANT"/"NON-COMPLIANT" verdicts, and
+        a ``ppe_required`` flag, for environmental recordings. That was wrong three
+        times over:
+
+        1. **Wrong population.** The OSHA PEL governs worker exposure inside a
+           workplace over a shift. It says nothing about a residence, and telling
+           a resident that hearing protection is "required" in their own home is
+           both meaningless and alarming.
+        2. **Wrong metric.** The PEL is an 8-hour time-weighted average computed
+           with a 5 dB exchange rate (a dose), not an energy-average LAeq.
+        3. **Wrong averaging period.** The LAeq here spans the whole record —
+           often 7 to 11 days — which is not comparable to an 8-hour limit
+           without normalisation.
+
+        Occupational exposure is assessed properly, and only on request, by
+        :meth:`get_occupational_assessment`, which computes a normalised
+        8-hour exposure level and an OSHA dose.
         """
-        epa_results = {
-            'standards': {
-                'OSHA_PEL': 'OSHA Permissible Exposure Limits'
-            },
+        return {
+            'standards': {},
             'epa_note': (
-                'EPA environmental noise limits are not evaluated by default in this platform without an explicit, cited limit table and metric definition. '
-                'OSHA occupational limits are evaluated below.'
+                'EPA environmental noise limits are not evaluated by default: EPA guidance '
+                'varies by document and programme and is not applicable without an explicit, '
+                'cited limit table, metric definition, averaging period and land-use context. '
+                'Occupational limits (OSHA/NIOSH) are deliberately NOT applied to environmental '
+                'measurements — they govern workplace exposure over a shift and are not '
+                'comparable to a residential or community measurement. Use the dedicated '
+                'occupational assessment endpoint for workplace data.'
             ),
             'osha_pel_compliance': {},
-            'detailed_assessment': {}
+            'detailed_assessment': {
+                col: {
+                    'measured_laeq': round(float(energetic_mean_db(self.df[col].dropna())), 2),
+                    'measured_max': round(float(self.df[col].dropna().max()), 2),
+                    'note': 'Descriptive only. No regulatory verdict is issued from this module.',
+                }
+                for col in self.noise_columns
+                if not self.df[col].dropna().empty
+                and energetic_mean_db(self.df[col].dropna()) is not None
+            },
         }
-        
-        for col in self.noise_columns:
-            data = self.df[col].dropna()
-            if data.empty:
-                continue
+    
+    # NOTE: two health-effect ladders were removed here.
+    #
+    # ``_get_iso_health_implications`` attributed a scale of health outcomes to
+    # ISO 1996, which defines measurement and assessment METHODS and sets no
+    # health thresholds at all — this module says exactly that in
+    # ``_iso_analysis``, so the two contradicted each other.
+    #
+    # ``_get_epa_health_effects`` attributed thresholds to "EPA guidelines"
+    # without a citable document, and mixed occupational hearing-damage language
+    # ("protective equipment mandatory") into environmental assessment.
+    #
+    # Health interpretation now comes solely from ``get_health_based_assessment``,
+    # which is sourced to WHO 2018 and WHO 1999 with the metric each threshold is
+    # defined on.
 
-            laeq = energetic_mean_db(data)
-            leq = float(laeq) if laeq is not None else float(data.mean())
-            max_level = data.max()
-            
-            # OSHA PEL (Occupational Safety and Health Administration)
-            # 8-hour TWA = 90 dB(A) Action level = 85 dB(A)
-            osha_results = {
-                'permissible_exposure_limit_8h_twa': 90,
-                'action_level': 85,
-                'measured_level': round(leq, 2),
-                'osha_compliance': 'COMPLIANT' if leq <= 90 else 'NON-COMPLIANT',
-                'action_level_status': 'BELOW' if leq < 85 else 'AT/ABOVE ACTION LEVEL',
-                'ppe_required': True if leq >= 85 else False
-            }
-            
-            epa_results['osha_pel_compliance'][col] = osha_results
-            
-            epa_results['detailed_assessment'][col] = {
-                'measured_leq': round(leq, 2),
-                'measured_max': round(max_level, 2),
-                'health_effects_epa': self._get_epa_health_effects(leq),
-                'regulatory_framework': 'OSHA regulates occupational noise exposure; environmental noise limits are typically local/regional regulations and guidelines.'
-            }
-        
-        return epa_results
-    
-    def _get_iso_health_implications(self, leq):
-        """Get health implications based on ISO 1996"""
-        if leq < 40:
-            return "No significant health effects expected"
-        elif leq < 50:
-            return "Minor annoyance, possible sleep disturbance"
-        elif leq < 60:
-            return "Moderate annoyance, possible sleep disturbance"
-        elif leq < 70:
-            return "High annoyance, probable speech interference"
-        elif leq < 80:
-            return "Severe annoyance, significant speech interference, potential hearing damage with prolonged exposure"
-        else:
-            return "DANGEROUS - Risk of hearing damage, immediate mitigation required"
-    
-    def _get_epa_health_effects(self, leq):
-        """Get health effects based on EPA guidelines"""
-        if leq < 50:
-            return "No significant risk"
-        elif leq < 60:
-            return "Minor interference with speech communication"
-        elif leq < 70:
-            return "Speech interference indoors, sleep disturbance possible"
-        elif leq < 80:
-            return "Hearing conservation program recommended in occupational settings"
-        elif leq < 90:
-            return "Hearing conservation program required; potential for hearing damage"
-        else:
-            return "CRITICAL - Immediate risk of hearing damage; protective equipment mandatory"
-    
     def _generate_recommendations(self):
         """Generate recommendations based on analysis.
 
@@ -195,13 +176,11 @@ class StandardsAnalyzer:
         recommendations = []
 
         # Attempt to compute derived environmental metrics once (timestamps required).
+        from analysis.timestamp_utils import resolve_time_column, parse_timestamps_robust
         env_metrics_by_col: dict[str, dict[str, float]] = {}
-        time_cols = [
-            c for c in self.df.columns
-            if any(term in c.lower() for term in ["timestamp", "datetime", "time", "date"])
-        ]
-        if time_cols:
-            ts = pd.to_datetime(self.df[time_cols[0]], errors="coerce", dayfirst=True, cache=True)
+        _tcol = resolve_time_column(self.df)
+        if _tcol:
+            ts, _ = parse_timestamps_robust(self.df[_tcol])
             if ts.notna().sum() > 0:
                 for col in self.noise_columns:
                     y = pd.to_numeric(self.df[col], errors="coerce")
@@ -317,17 +296,18 @@ class StandardsAnalyzer:
             "assessment_by_metric": {},
         }
         
-        # Attempt to compute environmental metrics if timestamps exist
-        time_cols = [
-            c for c in self.df.columns
-            if any(term in c.lower() for term in ["timestamp", "datetime", "time", "date"])
-        ]
-        
+        # Attempt to compute environmental metrics if timestamps exist.
+        # Use the shared resolver and the robust parser — a positional pick with a
+        # naive dayfirst parse produced a different timeline here than the rest of
+        # the platform, so the health assessment could disagree with the report.
+        from analysis.timestamp_utils import resolve_time_column, parse_timestamps_robust
+        time_col = resolve_time_column(self.df)
+
         has_time_data = False
         env_metrics_by_col = {}
-        
-        if time_cols:
-            ts = pd.to_datetime(self.df[time_cols[0]], errors="coerce", dayfirst=True, cache=True)
+
+        if time_col:
+            ts, _ = parse_timestamps_robust(self.df[time_col])
             if ts.notna().sum() > 0:
                 has_time_data = True
                 for col in self.noise_columns:
@@ -532,64 +512,179 @@ class StandardsAnalyzer:
         )
         return recs
     
-    def get_occupational_assessment(self):
-        """Assess occupational exposure against NIOSH and OSHA standards."""
+    def get_occupational_assessment(self, exposure_hours: float | None = None):
+        """Assess occupational exposure against NIOSH and OSHA criteria.
+
+        Occupational limits are **dose** criteria over a work shift, not levels.
+        Comparing a raw LAeq against 85/90 dB — as this method previously did —
+        ignores both the exposure duration and the exchange rate, and produced a
+        "COMPLIANT" verdict for an 11-day residential record.
+
+        Two quantities are computed instead:
+
+        ``L_EX,8h`` (NIOSH / ISO 1999)
+            The level which, sustained for 8 hours, delivers the same *energy* as
+            the measured exposure: ``LAeq,T + 10*log10(T / 8h)``. This is the
+            correct comparison for NIOSH's 85 dB REL, whose 3 dB exchange rate is
+            energy-equivalent.
+
+        ``OSHA dose``
+            OSHA uses a 5 dB exchange rate, which is **not** energy-equivalent, so
+            it must be accumulated per sample:
+            ``D = 100 * Σ(t_i / T_i)`` with ``T_i = 8 / 2**((L_i - 90) / 5)``,
+            counting only samples at or above the 80 dB(A) threshold, per
+            29 CFR 1910.95 Appendix A. 100% dose corresponds to the PEL.
+
+        Parameters
+        ----------
+        exposure_hours : float, optional
+            Length of the work shift the measurement represents, in hours. When
+            omitted, the record's own duration is used and the result is flagged,
+            because a monitor left running for days does not represent a shift.
+
+        Returns
+        -------
+        dict
+            Assessment per column, including the applicability caveat.
+        """
         occ_standards = occupational_noise_standards()
         assessment = {
             "title": "Occupational Noise Exposure Assessment",
             "standards": occ_standards,
+            "applicability_warning": (
+                "Occupational criteria (OSHA 29 CFR 1910.95, NIOSH REL) apply to WORKER "
+                "exposure in a workplace over a work shift. They must not be applied to "
+                "community, residential or environmental measurements, where WHO 2018 "
+                "Lden/Lnight guidelines and local ordinances are the applicable criteria."
+            ),
             "assessment_by_column": {},
         }
-        
+
+        # Duration the record actually represents.
+        measured_hours = self._record_duration_hours()
+        shift_hours = float(exposure_hours) if exposure_hours else measured_hours
+        duration_assumed = exposure_hours is None
+
         for col in self.noise_columns:
-            data = self.df[col].dropna()
+            data = pd.to_numeric(self.df[col], errors='coerce').dropna()
             if data.empty:
                 continue
-            
+
             laeq = energetic_mean_db(data)
-            leq = float(laeq) if laeq is not None else float(data.mean())
-            
-            col_assessment = {
+            if laeq is None:
+                continue
+            leq = float(laeq)
+
+            col_assessment: dict = {
                 "LAeq_measured": round(leq, 1),
-                "osha_status": {},
-                "niosh_status": {},
-                "recommendations": [],
+                "measurement_duration_hours": (round(measured_hours, 2)
+                                               if measured_hours else None),
+                "shift_hours_used": round(shift_hours, 2) if shift_hours else None,
+                "duration_assumed_from_record": duration_assumed,
             }
-            
-            # OSHA Assessment (90 dB PEL, 85 dB action level)
-            if leq >= 90:
-                col_assessment["osha_status"] = {
-                    "compliance": "NON-COMPLIANT",
-                    "level_comparison": "At or exceeds OSHA PEL (90 dB)",
-                    "required_actions": ["Hearing protection mandatory", "Engineering controls required", "Medical surveillance required"]
+
+            # A record spanning days is not a work shift. Normalising 263 hours
+            # of residential monitoring to an "8-hour equivalent" produces a
+            # number that looks like an occupational exposure and is not one.
+            if shift_hours and shift_hours > 24.0 and duration_assumed:
+                col_assessment["niosh_status"] = {
+                    "criterion": "NIOSH REL 85 dB(A) L_EX,8h",
+                    "status": "NOT APPLICABLE",
+                    "reason": (
+                        f"This record spans {shift_hours:.1f} hours, which is not a work "
+                        f"shift. Occupational criteria assess a worker's exposure over a "
+                        f"shift; pass an explicit 'exposure_hours' for the shift this "
+                        f"measurement represents, or use the environmental (WHO 2018) "
+                        f"assessment instead."
+                    ),
                 }
-            elif leq >= 85:
+                col_assessment["osha_status"] = dict(col_assessment["niosh_status"])
+                col_assessment["osha_status"]["criterion"] = (
+                    "OSHA PEL — 90 dB(A) 8-h TWA (29 CFR 1910.95)")
+                assessment["assessment_by_column"][col] = col_assessment
+                continue
+
+            # ── NIOSH: 8-hour normalised exposure level ──────────────────────
+            if shift_hours and shift_hours > 0:
+                l_ex_8h = leq + 10.0 * math.log10(shift_hours / 8.0)
+                col_assessment["L_EX_8h"] = round(l_ex_8h, 1)
+                col_assessment["niosh_status"] = {
+                    "criterion": "NIOSH REL 85 dB(A) L_EX,8h (3 dB exchange rate)",
+                    "measured_L_EX_8h": round(l_ex_8h, 1),
+                    "status": ("AT/ABOVE REL" if l_ex_8h >= 85.0 else "BELOW REL"),
+                    "exceeded_by_db": (round(l_ex_8h - 85.0, 1)
+                                       if l_ex_8h >= 85.0 else None),
+                }
+            else:
+                col_assessment["niosh_status"] = {
+                    "criterion": "NIOSH REL 85 dB(A) L_EX,8h",
+                    "status": "NOT ASSESSABLE",
+                    "reason": "Exposure duration unknown; an 8-hour normalisation requires it.",
+                }
+
+            # ── OSHA: 5 dB exchange rate dose ────────────────────────────────
+            interval_s = self._sample_interval_seconds()
+            if interval_s and interval_s > 0:
+                lv = data.to_numpy(dtype=float)
+                counted = lv[lv >= 80.0]           # 29 CFR 1910.95 App. A threshold
+                if counted.size:
+                    t_hours = interval_s / 3600.0
+                    allowed = 8.0 / np.power(2.0, (counted - 90.0) / 5.0)
+                    dose_pct = 100.0 * float(np.sum(t_hours / allowed))
+                else:
+                    dose_pct = 0.0
+                # TWA equivalent of the accumulated dose. Below ~0.1% dose the
+                # logarithm returns a physically meaningless figure (a 0.0% dose
+                # yielded "21.7 dB"), so report it as not applicable instead.
+                twa = (90.0 + 16.61 * math.log10(dose_pct / 100.0)) if dose_pct >= 0.1 else None
                 col_assessment["osha_status"] = {
-                    "compliance": "ABOVE ACTION LEVEL",
-                    "level_comparison": "Exceeds OSHA action level (85 dB)",
-                    "required_actions": ["Hearing conservation program required", "Baseline and annual audiograms", "Hearing protection provided"]
+                    "criterion": "OSHA PEL — 90 dB(A) 8-h TWA, 5 dB exchange rate (29 CFR 1910.95)",
+                    "dose_percent": round(dose_pct, 1),
+                    "twa_equivalent_db": round(twa, 1) if twa is not None else None,
+                    "status": ("EXCEEDS PEL" if dose_pct > 100.0 else
+                               "AT/ABOVE ACTION LEVEL" if dose_pct >= 50.0 else
+                               "BELOW ACTION LEVEL"),
+                    "note": ("Dose accumulated only over samples at or above 80 dB(A), "
+                             "per 29 CFR 1910.95 Appendix A. 100% dose = PEL; "
+                             "50% dose = 85 dB(A) action level."),
                 }
             else:
                 col_assessment["osha_status"] = {
-                    "compliance": "COMPLIANT",
-                    "level_comparison": f"Below OSHA action level (85 dB). Current: {leq:.1f} dB"
+                    "criterion": "OSHA PEL — 90 dB(A) 8-h TWA",
+                    "status": "NOT ASSESSABLE",
+                    "reason": "Sample interval unknown; a dose cannot be accumulated without it.",
                 }
-            
-            # NIOSH Assessment (85 dB recommended with 3 dB exchange rate)
-            if leq >= 85:
-                col_assessment["niosh_status"] = {
-                    "compliance": "AT/EXCEEDS NIOSH RECOMMENDED LIMIT",
-                    "level_comparison": "At or exceeds NIOSH recommended limit (85 dB)",
-                    "exchange_rate": "3 dB (more protective than OSHA 5 dB)",
-                    "note": "NIOSH recommends maximum 85 dB; hearing damage risk increases above this"
-                }
-            else:
-                col_assessment["niosh_status"] = {
-                    "compliance": "WITHIN NIOSH LIMIT",
-                    "level_comparison": f"Below NIOSH recommended limit (85 dB). Current: {leq:.1f} dB"
-                }
-            
+
             assessment["assessment_by_column"][col] = col_assessment
-        
+
         return assessment
+
+    def _record_duration_hours(self) -> float | None:
+        """Span of the record in hours, or None when there is no usable timeline."""
+        from analysis.timestamp_utils import resolve_time_column, parse_timestamps_robust
+        col = resolve_time_column(self.df)
+        if not col:
+            return None
+        ts, _ = parse_timestamps_robust(self.df[col])
+        ts = ts.dropna()
+        if len(ts) < 2:
+            return None
+        return float((ts.max() - ts.min()).total_seconds() / 3600.0)
+
+    def _sample_interval_seconds(self) -> float | None:
+        """Modal spacing between samples, in seconds."""
+        from analysis.timestamp_utils import resolve_time_column, parse_timestamps_robust
+        col = resolve_time_column(self.df)
+        if not col:
+            return None
+        ts, _ = parse_timestamps_robust(self.df[col])
+        ts = ts.dropna().sort_values()
+        if len(ts) < 2:
+            return None
+        d = ts.diff().dt.total_seconds().dropna()
+        d = d[d > 0]
+        if d.empty:
+            return None
+        mode = d.mode()
+        return float(mode.iloc[0]) if not mode.empty else float(d.median())
 

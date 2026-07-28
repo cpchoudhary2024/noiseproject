@@ -8,23 +8,61 @@ from docx.shared import Pt, RGBColor, Inches, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.style import WD_STYLE_TYPE
 from datetime import datetime
+import os
+import re
 import numpy as np
 
 
 class WordReportGenerator:
     def __init__(self, analysis_data, standards_data, daily_summary=None, hourly_summary=None,
                  device_id: str = '', source_files: list | None = None,
-                 merge_gap_report: dict | None = None, filepath: str = ''):
+                 merge_gap_report: dict | None = None, filepath: str = '',
+                 deidentify: bool = True):
         self.analysis = analysis_data or {}
         self.standards = standards_data or {}
         self.daily_summary = daily_summary
         self.hourly_summary = hourly_summary
-        self.device_id = str(device_id or '').strip()
-        self.source_files = list(source_files or [])
+
+        # This generator is a SEPARATE render path from ReportGeneratorV2 and was
+        # therefore not covered by that class's de-identification: a .docx built
+        # from the same request still printed the participant's name in the
+        # title-page metadata. Apply the same rule here, from the same helpers,
+        # so the two paths cannot drift apart again.
+        from analysis.report_generator_v2 import deidentify_label, is_safe_label
+        self.deidentify = bool(deidentify)
+        _raw_device = str(device_id or '').strip()
+        _raw_sources = [str(f) for f in (source_files or [])]
+
+        if self.deidentify:
+            self.device_id = (deidentify_label(_raw_device,
+                                               'Monitoring location (identifier withheld)')[0]
+                              if _raw_device else '')
+            self.source_files = []
+            for i, name in enumerate(_raw_sources, start=1):
+                stem = os.path.splitext(os.path.basename(name))[0]
+                stem = re.sub(r'^\d{8}_\d{6}_', '', stem)
+                self.source_files.append(stem if is_safe_label(stem) else f'Source file {i}')
+        else:
+            self.device_id = _raw_device
+            self.source_files = _raw_sources
         self.merge_gap_report = merge_gap_report
         self.filepath = filepath
         self.doc = Document()
         
+    def _source_label(self) -> str:
+        """De-identified label for the source file.
+
+        The .docx title page printed the raw filename, which is the most common
+        carrier of a participant's name. Text-level checks over the body missed
+        it because it sits in the metadata paragraph.
+        """
+        from analysis.report_generator_v2 import is_safe_label
+        stem = os.path.splitext(os.path.basename(self.filepath or ""))[0]
+        stem = re.sub(r"^\d{8}_\d{6}_", "", stem)
+        if not self.deidentify or is_safe_label(stem):
+            return stem or "not recorded"
+        return self.device_id or "withheld"
+
     def generate(self):
         """Generate complete Word report."""
         self._add_title_page()
@@ -69,7 +107,7 @@ class WordReportGenerator:
             )
             run.font.size = Pt(11)
         elif self.filepath:
-            run = metadata_para.add_run(f"Source File: {_os.path.basename(self.filepath)}\n")
+            run = metadata_para.add_run(f"Source File: {self._source_label()}\n")
             run.font.size = Pt(11)
 
         metadata_para.add_run(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n").font.size = Pt(11)
