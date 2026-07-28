@@ -2635,8 +2635,24 @@ def _compute_comparison_metrics(df: pd.DataFrame, original_name: str) -> dict:
         for h, grp in df_tmp.groupby('hour'):
             diurnal[int(h)] = _safe(energetic_mean_db(grp['leq']))
 
-    pct_above_day = _safe(float((leq > 53).mean() * 100)) if not leq.empty else None
-    pct_above_night = _safe(float((leq > 45).mean() * 100)) if not leq.empty else None
+    # Share of individual logged samples above each level.
+    #
+    # These are DISTRIBUTION statistics, not compliance rates, and the field names
+    # say so. Previously named pct_above_day_who / pct_above_night_who, they
+    # compared individual samples against the WHO Lden (53 dB) and Lnight (45 dB)
+    # guideline values — which are duration-weighted, penalty-adjusted averages
+    # that cannot be evaluated sample by sample. The night figure was also taken
+    # over the whole record rather than over night hours, so it was wrong twice.
+    # The compliance verdict comes from Lden/Lnight, computed above.
+    pct_above_53 = _safe(float((leq > 53).mean() * 100)) if not leq.empty else None
+    pct_night_above_45 = None
+    if not ts_valid.empty and not leq.empty:
+        _t = pd.DataFrame({'ts': ts, 'leq': leq}).dropna()
+        if not _t.empty:
+            _h = _t['ts'].dt.hour
+            _night = _t.loc[(_h >= 22) | (_h < 7), 'leq']
+            if not _night.empty:
+                pct_night_above_45 = _safe(float((_night > 45).mean() * 100))
 
     # Distribution box stats (for the box-and-whisker comparison): quartiles +
     # Tukey 1.5*IQR fences, computed on the raw level readings.
@@ -2666,8 +2682,11 @@ def _compute_comparison_metrics(df: pd.DataFrame, original_name: str) -> dict:
         'l10': _safe(exc.get('L10')),
         'l50': _safe(exc.get('L50')),
         'l90': _safe(exc.get('L90')),
-        'pct_above_day_who': pct_above_day,
-        'pct_above_night_who': pct_above_night,
+        'pct_samples_above_53db': pct_above_53,
+        'pct_night_samples_above_45db': pct_night_above_45,
+        'pct_samples_note': ('Share of individual logged samples above the stated level. '
+                             'Not a compliance rate: WHO guidelines apply to Lden and Lnight, '
+                             'not to individual samples.'),
         'diurnal': diurnal,
         'box': box,
     }
@@ -2729,12 +2748,17 @@ def _comparison_summary(datasets: list[dict]) -> dict:
             )
         nd = summary['n_exceed_day']
         if nd == 0:
-            parts.append(f"All {summary['n_total']} locations are within the WHO health guideline (53 dB).")
+            parts.append(f"All {summary['n_total']} locations are within the WHO 2018 "
+                         f"day-evening-night guideline (Lden 53 dB).")
         else:
-            parts.append(f"{nd} of {summary['n_total']} locations exceed the WHO health guideline (53 dB).")
+            parts.append(f"{nd} of {summary['n_total']} locations exceed the WHO 2018 "
+                         f"day-evening-night guideline (Lden 53 dB).")
         nn = summary['n_exceed_night']
         if nn > 0:
-            parts.append(f"{nn} exceed the stricter night-time sleep guideline (45 dB).")
+            # 45 dB Lnight is a different metric over a different window, not a
+            # "stricter" version of the 53 dB Lden guideline.
+            parts.append(f"{nn} exceed the separate night-time sleep guideline "
+                         f"(Lnight 45 dB, 23:00-07:00).")
         summary['verdict'] = ' '.join(parts)
 
     return summary
