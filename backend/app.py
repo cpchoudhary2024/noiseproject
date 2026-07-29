@@ -1215,7 +1215,19 @@ def analyze_data():
                 leq_series = pd.to_numeric(df[prim], errors='coerce').dropna()
                 if not leq_series.empty:
                     key_findings['avg_laeq'] = energetic_mean_db(leq_series)
-                    key_findings['peak'] = float(leq_series.max())
+                    # "Loudest single moment" must come from the L-Max stream.
+                    # max(LEQ) is the loudest interval *average* and is always
+                    # lower: on one record the card read 78 dB(A) while the
+                    # summary beside it correctly quoted L-Max at 81.0 dB(A).
+                    key_findings['peak_leq_interval'] = float(leq_series.max())
+                    _lmx = next((c for c in df.columns
+                                 if 'lmax' in ''.join(ch for ch in str(c).lower() if ch.isalnum())), None)
+                    if _lmx is not None:
+                        _lv = pd.to_numeric(df[_lmx], errors='coerce').dropna()
+                        if not _lv.empty:
+                            key_findings['peak'] = float(_lv.max())
+                            key_findings['peak_is_lmax'] = True
+                    key_findings.setdefault('peak', float(leq_series.max()))
                     # Share of individual logged samples at or below 53 dB(A).
                     # This is NOT a WHO compliance figure: 53 dB(A) is an Lden
                     # limit — a duration-weighted, penalty-adjusted long-term

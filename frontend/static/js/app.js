@@ -831,8 +831,13 @@ function renderMetricsPanel() {
             `around ${fmt(kf.loudest_hour_db, 0)} dB`, 'metric-warn'));
     }
     if (Number.isFinite(Number(kf.peak))) {
-        cards.push(card(fmt(kf.peak, 0), 'dB(A)', 'Loudest single moment',
-            'the highest level recorded at any instant', ''));
+        // Label matches the stream the value came from.
+        const peakLabel = kf.peak_is_lmax ? 'Loudest single moment (L-Max)'
+                                          : 'Loudest interval average (LEQ)';
+        cards.push(card(fmt(kf.peak, 0), 'dB(A)', peakLabel,
+            kf.peak_is_lmax ? 'the highest level the meter recorded at any instant'
+                            : 'the loudest averaging interval; instantaneous peaks were higher',
+            ''));
     }
 
     container.innerHTML = cards.length
