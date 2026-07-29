@@ -33,5 +33,7 @@ EXPOSE 7860
 # Run gunicorn from the backend directory so `from analysis.*` and `import retention` resolve
 WORKDIR /app/backend
 
-# 1 worker (enough for 5-10 non-concurrent users), 2 threads, 5-min timeout for large reports
-CMD ["gunicorn", "--bind", "0.0.0.0:7860", "--timeout", "300", "--workers", "1", "--threads", "2", "app:app"]
+# 1 worker (enough for 5-10 non-concurrent users), 2 threads. 10-min timeout:
+# a full-season merge (18 files, 10.7M rows) takes ~72 s to process, and a large
+# multipart upload over a domestic connection can add several minutes on top.
+CMD ["gunicorn", "--bind", "0.0.0.0:7860", "--timeout", "600", "--workers", "1", "--threads", "2", "app:app"]
