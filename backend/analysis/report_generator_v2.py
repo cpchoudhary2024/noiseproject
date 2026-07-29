@@ -31,7 +31,7 @@ from xml.sax.saxutils import escape
 #
 # The realistic leak is not the analysis — it is the FILENAME. Source files
 # routinely carry the participant's name (this project's own raw data sits in
-# directories such as "conv001"), and filenames were rendered verbatim in
+# directories named after the participant), and filenames were rendered verbatim in
 # the dataset-composition line, the merge list, and the provenance block.
 #
 # Identifiers are therefore stripped by default and files referred to positionally.

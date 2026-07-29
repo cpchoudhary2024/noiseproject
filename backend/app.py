@@ -1946,7 +1946,7 @@ def _safe_compare_label(filename: str, idx: int) -> str:
 
     Comparison results and the downloadable comparison PDF are shared onward, so
     the filename must not become the location name. A file called
-    "PARTICIPANT home.xlsx" previously became the label and appeared ten times
+    a participant-named file previously became the label and appeared ten times
     in the generated report, including in the headline verdict.
 
     A filename that is already a study code (CONV001, Home A, SITE-12) is kept,
