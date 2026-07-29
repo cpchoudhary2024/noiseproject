@@ -8,258 +8,137 @@ app_port: 7860
 pinned: false
 ---
 
-# Noise Data Analysis Platform
+# Environmental Noise Analysis Platform
 
-**Live app:** https://cpchoudhary2024-noise-analysis-platform.hf.space
+**Live:** https://cpchoudhary2024-noise-analysis-platform.hf.space
 
-A comprehensive web-based platform for analyzing noise data with ISO 1996 and EPA standards compliance checking, advanced statistics, and detailed reporting capabilities.
+Turns raw sound-level-meter exports into community and technical noise-exposure
+reports assessed against WHO, ISO and local regulatory criteria. In continuous
+use on an ongoing community monitoring study — **39.5 million 1-second
+A-weighted measurements across four residential sites to date, and growing.**
 
-## Features
+---
 
-### 📊 Core Features
-- **File Upload**: Support for CSV and Excel files (.xlsx, .xls)
-- **Data Preview**: Quick preview of uploaded data before analysis
-- **Comprehensive Analysis**: Advanced statistical analysis including:
-  - Mean, median, standard deviation
-  - Percentile analysis (L5, L10, L50, L90, L95)
-  - Trend analysis with linear regression
-  - Peak detection and analysis
-  - Distribution analysis
-  - Data quality assessment
+## The problem
 
-### 📈 Visualizations
-- Noise level distribution charts
-- Percentile level graphs
-- Compliance comparison charts
-- Interactive Plotly charts
+Environmental noise assessment fails quietly. The arithmetic is easy — an energy
+average is four lines of NumPy — and that is exactly why errors survive: every
+number looks plausible.
 
-### ✅ Standards Compliance
-- **ISO 1996-1:2016**: Environmental Noise Assessment
-  - Sensitive areas (hospitals, schools): 50 dB
-  - Residential areas: 55 dB
-  - Mixed residential/commercial: 60 dB
-  - Commercial areas: 65 dB
-  - Industrial areas: 75 dB
+The failure that matters is **comparing a metric to a limit not defined on that
+metric.** WHO's 53 dB guideline applies to L<sub>den</sub>: a duration-weighted
+24-hour average that adds +5 dB to evening and +10 dB to night samples. It says
+nothing about an individual reading, an hourly average, or one day's average —
+yet all three get compared against it, in tables and in charts. The comparison
+always biases the same way: **toward understating exceedance.**
 
-- **EPA Noise Abatement Criteria (NAC)**
-  - Residential: 55 dB
-  - Commercial: 65 dB
-  - Industrial: 75 dB
-  - Federal lands: 60 dB
+This platform is built so each measured quantity can only be evaluated against a
+criterion defined on that same quantity, and so that it declines to answer where
+it cannot answer honestly.
 
-- **OSHA Permissible Exposure Limits (PEL)**
-  - 8-hour TWA: 90 dB
-  - Action Level: 85 dB
+## Capabilities
 
-### 📄 Reporting
-- Comprehensive reports (HTML)
-- ISO compliance reports
-- EPA compliance reports
-- Summary reports
-- Data export (Excel with multiple sheets)
+**Ingestion** — Reads CSV, XLSX, XLS, Parquet and Larson Davis WLG by byte
+signature rather than file extension, because logger exports are routinely
+mislabelled. Recovers timestamps from year-first, day-first and epoch formats,
+and reconstructs absolute time where an export preserved only a minute-of-hour
+clock. Detects silent truncation at spreadsheet row ceilings, which had been
+removing days of monitoring from source files without warning.
 
-### 👥 User-Friendly Interface
-- Intuitive 6-step workflow
-- Interactive tabs for different analysis views
-- Real-time status indicators
-- Mobile-responsive design
-- Easy-to-understand interpretations for non-technical users
+**Metrics** — L<sub>Aeq</sub>, L<sub>10</sub>/L<sub>50</sub>/L<sub>90</sub>,
+L<sub>dn</sub>, L<sub>den</sub>, L<sub>night</sub>, day and night period
+averages, L<sub>Amax</sub>, with interval-aware coverage and a gap inventory.
+L<sub>dn</sub> and L<sub>den</sub> are duration-weighted per ISO 1996-1 and
+EU 2002/49/EC rather than sample-weighted, so results do not depend on how many
+samples happened to fall in each period.
 
-## Installation
+**Assessment** — WHO 2018 (road, rail, aircraft, indoor), WHO Night Noise
+Guidelines 2009, and Maryland COMAR 26.02.03.02, each evaluated on its own
+metric and averaging window. Source-specific criteria are reported as indicative
+only: a source-blind meter cannot attribute noise to a source.
 
-### Prerequisites
-- Python 3.8+
-- pip (Python package manager)
+**Scale** — Merges arbitrary numbers of weekly exports into a single timeline
+with gap accounting; 18 files and 10.7M rows merge with zero loss and no
+duplicates. Multi-site comparison across up to six locations.
 
-### Setup Instructions
+**Reporting** — Technical PDF, plain-language community HTML, and Word. Every
+sentence is templated from a computed value; there is no language model in the
+reporting path.
 
-1. **Clone or download the project**
-```bash
-cd noise-analysis-platform/backend
-```
+## Where it declines to answer
 
-2. **Create a virtual environment** (optional but recommended)
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
+Each of these replaced a confident output the platform could not support:
 
-3. **Install dependencies**
+- **Unreadable timestamps** → every time-based result withheld, rather than
+  dated to the day the report happened to run
+- **A missing period** → no L<sub>dn</sub> or L<sub>den</sub>. A night-only
+  record yields no 24-hour index rather than one that reads as passing
+- **No L<sub>den</sub>** → no guideline verdict. L<sub>Aeq</sub> is never
+  substituted; it omits the evening and night penalties and would pass records
+  that fail
+- **Source attribution** → never inferred from level data
+- **Identifiers** → names, addresses and filenames withheld from every output,
+  including chart annotations rendered into images and Word document metadata.
+  A SHA-256 of the source file preserves chain of custody without disclosing
+  whose home produced it
+
+It also volunteers what weakens its own conclusions: when few samples dominate
+the energy average, the record's true coverage and gaps, that WHO guidelines are
+long-term averages while any deployment is finite, and the 1–3 dB combined
+uncertainty ISO 1996-2 associates with environmental measurement.
+
+## Verification
+
+The acoustic core is checked against an independent reimplementation written
+from the published metric definitions, sharing no code with the platform.
+
+| check | result |
+|---|---|
+| L<sub>Aeq</sub>, percentiles, all windows, L<sub>dn</sub>, L<sub>den</sub> vs independent reference | **0.000 dB** |
+| Cross-surface agreement — analyzer, API, compliance matrix, narrative prose, CSV export | **75 / 75** |
+| Adversarial shapes — multi-gap, extreme peak, constant, night-only, 1-min cadence, unsorted, DST | **12 / 12** |
+| API and report generation across 16 datasets | **288 calls, 0 failures** |
+| 18-file merge, 10,703,625 rows | **exact, 0 duplicates** |
+| Parquet vs XLSX, same record | **bit-identical** |
+
+The cross-surface check exists because a number being correct in one place does
+not mean the prose beside it says the same thing. It extracts figures from the
+generated sentences and compares them against the API and against ground truth.
+
+## Running it
+
 ```bash
 pip install -r requirements.txt
+python backend/app.py                  # http://127.0.0.1:5001
+
+python tools/make_demo_dataset.py      # synthetic record to try it with
+python tools/convert_to_parquet.py DIR # ~7x faster reads, half the size
 ```
 
-4. **Run the Flask application**
-```bash
-python app.py
+## Data format
+
+Any table with at least one dB column. Names are matched on acoustic tokens
+(`leq`, `laeq`, `lmax`, `lmin`, `db`, `spl`). A timestamp column enables the
+time-based metrics; without one, L<sub>Aeq</sub> and the percentile profile are
+still reported and everything time-dependent is withheld.
+
+```
+Time (Date hh:mm:ss.ms), L-Max dB -A , LEQ dB -A , L-Min dB -A
+2026/04/12 20:04:31.000, 48.545, 48.345, 48.145
 ```
 
-5. **Open in browser**
-```
-http://localhost:5001
-```
+## Stack
 
-## Usage
+Python · Flask · pandas · NumPy · SciPy · Plotly · ReportLab · python-docx ·
+Docker · Hugging Face Spaces
 
-### Step 1: Upload Data
-- Click the upload area or drag and drop your CSV/Excel file
-- Supported file formats:
-  - `.csv` - Comma-separated values
-  - `.xlsx` - Excel 2007+
-  - `.xls` - Excel 97-2003
+## Disclaimer
 
-### Step 2: Preview Data
-- Review the data preview to ensure correct file format
-- Check the number of records and columns
-- Proceed if data looks correct
+Analyses against published guideline and regulatory values. Not a substitute for
+a certified acoustic survey; instrument calibration records are held by the
+operator. For formal compliance determinations, consult a certified acoustic
+engineer.
 
-### Step 3: Analysis
-- Automatic comprehensive analysis runs
-- Analyzes noise levels, trends, and compliance
-
-### Step 4: View Results
-- **Executive Summary**: Key statistics and interpretations
-- **Statistics**: Detailed statistical measures
-- **Compliance**: Compliance against various standards
-- **Charts**: Interactive visualizations
-- **ISO/EPA Standards**: Detailed standards compliance
-
-### Step 5: Generate Reports
-- Generate comprehensive HTML reports
-- Create ISO-specific reports
-- Create EPA-specific reports
-- Export data to Excel with analysis
-
-## Data Format
-
-### Expected CSV Format
-```csv
-Timestamp,Location,Noise_Level_dB,Frequency_Hz
-2024-01-15 08:00:00,Site A,65.2,1000
-2024-01-15 08:15:00,Site A,64.8,1000
-2024-01-15 08:30:00,Site A,66.1,1000
-```
-
-### Column Requirements
-- **At least one column** containing noise measurements in dB
-- Column names should ideally contain: `db`, `decibel`, `level`, `sound`, `noise`, `spl`, `leq`, etc.
-- Optional: Time/date column for temporal analysis
-- Optional: Location or metadata columns
-
-### Example with Multiple Measurements
-```csv
-DateTime,Area,Noise_Database,Noise_Level_Avg,Noise_Level_Max
-2024-01-15 08:00:00,Residential,65.2,66.1
-2024-01-15 08:30:00,Residential,64.8,65.9
-2024-01-15 09:00:00,Residential,66.1,67.3
-```
-
-## Key Metrics Explained
-
-### Leq (Equivalent Level)
-The average noise level over the measurement period. Most commonly used metric for environmental noise.
-
-### Percentile Levels
-- **L5**: Noise level exceeded 5% of the time (higher values)
-- **L10**: Noise level exceeded 10% of the time
-- **L50**: Median noise level (50th percentile)
-- **L90**: Noise level exceeded 90% of the time (lower quiet periods)
-- **L95**: Noise level exceeded 95% of the time (quietest periods)
-
-### Coefficient of Variation (CV)
-Standardized measure of variability. Higher CV indicates more variable noise levels.
-
-### Trend Analysis
-Shows if noise levels are increasing, decreasing, or stable over time using linear regression.
-
-## ISO 1996 Standards
-
-### Daytime vs. Nighttime
-- **Daytime**: 06:00 - 22:00
-- **Nighttime**: 22:00 - 06:00
-
-### Health Implications
-- **< 40 dB**: No significant health effects
-- **40-50 dB**: Minor annoyance, possible sleep disturbance
-- **50-60 dB**: Moderate annoyance
-- **60-70 dB**: High annoyance, speech interference
-- **70-80 dB**: Severe annoyance, hearing damage risk
-- **> 80 dB**: DANGEROUS - Risk of hearing damage
-
-## Troubleshooting
-
-### File Upload Issues
-- Ensure file is CSV or Excel format
-- Check that file size is less than 50 MB
-- Verify the file is not corrupted
-
-### No Noise Columns Detected
-- Verify column name contains keywords: `db`, `level`, `noise`, `sound`, `spl`, `leq`
-- Alternatively, ensure numeric columns exist (excluding time/date/ID columns)
-
-### Analysis Errors
-- Ensure data contains numeric values in noise columns
-- Check for proper date/time formatting if using time-series analysis
-- Verify no special characters in column names
-
-## Project Structure
-```
-noise-analysis-platform/
-├── backend/
-│   ├── app.py                          # Main Flask application
-│   ├── requirements.txt                # Python dependencies
-│   └── analysis/
-│       ├── noise_analyzer.py           # Core analysis engine
-│       ├── iso_epa_standards.py        # Standards compliance checking
-│       └── report_generator.py         # Report generation
-├── frontend/
-│   ├── templates/
-│   │   └── index.html                  # Main HTML template
-│   └── static/
-│       ├── css/
-│       │   └── style.css               # Styling
-│       └── js/
-│           └── app.js                  # Frontend logic
-└── uploads/                            # Uploaded files storage
-```
-
-## Performance Notes
-
-- Typical analysis time: < 5 seconds for 1000 records
-- Supports files up to 50 MB
-- All processing happens server-side for accuracy
-
-## Future Enhancements
-
-- Real-time noise monitoring
-- Database storage for historical analysis
-- Advanced frequency analysis (octave bands)
-- Machine learning for predictive analysis
-- Integration with external noise databases
-- Multiple file batch processing
-- Custom threshold configuration
-
-## Compliance & Disclaimer
-
-This platform provides analysis based on:
-- ISO 1996-1:2016 Environmental Noise
-- EPA Noise Abatement Criteria
-- OSHA Occupational Noise Exposure Standards
-
-**Disclaimer**: This analysis is for informational purposes. For official compliance determinations and professional acoustic assessments, consult a certified acoustic engineer or environmental specialist.
-
-## Support
-
-For issues or questions:
-1. Check the troubleshooting section
-2. Verify your data format
-3. Review sample CSV files
-
-## License
-
-[Your License Here]
-
-## Version
-
-Version 1.0.0
-Last Updated: January 2024
+Developed for a community noise study at the Johns Hopkins Bloomberg School of
+Public Health. PI: Dr. Ana María Rule. No measurement data is included in this
+repository.

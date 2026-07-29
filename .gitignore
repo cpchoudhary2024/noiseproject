@@ -106,3 +106,7 @@ yarn-error.log
 *.orig
 *.rej
 .vercel
+
+# Generated demo data — regenerate with tools/make_demo_dataset.py
+demo_data/
+*.parquet
