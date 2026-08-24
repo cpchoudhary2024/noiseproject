@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
 """
 Enhanced Environmental Metrics Module
 Calculates advanced environmental analysis metrics for noise data

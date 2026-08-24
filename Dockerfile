@@ -27,7 +27,7 @@ COPY . .
 RUN mkdir -p uploads/raw artifacts/reports artifacts/charts logs \
     && chmod -R 777 uploads artifacts logs
 
-# HuggingFace Spaces requires port 7860
+# HuggingFace Spaces requires port 7860; Cloud Run injects its own $PORT.
 EXPOSE 7860
 
 # Run gunicorn from the backend directory so `from analysis.*` and `import retention` resolve
@@ -36,4 +36,8 @@ WORKDIR /app/backend
 # 1 worker (enough for 5-10 non-concurrent users), 2 threads. 10-min timeout:
 # a full-season merge (18 files, 10.7M rows) takes ~72 s to process, and a large
 # multipart upload over a domestic connection can add several minutes on top.
-CMD ["gunicorn", "--bind", "0.0.0.0:7860", "--timeout", "600", "--workers", "1", "--threads", "2", "app:app"]
+#
+# Shell form so $PORT expands at runtime: Cloud Run injects PORT and rejects a
+# container that does not listen on it, while HuggingFace Spaces leaves it unset
+# and expects 7860. `exec` keeps gunicorn as PID 1 so it still receives SIGTERM.
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-7860} --timeout 600 --workers 1 --threads 2 app:app"]

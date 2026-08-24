@@ -11,7 +11,6 @@ from werkzeug.utils import secure_filename
 from analysis.noise_analyzer import NoiseAnalyzer
 from analysis.report_generator import ReportGenerator
 from analysis.report_generator_v2 import ReportGeneratorV2
-from analysis.docx_generator import WordReportGenerator
 from analysis.iso_epa_standards import StandardsAnalyzer
 from analysis.data_summarizer import DataSummarizer
 from analysis.chart_generator import AdvancedChartGenerator
@@ -239,6 +238,23 @@ os.makedirs(ARTIFACTS_REPORTS_DIR, exist_ok=True)
 os.makedirs(ARTIFACTS_CHARTS_DIR, exist_ok=True)
 
 
+class TemporalFilterError(ValueError):
+    """A date range or exclusion was requested but could not be honoured.
+
+    Raised rather than returned so that no analysis can proceed on data the user
+    did not ask for. Every previous failure mode here was silent: the caller got
+    a DataFrame back and had no way to tell whether it had been filtered.
+    """
+
+
+def _filters_requested(filters: dict | None) -> bool:
+    """True when the user actually asked for a date bound or an exclusion."""
+    if not filters:
+        return False
+    return bool(filters.get('bound_start') or filters.get('bound_end')
+                or filters.get('exclusions'))
+
+
 def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFrame:
     """Apply user-defined temporal exclusions and date bounds to produce clean_df.
 
@@ -250,49 +266,102 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
 
     All analysis, visualisation, and compliance checks must run on the returned
     DataFrame so that results perfectly reflect the filtered data.
+
+    Raises:
+        TemporalFilterError: the filter could not be applied, or applying it left
+            no data. Both used to return the *unfiltered* frame instead, so a
+            report covering ten days was produced for someone who had asked for
+            four, with nothing anywhere to say so.
     """
-    if not filters or df.empty:
+    if df.empty or not _filters_requested(filters):
         return df
 
     time_col = resolve_time_column(df)
     if not time_col:
-        return df
+        raise TemporalFilterError(
+            "This file has no recognisable time column, so a date range cannot be "
+            "applied to it. Re-export the data with a full 'YYYY-MM-DD HH:MM:SS' "
+            "timestamp column, or run the analysis without a date filter."
+        )
+
     ts, _ = parse_timestamps_robust(df[time_col])
     valid_ts = ts.notna()
+    if not valid_ts.any():
+        raise TemporalFilterError(
+            f"The timestamps in column '{time_col}' could not be read, so the "
+            "requested date range cannot be applied. Re-export the data with a full "
+            "'YYYY-MM-DD HH:MM:SS' timestamp column, or run without a date filter."
+        )
 
-    keep = pd.Series(True, index=df.index)
+    # Rows whose timestamp could not be read are DROPPED, not kept. A row with no
+    # readable time cannot be shown to fall inside the requested window, and
+    # keeping it silently readmits data the user excluded — which is what the
+    # previous `(~valid_ts) | …` did, disabling the filter entirely on any file
+    # whose timestamps failed to parse.
+    keep = valid_ts.copy()
+    unreadable = int((~valid_ts).sum())
 
-    # --- Bounding: restrict to [bound_start, bound_end] ---
     bound_start = filters.get('bound_start')
     bound_end   = filters.get('bound_end')
     if bound_start:
         try:
-            start_dt = pd.to_datetime(bound_start)
-            keep &= (~valid_ts) | (ts >= start_dt)
-        except Exception:
-            pass
+            keep &= ts >= pd.to_datetime(bound_start)
+        except Exception as exc:
+            raise TemporalFilterError(f"Start date '{bound_start}' is not a valid date.") from exc
     if bound_end:
         try:
-            # Include the full last day
+            # Include the full last day.
             end_dt = pd.to_datetime(bound_end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-            keep &= (~valid_ts) | (ts <= end_dt)
-        except Exception:
-            pass
+            keep &= ts <= end_dt
+        except Exception as exc:
+            raise TemporalFilterError(f"End date '{bound_end}' is not a valid date.") from exc
 
-    # --- Exclusions: drop rows within each bad window ---
     for excl in (filters.get('exclusions') or []):
-        excl_start = excl.get('start')
-        excl_end   = excl.get('end')
-        if excl_start and excl_end:
-            try:
-                es = pd.to_datetime(excl_start)
-                ee = pd.to_datetime(excl_end)
-                keep &= (~valid_ts) | ~((ts >= es) & (ts <= ee))
-            except Exception:
-                pass
+        es_raw, ee_raw = excl.get('start'), excl.get('end')
+        if not (es_raw and ee_raw):
+            continue
+        try:
+            es, ee = pd.to_datetime(es_raw), pd.to_datetime(ee_raw)
+        except Exception as exc:
+            raise TemporalFilterError(
+                f"Exclusion window '{es_raw}' to '{ee_raw}' is not a valid date range."
+            ) from exc
+        keep &= ~((ts >= es) & (ts <= ee))
 
     clean_df = df[keep].copy()
-    return clean_df if not clean_df.empty else df
+    if clean_df.empty:
+        span = ''
+        if valid_ts.any():
+            span = (f" The file covers {ts.min():%d %b %Y} to {ts.max():%d %b %Y}.")
+        raise TemporalFilterError(
+            "The selected date range excludes every reading in this file, so there "
+            f"is nothing to analyse.{span} Check the dates and try again."
+        )
+
+    logger.info(
+        "[FILTER] %s rows in, %s retained, %s dropped (%s had unreadable timestamps)",
+        len(df), len(clean_df), len(df) - len(clean_df), unreadable
+    )
+    return clean_df
+
+
+
+def _filtered_or_400(df, filters, tag: str):
+    """Apply temporal filters, converting a refusal into a client-facing 400.
+
+    Returns ``(df, None)`` on success or ``(None, response)`` when the filter
+    could not be honoured. Callers must return the response unchanged — running
+    on unfiltered data after a failed filter is the bug this replaces.
+    """
+    try:
+        out = _apply_temporal_filters(df, filters)
+    except TemporalFilterError as exc:
+        logger.warning("[%s] Temporal filter rejected: %s", tag, exc)
+        return None, (jsonify({'error': str(exc), 'error_kind': 'temporal_filter'}), 400)
+    if _filters_requested(filters):
+        logger.info("[%s] Temporal filter applied: %s of %s rows retained",
+                    tag, len(out), len(df))
+    return out, None
 
 
 def _resolve_uploaded_filepath(filepath: str) -> str:
@@ -1075,9 +1144,24 @@ def analyze_data():
         # Apply temporal filtration if the user defined exclusions / bounds.
         # Filters bypass the analysis cache so the results match the clean_df exactly.
         filters = (data or {}).get('filters')
-        if filters:
-            df = _apply_temporal_filters(df, filters)
-            logger.info(f"[ANALYZE] Applied temporal filters: {len(df)} rows retained")
+        rows_before = len(df)
+        df, err = _filtered_or_400(df, filters, 'ANALYZE')
+        if err:
+            return err
+        # Reported back to the browser so the user can see the filter took
+        # effect. The previous silent behaviour gave them no way to tell.
+        filter_summary = None
+        if _filters_requested(filters):
+            _fts, _ = parse_timestamps_robust(df[resolve_time_column(df)]) \
+                if resolve_time_column(df) else (pd.Series(dtype='datetime64[ns]'), None)
+            _fts = _fts.dropna()
+            filter_summary = {
+                'applied': True,
+                'rows_before': rows_before,
+                'rows_after': len(df),
+                'range_start': _fts.min().isoformat() if not _fts.empty else None,
+                'range_end': _fts.max().isoformat() if not _fts.empty else None,
+            }
 
         # Check if analysis is already cached (only when no filters applied)
         cache_entry = _get_cache_entry(filepath)
@@ -1195,6 +1279,7 @@ def analyze_data():
             compliance_matrix = evaluate_compliance(
                 lden        = env_first.get('Lden'),
                 lnight      = env_first.get('Lnight'),
+                ldn         = env_first.get('Ldn'),
                 laeq        = float(stat_first.get('laeq_db') or stat_first.get('mean') or 0) or None,
                 laeq_day    = laeq_day,
                 laeq_night  = laeq_night,
@@ -1362,6 +1447,7 @@ def analyze_data():
             'compliance_matrix': compliance_matrix,
             'plain_english_summary': plain_english_summary,
             'timestamp_integrity': timestamp_integrity,
+            'filter_summary': filter_summary,
             'ingest_warnings': ingest_warnings,
             'key_findings': key_findings,
             'filepath': filepath
@@ -1523,6 +1609,7 @@ def compliance_check():
         matrix = evaluate_compliance(
             lden       = env_f.get('Lden'),
             lnight     = env_f.get('Lnight'),
+            ldn        = env_f.get('Ldn'),
             laeq       = float(stat_f.get('laeq_db') or stat_f.get('mean') or 0) or None,
             laeq_day   = env_f.get('LAeq_day'),
             laeq_night = env_f.get('LAeq_night') or env_f.get('Lnight'),
@@ -1649,9 +1736,9 @@ def generate_report():
         _set_progress(job_id, 15, 'Loading data…')
         df = _get_cached_df(filepath)
         filters = (data or {}).get('filters')
-        if filters:
-            df = _apply_temporal_filters(df, filters)
-            logger.info(f"[REPORT] Applied temporal filters: {len(df)} rows retained")
+        df, err = _filtered_or_400(df, filters, 'REPORT')
+        if err:
+            return err
 
         entry = _get_cache_entry(filepath) or {}
         analysis_cached = entry.get('analysis')
@@ -1712,22 +1799,27 @@ def generate_report():
             )
 
         _set_progress(job_id, 60, 'Generating document…')
-        if report_format == 'docx':
-            # Create Word report
-            word_gen = WordReportGenerator(
-                analysis_cached, standards_cached, daily_cached, hourly_cached,
-                device_id=device_id, source_files=source_files,
-                merge_gap_report=merge_gap_report,
-                filepath=filepath,
-            )
-            doc = word_gen.generate()
+        DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        out_dir = app.config['ARTIFACTS_REPORTS_DIR']
 
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f'noise_analysis_comprehensive_{timestamp}.docx'
-            report_path = os.path.join(app.config['ARTIFACTS_REPORTS_DIR'], filename)
-            doc.save(report_path)
-
-            mimetype = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        if report_type == 'resident':
+            # Two-page resident summary. Checked before the format branches so a
+            # docx request cannot fall through and hand back the full technical
+            # report instead.
+            generator = _make_generator()
+            if report_format == 'docx':
+                report_path = generator.generate_resident_docx_report(output_dir=out_dir)
+                mimetype = DOCX_MIME
+            else:
+                report_path = generator.generate_resident_pdf_report(output_dir=out_dir)
+                mimetype = 'application/pdf'
+        elif report_format == 'docx':
+            # Word is rendered from the same story as the PDF, so the two cannot
+            # disagree. This replaces WordReportGenerator, which built a separate
+            # document that did not match the PDF it sat beside.
+            generator = _make_generator()
+            report_path = generator.generate_docx_report(report_type, output_dir=out_dir)
+            mimetype = DOCX_MIME
         elif report_format in {'html', 'htm'}:
             generator = _make_generator()
             report_path = generator.generate_html_report(report_type, output_dir=app.config['ARTIFACTS_REPORTS_DIR']) if hasattr(generator, 'generate_html_report') else None
@@ -1793,8 +1885,9 @@ def get_computed_summaries():
 
         # Read data and apply any temporal filters before computing summaries
         df = read_input_file(filepath)
-        if filters:
-            df = _apply_temporal_filters(df, filters)
+        df, err = _filtered_or_400(df, filters, 'SUMMARY')
+        if err:
+            return err
 
         from analysis.report_generator_v2 import ReportGeneratorV2
         rg = ReportGeneratorV2(df, filepath)
@@ -2309,8 +2402,9 @@ def get_temporal_heatmap():
         
         df = _get_cached_df(filepath)
         filters = (data or {}).get('filters')
-        if filters:
-            df = _apply_temporal_filters(df, filters)
+        df, err = _filtered_or_400(df, filters, 'CHART')
+        if err:
+            return err
 
         noise_col = _resolve_noise_column(df, noise_col)
         if not noise_col:
@@ -2349,8 +2443,9 @@ def get_diurnal_boxplot():
 
         df = _get_cached_df(filepath)
         filters = (data or {}).get('filters')
-        if filters:
-            df = _apply_temporal_filters(df, filters)
+        df, err = _filtered_or_400(df, filters, 'CHART')
+        if err:
+            return err
 
         noise_col = _resolve_noise_column(df, noise_col)
         if not noise_col:
@@ -2586,7 +2681,11 @@ def validate_filters():
 
         df = _get_cached_df(filepath)
         total_rows = len(df)
-        clean_df = _apply_temporal_filters(df, filters)
+        try:
+            clean_df = _apply_temporal_filters(df, filters)
+        except TemporalFilterError as exc:
+            return jsonify({'success': False, 'error': str(exc),
+                            'error_kind': 'temporal_filter'}), 400
         retained_rows = len(clean_df)
         dropped_rows  = total_rows - retained_rows
 

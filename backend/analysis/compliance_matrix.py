@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
 """
 Compliance standards matrix — ground-truth sourced exclusively from:
 
@@ -7,12 +8,65 @@ Compliance standards matrix — ground-truth sourced exclusively from:
   • WHO Guidelines for Community Noise (Berglund et al., 1999)
     https://iris.who.int/handle/10665/66217
 
-  • Maryland Code of Maryland Regulations (COMAR) 26.02.03.02
-    Maximum Allowable Noise Levels
+  • Maryland Code of Maryland Regulations (COMAR) 26.02.03
+    .01 Definitions  ·  .02 Environmental Noise Standards (Table 1, goals)
+    .03 General Regulations (Table 2, maximum allowable levels)
+
+VERIFICATION (5 Aug 2026). Values below were checked against primary sources,
+not against secondary summaries:
+  • WHO 2018 road/rail/aircraft/wind-turbine Lden and Lnight — confirmed against
+    the WHO Compendium of WHO and other UN guidance on health and environment,
+    chapter 11 "Environmental noise", 2022 update (cdn.who.int).
+  • Lden and Lnight period definitions — confirmed against Directive 2002/49/EC
+    Annex I: day 07:00-19:00 (12 h), evening 19:00-23:00 (4 h, +5 dB), night
+    23:00-07:00 (8 h, +10 dB), averaged over a YEAR. Member States may shorten
+    the evening by 1-2 h; the defaults are used here.
+  • Maryland COMAR 26.02.03 — confirmed against the regulation text.
+    .01B(5)  "Daytime hours" = 7 a.m. to 10 p.m.
+    .01B(15) "Nighttime hours" = 10 p.m. to 7 a.m.
+    .01B(4)  Ldn = 24 h energy average, +10 dB applied to 10 p.m.-7 a.m.
+    .02  Table 1 (GOALS): Industrial 70 dBA Leq(24), Commercial 64 dBA Ldn,
+         Residential 55 dBA Ldn.
+    .03  Table 2 (ENFORCEABLE, "a person may not cause or permit noise levels
+         which exceed those specified in Table 2"):
+         Day 75/67/65, Night 75/62/55 dBA for industrial/commercial/residential.
+         Table 2 states NO averaging period — see MD_TABLE2_METRIC_NOTE.
 
 IMPORTANT: OSHA/NIOSH occupational standards are deliberately excluded from
 the environmental compliance matrix. They belong in an occupational assessment
 context only (datasets from industrial worksites with shift-worker exposure).
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ KNOWN CONFLICT — read before changing any limit or writing anything about    ║
+║ limits, in this repo or in a report.                                         ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ The study's own participant handout, "Noise Limits Guidelines pdf.pdf"        ║
+║ (Understanding Noise: A Resident's Complete Guide), carries a "Safe Limits    ║
+║ Summary" that does NOT come from WHO, although it is captioned as derived     ║
+║ from the WHO 2018 guidelines:                                                 ║
+║                                                                               ║
+║     Daytime   07:00-19:00   outside the home   below 55 dB                    ║
+║     Evening   19:00-23:00   outside the home   below 50 dB                    ║
+║     Night     23:00-07:00   outside the home   below 45 dB                    ║
+║                                                                               ║
+║ WHO 2018 publishes no such per-period outdoor thresholds. It publishes Lden   ║
+║ 53 dB and Lnight 45 dB for road traffic, and Lden is a single penalty-        ║
+║ weighted annual figure that cannot be decomposed into separate day and        ║
+║ evening limits. The 55 and 50 dB values appear to be back-calculated from     ║
+║ Lden 53 by removing the +5/+10 dB penalties. That is an inference, not a      ║
+║ WHO recommendation, and it is not labelled as one in the handout.             ║
+║                                                                               ║
+║ Only the night value (45 dB) coincides with a real WHO figure, and even that  ║
+║ agreement is incidental — WHO's 45 dB is an Lnight annual average, not a      ║
+║ "stay below this" outdoor threshold.                                          ║
+║                                                                               ║
+║ STATUS: the platform and its reports follow WHO as published (Lden 53 /       ║
+║ Lnight 45) and do NOT reproduce the handout's table. The handout is a         ║
+║ compiled PDF and has not been corrected. Anyone comparing a report against    ║
+║ the handout will find a discrepancy on the day and evening rows; it is the    ║
+║ handout that needs revising, not the report.                                  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 """
 from __future__ import annotations
 
@@ -36,14 +90,36 @@ WHO_BEDROOM_LAMAX = 45.0  # dB(A) — bedroom, single event (prevent awakening)
 WHO_LIVING_LAEQ   = 35.0  # dB(A) — living room
 WHO_CLASS_LAEQ    = 35.0  # dB(A) — classroom
 
-# ── Maryland COMAR 26.02.03.02 ────────────────────────────────────────────────
-# Daytime = 07:00–22:00  /  Nighttime = 22:00–07:00  (Maryland definition)
+# ── Maryland COMAR 26.02.03.03 Table 2 — maximum allowable levels ─────────────
+# Daytime = 07:00–22:00  /  Nighttime = 22:00–07:00  (COMAR .01B(5) and .01B(15))
 MD_RESIDENTIAL_DAY    = 65.0   # dB(A)
 MD_RESIDENTIAL_NIGHT  = 55.0   # dB(A)
 MD_COMMERCIAL_DAY     = 67.0   # dB(A)
 MD_COMMERCIAL_NIGHT   = 62.0   # dB(A)
 MD_INDUSTRIAL_DAY     = 75.0   # dB(A)
 MD_INDUSTRIAL_NIGHT   = 75.0   # dB(A)
+
+# ── Maryland COMAR 26.02.03.02 Table 1 — environmental noise standards ────────
+# The state's GOALS, distinct from the enforceable Table 2 above and expressed
+# on different metrics. The residential goal is an Ldn, which this platform
+# computes directly, and COMAR's own Ldn definition (.01B(4): +10 dB applied to
+# 10 p.m.–7 a.m.) matches the Ldn implemented in acoustics.py exactly.
+MD_GOAL_RESIDENTIAL_LDN = 55.0   # dB(A) Ldn
+MD_GOAL_COMMERCIAL_LDN  = 64.0   # dB(A) Ldn
+MD_GOAL_INDUSTRIAL_LEQ24 = 70.0  # dB(A) Leq(24)
+
+# COMAR Table 2 is headed "Maximum Allowable Noise Levels (dBA)" and states no
+# averaging period. The regulation defines "equivalent sound level" in .01B(13)
+# and says in .02A(2) that the STANDARDS (Table 1) are expressed in equivalent
+# levels, but it does not say the same of Table 2. Comparing a period LAeq
+# against Table 2 is therefore a reading of the regulation, not a quotation of
+# it, and every row derived from Table 2 says so rather than implying the
+# regulation settled the question.
+MD_TABLE2_METRIC_NOTE = (
+    "COMAR Table 2 is stated in dB(A) with no averaging period given. This "
+    "report compares it against the LAeq of the period, which is the most "
+    "common reading; a not-to-exceed reading of the same table would be stricter."
+)
 
 
 @dataclass(frozen=True)
@@ -169,7 +245,7 @@ MATRIX: list[StandardRow] = [
         standard="WHO Indoor — Bedroom (average)",
         metric="LAeq",
         limit_db=WHO_BEDROOM_LAEQ,
-        source="WHO Guidelines for Community Noise (1999); WHO 2018, indoor guidelines",
+        source="WHO Guidelines for Community Noise (1999), Table 4.1",
         tooltip=(
             "Indoor bedroom average level to protect sleep quality. "
             "30 dB(A) represents a near-quiet environment essential for restorative "
@@ -185,7 +261,7 @@ MATRIX: list[StandardRow] = [
         standard="WHO Indoor — Bedroom (single event)",
         metric="LAmax",
         limit_db=WHO_BEDROOM_LAMAX,
-        source="WHO Guidelines for Community Noise (1999); WHO 2018",
+        source="WHO Guidelines for Community Noise (1999), Table 4.1",
         tooltip=(
             "A single noise event above 45 dB(A) inside the bedroom is sufficient "
             "to cause sleep arousal — the WHO threshold to prevent awakening. "
@@ -199,28 +275,58 @@ MATRIX: list[StandardRow] = [
 
     # ── Maryland COMAR — Residential ─────────────────────────────────────────
     StandardRow(
-        standard="MD COMAR Day (07:00-22:00) LAeq",
+        standard="MD COMAR Day (07:00-22:00)",
         metric="LAeq (07:00–22:00)",
         limit_db=MD_RESIDENTIAL_DAY,
-        source="COMAR 26.02.03.02 — Maximum Allowable Noise Levels",
+        source="COMAR 26.02.03.03 Table 2 — Maximum Allowable Noise Levels (residential)",
         tooltip=(
-            "Maryland state legal limit for residential zones, 7 AM to 10 PM. "
-            "Note: This 65 dB limit exceeds the WHO 53 dB Lden guideline by 12 dB. "
-            "A noise level can be fully legal under Maryland law while still "
-            "exceeding WHO health-protective guidelines."
+            "Maryland's enforceable residential limit, 7 a.m. to 10 p.m. "
+            "(COMAR .01B(5) defines daytime hours). It is measured at or within "
+            "the property line of the RECEIVING property, not at the source "
+            "(.03D(2)). " + MD_TABLE2_METRIC_NOTE + " "
+            "At 65 dB(A) it is 12 dB above the WHO 53 dB Lden guideline: a level "
+            "can be fully legal under Maryland law and still exceed the WHO "
+            "health-based guideline."
         ),
         category="maryland",
     ),
     StandardRow(
-        standard="MD COMAR Night (22:00-07:00) LAeq",
+        standard="MD COMAR Night (22:00-07:00)",
         metric="LAeq (22:00–07:00)",
         limit_db=MD_RESIDENTIAL_NIGHT,
-        source="COMAR 26.02.03.02 — Maximum Allowable Noise Levels",
+        source="COMAR 26.02.03.03 Table 2 — Maximum Allowable Noise Levels (residential)",
         tooltip=(
-            "Maryland nighttime residential legal limit (10 PM – 7 AM). "
-            "At 55 dB, this is 10 dB higher than the WHO 45 dB Lnight guideline. "
-            "Maryland defines nighttime one hour earlier (10 PM) than WHO (11 PM). "
-            "Compliance with Maryland law does not imply absence of health risk."
+            "Maryland's enforceable residential limit, 10 p.m. to 7 a.m. "
+            "(COMAR .01B(15) defines nighttime hours). " + MD_TABLE2_METRIC_NOTE + " "
+            "At 55 dB(A) it is 10 dB above the WHO 45 dB Lnight guideline, and "
+            "Maryland's night starts an hour earlier (10 p.m.) than the WHO night "
+            "used for Lnight (11 p.m.), so the two cover different windows. "
+            "Prominent discrete tones and periodic noises must be 5 dB(A) below "
+            "this level (COMAR .03A(3))."
+        ),
+        category="maryland",
+    ),
+
+    # ── Maryland COMAR .02 Table 1 — state environmental noise goal ───────────
+    # Distinct from Table 2 above: Table 1 is the goal the state is working
+    # toward, and for residential zones it is stated on Ldn — the one Maryland
+    # figure directly comparable with a long-term average rather than with a
+    # period level. Omitting it left the report silent on the state's own
+    # health-oriented standard while quoting only its enforcement floor.
+    StandardRow(
+        standard="MD COMAR environmental noise goal (residential)",
+        metric="Ldn",
+        limit_db=MD_GOAL_RESIDENTIAL_LDN,
+        source="COMAR 26.02.03.02 Table 1 — Environmental Noise Standards",
+        tooltip=(
+            "Maryland's environmental noise standard for residential zoning "
+            "districts, 55 dB(A) Ldn. COMAR .02B(1) calls the Table 1 values "
+            "\"goals for the attainment of an adequate environment\", which the "
+            "enforceable Table 2 limits are intended to achieve — so this is a "
+            "target rather than a level a person may not exceed. "
+            "Ldn is defined in COMAR .01B(4) as the 24-hour energy average with "
+            "+10 dB applied to 10 p.m.–7 a.m., which is exactly the Ldn computed "
+            "in this report."
         ),
         category="maryland",
     ),
@@ -231,6 +337,7 @@ def evaluate_compliance(
     *,
     lden: float | None = None,
     lnight: float | None = None,
+    ldn: float | None = None,
     laeq: float | None = None,
     laeq_day: float | None = None,
     laeq_night: float | None = None,
@@ -275,8 +382,9 @@ def evaluate_compliance(
         (MATRIX[5], lnight),        # WHO Railway Lnight  (indicative)
         (MATRIX[6], laeq),          # WHO Bedroom LAeq    (indoor only)
         (MATRIX[7], lamax),         # WHO Bedroom LAmax   (indoor only)
-        (MATRIX[8], laeq_day),      # Maryland Residential Day
-        (MATRIX[9], laeq_night),    # Maryland Residential Night
+        (MATRIX[8], laeq_day),      # Maryland Residential Day   (Table 2)
+        (MATRIX[9], laeq_night),    # Maryland Residential Night (Table 2)
+        (MATRIX[10], ldn),          # Maryland residential goal  (Table 1, Ldn)
     ]
 
     results: list[dict] = []

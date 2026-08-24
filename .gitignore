@@ -53,11 +53,10 @@ noise_analysis.db
 *.db
 *.sqlite
 
-# Analyzed files copy
-analyzed likely files copy/
-
-# Standards sources (large PDFs)
-standards_sources/
+# Measurement data and generated reports (never committed)
+data/*
+reports/
+docs/reference/
 
 # Flask
 instance/
@@ -110,3 +109,86 @@ yarn-error.log
 # Generated demo data — regenerate with tools/make_demo_dataset.py
 demo_data/
 *.parquet
+
+# ─── Data-engineering hygiene (added by audit) ───
+# Secrets — never commit credentials
+.env
+.env.*
+!.env.example
+
+# Raw / bulk data: keep on disk, keep out of git (regenerate or fetch on demand)
+data/raw/*
+data/cache/
+*.nc
+*.nc4
+*.hdf5
+*.parquet
+*.zip
+*.7z
+
+# Build artifacts & dependency trees
+node_modules/
+dist/
+build/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# Stray logs & run debris
+*.log
+logs/
+*.pid
+
+# Office lock/temp files (e.g. ~$report.docx)
+~$*
+*.tmp
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Bulk acoustic records & generated deliverables
+data/*
+reports/
+latest reports/
+artifacts/
+
+# ─── Keep the standard scaffold under version control ───
+!data/raw/
+!data/processed/
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!outputs/
+!outputs/plots/
+!outputs/plots/.gitkeep
+!notebooks/
+
+# ─── PII GUARD — participant identities (never publish) ───
+# These scripts embed study-participant names and home street addresses in
+# site-mapping dictionaries. They are deliberately kept local: useful for
+# generating resident-facing deliverables, unsafe to publish.
+# Verified untracked and absent from git history at the time this was added.
+tools/build_word_reports.py
+tools/build_brief.py
+tools/build_control_comparison.py
+tools/build_boxplot_assessment.py
+tools/compute_exceedance.py
+tools/data/exceedance_results.json
+
+# Raw logger folders are named by participant (site code + given name).
+data/raw/community-loggers/
+
+# Resident-facing deliverables carry names/addresses on the page.
+Resident*Report*.docx
+*Home ?*.docx

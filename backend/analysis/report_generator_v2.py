@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -13,10 +14,16 @@ from analysis.iso_epa_standards import StandardsAnalyzer
 from analysis.standards_reference import who_2018_environmental_noise_guideline_levels
 from analysis.chart_generator import AdvancedChartGenerator
 from analysis.acoustics import (compute_ldn_lden, energetic_mean_db,
-                                exceedance_levels_db, energy_concentration)
+                                exceedance_levels_db, energy_concentration,
+                                time_above_level_by_period, time_above_level_in_window,
+                                nightly_lnight, LDEN_DEFAULT)
 from analysis.gap_detector import detect_gaps, gap_report_to_dict, data_completeness_pct, _modal_interval_seconds
-from analysis.compliance_matrix import evaluate_compliance
+from analysis.docx_from_story import render_story_to_docx, PageTrackingDocTemplate
+from analysis.compliance_matrix import (evaluate_compliance,
+                                        MD_RESIDENTIAL_DAY, MD_RESIDENTIAL_NIGHT,
+                                        WHO_ROAD_LDEN, WHO_ROAD_LNIGHT)
 import io
+from typing import NamedTuple
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
@@ -63,7 +70,7 @@ DEFAULT_INSTRUMENT_NOTE = (
 # Labels that are safe to print: study codes, home letters, device serials.
 _SAFE_LABEL_RE = re.compile(
     r'^(?:'
-    r'home\s*[A-Z]|'                      # Home A, Home D
+    r'(?:home|house)\s*[A-Z]|'            # Home A, House D
     r'(?:conv|pair|site|loc|dev|unit)\s*[-_]?\d{1,4}|'   # CONV001, SITE-12
     r'[A-Z]{1,6}[-_]?\d{1,6}|'            # MON-4471, SLM12
     r'\d{1,6}'                            # bare numeric id
@@ -72,10 +79,153 @@ _SAFE_LABEL_RE = re.compile(
 )
 
 
+# Matches the home/house labels above, so they can be normalised for display
+# ("home a" -> "Home A") before being printed into a chart title.
+_HOME_LABEL_RE = re.compile(r'^(home|house)\s*([A-Za-z])$', re.IGNORECASE)
+
+
 def is_safe_label(value: str) -> bool:
     """True when ``value`` is a study code rather than a personal identifier."""
     v = str(value or '').strip()
     return bool(v) and bool(_SAFE_LABEL_RE.match(v))
+
+
+# Averaging intervals offered for the Chart 1 time history.
+#
+# Only intervals that are conventional reporting units in environmental
+# acoustics: the 15-minute LAeq (short-term monitoring), the 1-hour LAeq (the
+# standard long-term interval, and the interval Lden, Lnight and the COMAR
+# period limits are built from), and the 24-hour LAeq (the daily figure). The
+# 6-hour average previously used here is not a reporting interval in acoustics —
+# it was chosen only to reduce the point count — so a reader could not relate a
+# plotted point to any metric in the rest of the report. It is no longer offered.
+_TS_BIN_CHOICES: tuple[tuple[pd.Timedelta, str, str], ...] = (
+    (pd.Timedelta(minutes=15), '15min', '15-minute'),
+    (pd.Timedelta(hours=1),    '1h',    '1-hour'),
+    (pd.Timedelta(days=1),     '1D',    '24-hour'),
+)
+
+# Above roughly this many points a line stops reading as a trace and fills in as
+# a solid band, hiding both the shape and the envelope behind it.
+_TS_MAX_POINTS = 1500
+
+
+def ts_resample_rule(span: pd.Timedelta) -> tuple[str, str]:
+    """Choose the Chart 1 averaging interval for a record of length ``span``.
+
+    The finest standard interval that keeps the trace legible. Selecting on a
+    point budget rather than on fixed day thresholds means the choice stays
+    correct for any record length, including the ones between the thresholds
+    that a fixed ladder handles badly.
+
+    Parameters
+    ----------
+    span : pandas.Timedelta
+        Elapsed time between the first and last measurement.
+
+    Returns
+    -------
+    tuple of (str, str)
+        ``(pandas_freq, human_label)`` — e.g. ``('1h', '1-hour')``.
+    """
+    for interval, freq, label in _TS_BIN_CHOICES:
+        if span / interval <= _TS_MAX_POINTS:
+            return freq, label
+    return _TS_BIN_CHOICES[-1][1], _TS_BIN_CHOICES[-1][2]
+
+
+def ts_rolling_window(span: pd.Timedelta, bin_interval: pd.Timedelta) -> tuple[pd.Timedelta, str]:
+    """Choose the smoothing window for the Chart 1 trend line.
+
+    Environmental noise is dominated by the diurnal cycle, so the window is set
+    to the cycle it should remove rather than to a fixed number of bins:
+
+    * **24 hours** for any record of three days or more. One full cycle, so the
+      day/night oscillation averages out and what remains is the day-to-day
+      trend — the quantity a trend line on a multi-day record should show.
+    * **1 hour** for records shorter than three days. There are too few cycles
+      to average over, and the diurnal shape is the finding rather than
+      something to remove, so the line only takes out sample-to-sample scatter.
+    * **7 days** once the bins are themselves daily, where a 24-hour window
+      would be a single bin and the trend line would duplicate the LAeq trace.
+
+    Returns
+    -------
+    tuple of (pandas.Timedelta, str)
+        The window and its label, e.g. ``'24-hour'``.
+    """
+    if bin_interval >= pd.Timedelta(days=1):
+        return pd.Timedelta(days=7), '7-day'
+    if span < pd.Timedelta(days=3):
+        return pd.Timedelta(hours=1), '1-hour'
+    return pd.Timedelta(days=1), '24-hour'
+
+
+# Baseline y-axis window for the Chart 1 time series, in dB(A).
+#
+# Anchored rather than autoscaled so the 45 dB and 53 dB reference lines occupy
+# the same position in every report and two reports remain comparable by eye.
+# Chosen to hold the range of environmental noise these loggers record while
+# leaving clear headroom above 53 and below 45. It is a floor on the window, not
+# a clip: data outside it extends the axis.
+Y_AXIS_BASE_WINDOW_DB: tuple[float, float] = (30.0, 90.0)
+
+# Chart typography, in POINTS AT FINAL PRINT SIZE.
+#
+# Plotly font sizes are pixels on the figure canvas, and the canvas is then
+# scaled to fit its box on the page — so the same numeric size renders at a
+# different physical size in every chart, depending on how wide its canvas is
+# relative to its print box. Setting pixels directly is therefore not a way to
+# control legibility: a 13 px label is 12.6 pt in a 700 px canvas printed 9.4 in
+# wide, and 6.2 pt in a 1095 px canvas printed 7.3 in wide.
+#
+# These are declared in points and converted to canvas pixels by
+# ``_size_fig_for_print``, which is the only place that knows both numbers.
+# Every value clears the 8 pt floor this project requires for publication
+# figures.
+CHART_TITLE_PT = 13.0
+CHART_LEGEND_PT = 9.5
+CHART_AXIS_TITLE_PT = 10.5
+CHART_TICK_PT = 9.0
+CHART_ANNOTATION_PT = 9.0
+CHART_FONT_COLOR = '#1F2933'
+
+
+def ts_resample_ladder_text() -> str:
+    """State the averaging interval as the record lengths it applies to.
+
+    Computed from the point budget rather than written out, so the sentence in
+    the report always describes what ``ts_resample_rule`` actually does. A
+    reader wants to know which interval their own record gets, not the rule the
+    code applies to work it out.
+    """
+    parts = []
+    for i, (interval, _freq, label) in enumerate(_TS_BIN_CHOICES):
+        if i == len(_TS_BIN_CHOICES) - 1:
+            parts.append(f"{label} beyond that")
+            break
+        # Longest record this interval still fits inside the budget, in whole
+        # days — floored, so the stated bound is one the rule really honours.
+        max_days = int((interval * _TS_MAX_POINTS).total_seconds() // 86400)
+        parts.append(f"{label} for records up to {max_days} days")
+    return ", ".join(parts[:-1]) + f", and {parts[-1]}"
+
+
+class TimeSeriesBinning(NamedTuple):
+    """How Chart 1 was binned, so the caption can state it rather than guess.
+
+    Attributes
+    ----------
+    freq : str
+        pandas resample rule actually used, e.g. ``'1h'``.
+    bin_label : str
+        Bin length in words, e.g. ``'1-hour'``.
+    window_label : str
+        Wall-clock span of the rolling-median window, e.g. ``'4-hour'``.
+    """
+    freq: str = ''
+    bin_label: str = ''
+    window_label: str = ''
 
 
 def deidentify_label(value: str, fallback: str) -> tuple[str, bool]:
@@ -651,8 +801,15 @@ class ReportGeneratorV2:
             laeq_day = energetic_mean_db(leq_vals[is_day]) if is_day.any() else None
             laeq_night = energetic_mean_db(leq_vals[is_night]) if is_night.any() else None
             
-            # Lden for the day (with penalties)
-            _lden_out = compute_ldn_lden(group['ts'][is_day], leq_vals[is_day]) if is_day.any() else None
+            # Lden for the day (with penalties).
+            #
+            # The WHOLE calendar day, not the daytime slice. Lden is defined over
+            # 24 hours as day + evening + night, and compute_ldn_lden correctly
+            # refuses to return a value when a constituent period has no data —
+            # so passing only 07:00-22:00 left the night component empty and
+            # produced None for every single day. The Lden column of the daily
+            # matrix has been blank ever since.
+            _lden_out = compute_ldn_lden(group['ts'], leq_vals)
             lden_day = _lden_out.get('Lden') if _lden_out else None
             
             daily_rows.append({
@@ -692,17 +849,83 @@ class ReportGeneratorV2:
             self.hourly_summary = pd.DataFrame(hourly_rows).sort_values('Hour').reset_index(drop=True)
             print(f"[Report] Computed hourly summary: {len(self.hourly_summary)} hours")
     
+    # Page geometry, shared by the PDF and Word paths so both documents lay out
+    # on the same sheet with the same text block.
+    TECHNICAL_PAGE = dict(width_in=11.0, height_in=8.5,
+                          margins_in=(0.5, 0.5, 0.75, 0.75))
+    RESIDENT_PAGE = dict(width_in=8.5, height_in=11.0,
+                         margins_in=(0.6, 0.6, 0.6, 0.6))
+
     def generate_pdf_report(self, report_type='comprehensive', output_dir: str | None = None):
-        """Generate an 8-section publication-grade PDF report."""
-        
+        """Generate the 8-section publication-grade PDF report."""
         report_filename = f"noise_analysis_{report_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
         report_dir = output_dir or os.path.dirname(self.filepath)
         os.makedirs(report_dir, exist_ok=True)
         report_path = os.path.join(report_dir, report_filename)
 
-        doc = SimpleDocTemplate(report_path, pagesize=(11*inch, 8.5*inch), 
-                               topMargin=0.5*inch, bottomMargin=0.5*inch, 
-                               leftMargin=0.75*inch, rightMargin=0.75*inch)
+        doc = self._technical_doc_template(report_path)
+        story = self._build_technical_story(doc, report_type)
+        doc.build(story, onFirstPage=self._add_page_template, onLaterPages=self._add_page_template)
+        return report_path
+
+    def generate_docx_report(self, report_type='comprehensive', output_dir: str | None = None):
+        """The same report as :meth:`generate_pdf_report`, as an editable Word file.
+
+        Built from the identical story, so the two documents cannot diverge.
+        """
+        report_filename = f"noise_analysis_{report_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        report_dir = output_dir or os.path.dirname(self.filepath)
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, report_filename)
+
+        doc = self._technical_doc_template(io.BytesIO())
+        story = self._build_technical_story(doc, report_type)
+        page_of = self._paginate(doc, story)
+        return render_story_to_docx(
+            story, report_path,
+            page_width_in=self.TECHNICAL_PAGE['width_in'],
+            page_height_in=self.TECHNICAL_PAGE['height_in'],
+            margins_in=self.TECHNICAL_PAGE['margins_in'],
+            footer_lines=self._footer_lines(),
+            page_of=page_of,
+        )
+
+    def _technical_doc_template(self, path: str) -> SimpleDocTemplate:
+        g = self.TECHNICAL_PAGE
+        top, bottom, left, right = g['margins_in']
+        return PageTrackingDocTemplate(
+            path, pagesize=(g['width_in'] * inch, g['height_in'] * inch),
+            topMargin=top * inch, bottomMargin=bottom * inch,
+            leftMargin=left * inch, rightMargin=right * inch,
+        )
+
+    @staticmethod
+    def _paginate(doc, story: list) -> dict[int, int]:
+        """Lay the story out and report which page each flowable landed on.
+
+        The layout is thrown away — only the page numbers are wanted. Building
+        against a BytesIO keeps it off disk. ReportLab consumes the story list
+        during build, so a copy is passed and the caller's list stays intact for
+        the Word renderer to walk.
+        """
+        doc.build(list(story))
+        return dict(doc.flowable_pages)
+
+    @staticmethod
+    def _footer_lines() -> tuple[str, ...]:
+        """Footer text, matching what _add_page_template draws on the PDF."""
+        return (
+            f"Environmental Noise Analysis | {datetime.now().strftime('%Y-%m-%d')}",
+            "Developed by Chandra Prakash Choudhary | PI: Dr. Ana María Rule, "
+            "Associate Professor — Johns Hopkins University",
+        )
+
+    def _build_technical_story(self, doc, report_type='comprehensive') -> list:
+        """Assemble the technical report as a ReportLab story.
+
+        The single definition of the report's content. Both the PDF and the Word
+        renderer consume what this returns, so a change here reaches both.
+        """
         styles = self._get_pdf_styles()
         story = []
 
@@ -763,7 +986,11 @@ class ReportGeneratorV2:
         if time_based_ok:
             # Section 5: Daily Summary Matrix
             self._add_section_5_daily_matrix(story, styles)
-            story.append(PageBreak())
+            # No forced break here. Section 5's table is as long as the record,
+            # so a fixed break left whatever it did not use blank — 60% of a
+            # page on a one-week record. Section 6 now flows on behind it and
+            # starts a page of its own only when it genuinely needs one.
+            story.append(Spacer(1, 0.2 * inch))
 
             # Section 6: Diurnal Hourly Profile
             self._add_section_6_hourly_profile(story, styles, ts=ts)
@@ -784,576 +1011,963 @@ class ReportGeneratorV2:
         
         # Section 9: Methodological Limitations & Disclaimer
         self._add_section_9_disclaimer(story, styles)
-        
-        doc.build(story, onFirstPage=self._add_page_template, onLaterPages=self._add_page_template)
-        
-        return report_path
 
-    def generate_html_report(self, report_type='comprehensive', output_dir: str | None = None):
-        """Generate a plain-language Community Noise Report for non-expert readers.
+        return story
 
-        Designed for research-study participants: a clear headline, friendly key
-        numbers, three intuitive visuals (how your noise compares, day-by-day
-        trend, a typical day), plus plain-language health meaning and actions.
-        No percentile tables, box-and-whisker, radar charts, or pass/fail jargon.
+    # ============================================================
+    # RESIDENT REPORT (two pages, three charts)
+    # ============================================================
+
+    def _display_location_label(self) -> str:
+        """The location label as it should be printed, or '' if none is printable.
+
+        Only study codes reach print — the same allow-list the rest of the report
+        de-identifies against — so a free-text entry cannot leak into a chart
+        title, where it would be baked into the image and survive every
+        text-level check. ``home a`` is normalised to ``Home A``.
         """
-        report_filename = f"community_noise_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        label = str(self.device_id or '').strip()
+        if not label or not is_safe_label(label):
+            return ''
+        m = _HOME_LABEL_RE.match(label)
+        return f"{m.group(1).capitalize()} {m.group(2).upper()}" if m else label
+
+    def _chart_location_suffix(self) -> str:
+        """`' at Home A'` for chart titles, or `''` when no label was supplied."""
+        label = self._display_location_label()
+        return f" at {label}" if label else ""
+
+    # Name given to the provenance annotation, so it can be found and removed
+    # without disturbing any other annotation on the figure.
+    SOURCE_ANNOTATION_NAME = 'figure-source'
+    # Reference-line labels drawn outside the plot frame, in the right margin.
+    REF_LABEL_ANNOTATION_NAME = 'ref-line-label'
+
+    @staticmethod
+    def _apply_chart_typography(fig, *, title: str):
+        """Embolden the title. Sizes are applied later by ``_size_fig_for_print``,
+        which is the only place that knows the print box the canvas maps onto.
+
+        Parameters
+        ----------
+        title : str
+            Plain title text. Emboldened here — do not pass markup.
+        """
+        fig.update_layout(title=dict(text=f"<b>{title}</b>", font=dict(color=CHART_FONT_COLOR)))
+        return fig
+
+    @staticmethod
+    def _scale_fig_fonts(fig, *, px_per_pt: float):
+        """Set every font on ``fig`` from the point sizes declared at module level.
+
+        Parameters
+        ----------
+        px_per_pt : float
+            Canvas pixels per printed point, i.e. ``(canvas_px / inches) / 72``.
+        """
+        def px(pt: float) -> int:
+            return max(1, int(round(pt * px_per_pt)))
+
+        tick_font = dict(size=px(CHART_TICK_PT), color=CHART_FONT_COLOR)
+        fig.update_layout(
+            title=dict(font=dict(size=px(CHART_TITLE_PT), color=CHART_FONT_COLOR)),
+            legend=dict(font=dict(size=px(CHART_LEGEND_PT), color=CHART_FONT_COLOR)),
+            font=tick_font,
+        )
+        axis_title = dict(font=dict(size=px(CHART_AXIS_TITLE_PT), color=CHART_FONT_COLOR))
+        # Polar charts have no cartesian axes; update_xaxes is a silent no-op on
+        # them and would leave their tick text at the plotly default.
+        if any(getattr(tr, 'type', '') in ('scatterpolar', 'barpolar') for tr in fig.data):
+            fig.update_polars(radialaxis=dict(tickfont=tick_font),
+                              angularaxis=dict(tickfont=tick_font))
+        else:
+            # automargin lets plotly measure the rendered tick labels and grow
+            # the margin to fit them. Without it the axis title is placed at a
+            # fixed offset and the tick numbers overprint it as soon as the type
+            # size or the number of digits changes — which is exactly what
+            # happened when these fonts were scaled up for print.
+            fig.update_xaxes(title=axis_title, tickfont=tick_font, automargin=True)
+            fig.update_yaxes(title=axis_title, tickfont=tick_font, automargin=True)
+        fig.update_traces(colorbar=dict(
+            title=dict(font=dict(size=px(CHART_AXIS_TITLE_PT), color=CHART_FONT_COLOR)),
+            tickfont=tick_font,
+        ), selector=dict(type='heatmap'))
+        for ann in fig.layout.annotations:
+            ann.font.size = px(CHART_ANNOTATION_PT)
+        return fig
+
+    def _add_source_annotation(self, fig, *, y: float = -0.20):
+        """Append the provenance caption to a figure.
+
+        Uses ``add_annotation``, never ``update_layout(annotations=[...])``:
+        plotly merges array properties element-wise, so passing a one-element
+        list overwrote the annotations ``add_hline`` had already created. That
+        silently replaced the "53 dB reference" and "45 dB reference" labels
+        with two stacked copies of this caption — the reference lines have been
+        rendering unlabelled ever since.
+        """
+        fig.add_annotation(
+            name=self.SOURCE_ANNOTATION_NAME,
+            text=f"Source: {self._figure_source_label()}",
+            xref='paper', yref='paper',
+            x=1, y=y,
+            xanchor='right', yanchor='top',
+            showarrow=False,
+            font=dict(size=9, color='rgba(80,80,80,0.85)'),
+        )
+        return fig
+
+    @staticmethod
+    def _stack_height(flowables: list, avail_width: float) -> float:
+        """Total laid-out height of ``flowables`` at ``avail_width``, in points.
+
+        ``wrap`` is what the platypus frame itself calls to place each flowable,
+        so this measures the real rendered height — including text that wraps to
+        an extra line — rather than an estimate that drifts with the content.
+        """
+        total = 0.0
+        for f in flowables:
+            try:
+                total += f.wrap(avail_width, 0x7FFFFFFF)[1]
+                total += getattr(f, 'getSpaceBefore', lambda: 0)()
+                total += getattr(f, 'getSpaceAfter', lambda: 0)()
+            except Exception:
+                # A flowable that cannot be measured is skipped rather than
+                # allowed to abort the report; the floor on chart height keeps
+                # the result sane if that ever costs us a few points.
+                continue
+        return total
+
+    def _chart_image(self, fig, *, width_inch: float, height_inch: float, drop_source: bool = True):
+        """Size a figure to its print box and convert it to a ReportLab image.
+
+        The single path every chart in every report goes through, so text on the
+        page is the same physical size in all of them.
+
+        The in-image provenance caption is dropped by default and printed in the
+        figure caption instead: it sits at a fixed fraction below the axis, so
+        it was clipped by the frame whenever a chart's margins or type size
+        changed. Caption text cannot be clipped.
+        """
+        sized = self._size_fig_for_print(fig, width_inch=width_inch, height_inch=height_inch,
+                                         drop_source=drop_source)
+        return self._plotly_fig_to_image(sized, width_inch=width_inch, height_inch=height_inch)
+
+    def _size_fig_for_print(self, fig, *, width_inch: float, height_inch: float,
+                            dpi: int = 300, drop_source: bool = False):
+        """Fix a figure's pixel canvas to the print box at ``dpi`` and size its fonts.
+
+        Plotly's default 700×N canvas made figures render narrower than the text
+        column: ``_plotly_fig_to_image`` preserves aspect, so a tall default
+        canvas hits the height cap and the width shrinks to match. Sizing the
+        canvas to the print box instead means the figure fills the column at the
+        requested resolution — and fixes the physical size of a point of text,
+        which is what makes the type scale meaningful.
+
+        Parameters
+        ----------
+        width_inch, height_inch : float
+            Print box on the page.
+        dpi : int
+            Target resolution of the rendered image, 300 minimum for print.
+        drop_source : bool
+            Remove the in-image provenance caption, for callers that print it in
+            the figure caption instead.
+        """
+        if fig is None:
+            return None
+        # _plotly_fig_to_image multiplies the canvas by this on export.
+        export_scale = 1.25 if len(self.df) > 500_000 else 2
+        canvas_w = int(round(width_inch * dpi / export_scale))
+        fig.update_layout(
+            width=canvas_w,
+            height=int(round(height_inch * dpi / export_scale)),
+            autosize=False,
+        )
+        if drop_source:
+            # Drop only the provenance caption, where the caller prints it as
+            # text instead. Everything else stays: clearing the whole list would
+            # also take the "53 dB reference" / "45 dB reference" labels that
+            # add_hline puts here. Direct assignment, because
+            # update_layout(annotations=[]) is a no-op on an array property.
+            fig.layout.annotations = tuple(
+                a for a in fig.layout.annotations if a.name != self.SOURCE_ANNOTATION_NAME
+            )
+        # Fonts last, so they are sized against the canvas just set.
+        px_per_pt = (canvas_w / width_inch) / 72.0
+        self._scale_fig_fonts(fig, px_per_pt=px_per_pt)
+
+        # Reserve room for any label parked in the right margin. Its width scales
+        # with the font, so a fixed margin clips it as soon as the type size
+        # changes — which is what cut the "dB" off "53 dB" on Chart 1.
+        margin_labels = [a for a in fig.layout.annotations
+                         if a.name == self.REF_LABEL_ANNOTATION_NAME]
+        if margin_labels:
+            widest = max(len(str(a.text or '')) for a in margin_labels)
+            # 0.62 em per character is a safe upper bound for digits and capitals
+            # in this face; the leading gap keeps the text clear of the frame.
+            needed = int(round(widest * 0.62 * CHART_ANNOTATION_PT * px_per_pt)) + int(12 * px_per_pt)
+            current = fig.layout.margin.r or 0
+            if needed > current:
+                fig.update_layout(margin=dict(r=needed))
+        return fig
+
+    def _exceedance_summary(self, ts: pd.Series, leq: pd.Series) -> dict:
+        """How often the measured level sat above each applicable limit.
+
+        Two different questions, because the two standards are different kinds
+        of thing:
+
+        * **Maryland COMAR** states levels in dB(A), so "what share of the
+          period was at or above the level" is a question the limit supports.
+          Each period is its own denominator — the night share is a share of
+          measured night-time, not of the 24-hour day. Pooling over 24 hours
+          would dilute the night figure with the daytime hours the night limit
+          does not govern.
+        * **WHO Lnight** is also a plain LAeq of the measured levels, over
+          23:00-07:00, so a share of time above 45 dB(A) is exactly as
+          computable — on that window, not COMAR's 22:00-07:00.
+        * **WHO Lden** is not: it adds +5 dB to evening and +10 dB to night
+          before averaging, so its 53 dB(A) sits on a penalty-weighted scale no
+          measured reading is on. For Lden the answerable question is how many
+          individual days had an Lden above the guideline.
+
+        Every share is a description of exposure, not a compliance verdict: all
+        of these limits are assessed on a period average.
+
+        Returns
+        -------
+        dict
+            ``day_pct``/``night_pct`` for COMAR, ``who_night_pct`` for WHO
+            Lnight, ``nights_over``/``nights_total`` and
+            ``days_over``/``days_total`` for the per-period counts, and
+            ``interval_s``. Values are None when the data cannot support them.
+        """
+        out: dict = {'day_pct': None, 'night_pct': None, 'who_night_pct': None,
+                     'nights_over': None, 'nights_total': 0,
+                     'days_over': None, 'days_total': 0,
+                     'interval_s': self._logging_interval_s(ts)}
+        if leq.dropna().empty:
+            return out
+
+        out.update(time_above_level_by_period(
+            ts, leq,
+            day_threshold_db=MD_RESIDENTIAL_DAY,
+            night_threshold_db=MD_RESIDENTIAL_NIGHT,
+        ))
+        # WHO Lnight's own window, which is an hour shorter than COMAR's.
+        out['who_night_pct'], _n = time_above_level_in_window(
+            ts, leq, threshold_db=WHO_ROAD_LNIGHT,
+            start_hour=LDEN_DEFAULT.night_start, end_hour=LDEN_DEFAULT.night_end)
+
+        nights = nightly_lnight(ts, leq)
+        if not nights.empty:
+            out['nights_total'] = int(len(nights))
+            out['nights_over'] = int((nights > WHO_ROAD_LNIGHT).sum())
+
+        if self.daily_summary is not None and 'Daily_Lden' in self.daily_summary.columns:
+            lden_days = pd.to_numeric(self.daily_summary['Daily_Lden'], errors='coerce').dropna()
+            if not lden_days.empty:
+                out['days_total'] = int(len(lden_days))
+                out['days_over'] = int((lden_days > WHO_ROAD_LDEN).sum())
+        return out
+
+    @classmethod
+    def _exceedance_note(cls, stats: dict, *, brief: bool = False) -> str:
+        """Explain what the two exceedance figures are, and what they are not.
+
+        Shared by both reports so the caveats travel with the numbers wherever
+        they appear, and appear exactly once in each document. ``brief`` keeps
+        the two points a reader needs to avoid misreading the figures and drops
+        the methodological detail, which the technical report carries in full.
+        """
+        iv = stats.get('interval_s')
+        if iv is None or iv <= 0:
+            interval_phrase = "the logging interval of the instrument"
+        elif iv < 60:
+            interval_phrase = f"the {iv:.0f}-second readings the logger stored"
+        else:
+            interval_phrase = f"the {iv / 60:.0f}-minute readings the logger stored"
+        if brief:
+            # Merged with the "why two night figures" note: both were explaining
+            # windows, and on a two-page report the overlap cost a third page.
+            return (
+                "The two agencies (MD and WHO) define night differently — Maryland COMAR averages 22:00–07:00 (9 h) "
+                f"against {MD_RESIDENTIAL_NIGHT:.0f} dB(A), WHO Lnight averages 23:00–07:00 (8 h) "
+                f"against {WHO_ROAD_LNIGHT:.0f} dB(A) for health — so the average and the share of time "
+                "are each computed over that standard's own window, never the 24-hour day. Shares are of "
+                f"<i>measured</i> time, counted on the readings stored by the monitor. Lden has no share of time: it adds "
+                f"+5 dB to evening and +10 dB to night readings before averaging, so its "
+                f"{WHO_ROAD_LDEN:.0f} dB(A) is not on the scale of any single reading. A level can meet "
+                "Maryland law and still exceed the WHO guideline."
+            )
+        return (
+            "<b>On the shares of time.</b> Each share is counted within its own window and against its own "
+            "level. The COMAR night figure covers 22:00–07:00 against "
+            f"{MD_RESIDENTIAL_NIGHT:.0f} dB(A); the WHO night figure covers 23:00–07:00 against "
+            f"{WHO_ROAD_LNIGHT:.0f} dB(A). Both are plain LAeq comparisons on the measured scale, so both "
+            "are computable in the same way — they differ in window and in level, not in kind. A night "
+            "share uses measured night-time as its denominator, never the 24-hour day, which would dilute "
+            "it with hours the night level does not govern. All are shares of <i>measured</i> time, "
+            f"counted on {interval_phrase}; a shorter logging interval resolves brief peaks that a longer "
+            "one averages away. "
+            "<b>Lden has no such figure</b> because it adds +5 dB to evening and +10 dB to night readings "
+            "before averaging: its 53 dB(A) sits on a penalty-weighted scale that no measured reading is "
+            "on, so a count of readings above 53 dB(A) would not be about Lden at all. "
+            "<b>None of these shares is a compliance verdict.</b> Every limit here is assessed on a period "
+            "average, and a period can pass on its average while spending real time above the level; the "
+            "verdict rows above carry the assessment. WHO further intends Lden and Lnight as long-term "
+            "annual averages, so figures from a short record are indicative."
+        )
+
+    @staticmethod
+    def _fmt_share(pct: float | None) -> str:
+        """Format a percentage of time, without rounding a real event to zero."""
+        if pct is None:
+            return "not available"
+        if pct == 0:
+            return "0%"
+        if pct < 0.1:
+            return "under 0.1%"
+        return f"{pct:.1f}%"
+
+    @staticmethod
+    def _chart3_method_sentences() -> str:
+        """The 'how Chart 3 was made' text, shared by both reports.
+
+        Describes the viridis scale the heatmap actually uses. The technical
+        report previously described a red/green scale, which this chart has
+        never drawn — a reader following it would have read the loudest hours as
+        the quietest, since viridis puts bright yellow at the top of the range.
+        """
+        return (
+            "<b>Cells</b> — one clock hour on one date, computed by logarithmic energy averaging (never an "
+            "arithmetic mean) over the samples in that hour; blank cells are hours with no data. "
+            "<b>Colour</b> — viridis: dark purple quietest, green mid-range, bright yellow loudest. Colour "
+            "reflects the measured level only; a single hour cannot be compared against the WHO "
+            "guidelines, which are defined on Lden and Lnight. Every second hour is labelled, each tick "
+            "on the centre of its cell."
+        )
+
+    @staticmethod
+    def _chart2_method_sentences(*, metrics_at: str, reading: str = 'individual') -> str:
+        """The 'how Chart 2 was made' text, shared by both reports.
+
+        Carries the box-plot vocabulary, defined here rather than in the
+        definitions table because this is the only figure that uses it. The
+        wording follows the PI's supplied definitions, with the whisker rule
+        corrected: hers fixed the upper whisker at Q3 + 1.5 x IQR and the lower
+        at the smallest observation, which is two different rules. Both whiskers
+        reach the furthest observation *within* 1.5 x IQR of the box, which is
+        the Tukey convention this chart is drawn to.
+        """
+        return (
+            "A visual summary of the LAeq at each hour of the day, pooled across every measured day: the "
+            "00:00 box holds every reading taken between 00:00 and 00:59 on any day of the record. "
+            "<b>Box</b> — the interquartile range (IQR), the middle 50% of readings, from the 25th "
+            "percentile (Q1) to the 75th (Q3). <b>Median</b> — the line across the box: half the readings "
+            "are louder, half quieter. <b>Whiskers</b> — extend to the furthest reading within 1.5 x IQR "
+            f"of the box, one above Q3 and one below Q1. <b>Outliers</b> — the points beyond the whiskers: "
+            f"{reading} readings that fall outside the majority of the data, the quietest at night and the "
+            "loudest by day. What produced any individual outlier cannot be determined from sound level "
+            "data. A tall box means the level at that hour varied widely between days; a short box means "
+            "it was consistent. "
+            "<b>Colours</b> — orange is daytime (07:00\u201322:00), dark blue on the shaded background is "
+            "night (22:00\u201307:00), following the Maryland COMAR definition. [3] "
+            f"<b>Dashed lines</b> — the COMAR 26.02.03.03 Table 2 residential limits, "
+            f"{MD_RESIDENTIAL_DAY:.0f} dB(A) by day and {MD_RESIDENTIAL_NIGHT:.0f} dB(A) by night, each "
+            f"drawn only across the hours its period covers. They apply to the LAeq of the whole day or "
+            f"whole night period, reported {metrics_at}, not to a single hour or a single reading. [2]"
+        )
+
+    @staticmethod
+    def _chart1_method_sentences(binning: 'TimeSeriesBinning', *, metrics_at: str) -> str:
+        """The 'how Chart 1 was made' text, shared by both reports.
+
+        One sentence per step of the calculation, in the order the calculation
+        happens, so a reader can follow it without inferring anything.
+        """
+        if not binning.bin_label:
+            return "Each plotted point is an energy-averaged LAeq over the resampling interval."
+        # One labelled entry per element of the figure. A reader looking at a
+        # single line on the chart can find just that line, instead of reading a
+        # paragraph to locate it.
+        return (
+            f"<b>Black line</b> — LAeq in consecutive {binning.bin_label} bins: every sample in a bin is "
+            f"combined by logarithmic energy averaging into one value, giving one point per bin, not one "
+            f"per sample. Bin length is set by record length ({ts_resample_ladder_text()}). "
+            f"<b>Shaded band</b> — L-Min to L-Max within the same bins. "
+            f"<b>Purple line</b> — centered {binning.window_label} moving median, which removes the daily "
+            f"cycle and leaves the underlying trend. "
+            f"<b>Breaks</b> — bins with no measurement are left blank, so a gap is an outage, not a quiet "
+            f"period. "
+            f"<b>Dashed lines</b> — the WHO 2018 values of {WHO_ROAD_LDEN:.0f} and "
+            f"{WHO_ROAD_LNIGHT:.0f} dB(A), drawn as a scale only. WHO sets its limits on Lden and Lnight, "
+            f"whole-period figures reported {metrics_at}, not on a {binning.bin_label} average, so a bin "
+            f"above a line is not by itself an exceedance."
+        )
+
+    @staticmethod
+    def _period_title_label(ts_valid: pd.Series) -> str:
+        """Name the measurement period for a chart title, e.g. ``'March 2026'``."""
+        if ts_valid.empty:
+            return ''
+        start, end = ts_valid.min(), ts_valid.max()
+        if (start.year, start.month) == (end.year, end.month):
+            return start.strftime('%B %Y')
+        if start.year == end.year:
+            return f"{start.strftime('%B')}–{end.strftime('%B %Y')}"
+        return f"{start.strftime('%B %Y')} – {end.strftime('%B %Y')}"
+
+    def generate_resident_pdf_report(self, output_dir: str | None = None) -> str:
+        """Two-page resident summary: headline numbers plus Charts 1, 2 and 3.
+
+        Portrait letter, so it reads and prints as a handout rather than as an
+        extract of the landscape technical report. Every figure and number is
+        computed by the same code paths as the comprehensive report — this is a
+        shorter selection of that report, never a separate calculation.
+
+        Returns
+        -------
+        str
+            Absolute path to the written PDF.
+        """
+        report_filename = f"resident_noise_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
         report_dir = output_dir or os.path.dirname(self.filepath)
         os.makedirs(report_dir, exist_ok=True)
         report_path = os.path.join(report_dir, report_filename)
 
-        ts_col, leq_col, lmax_col, lmin_col = self._resolve_acoustic_columns()
-        ts  = self._get_timestamp_series(ts_col)
-        leq = self._get_numeric_series(leq_col)
-
-        ts_valid = ts.dropna()
-        start_str = ts_valid.min().strftime('%d %b %Y') if not ts_valid.empty else 'N/A'
-        end_str   = ts_valid.max().strftime('%d %b %Y') if not ts_valid.empty else 'N/A'
-        n_days_v = int(round((ts_valid.max() - ts_valid.min()).total_seconds() / 86400)) if not ts_valid.empty else 0
-        completeness = data_completeness_pct(ts_valid, actual_count=len(self.df))
-
-        # Acoustic metrics
-        leq_clean = leq.dropna()
-        laeq_v   = energetic_mean_db(leq) if not leq_clean.empty else None
-        env      = compute_ldn_lden(ts, leq) or {} if not leq_clean.empty else {}
-        lden_v   = env.get('Lden')
-        lnight_v = env.get('Lnight')
-        peak_v   = float(leq_clean.max()) if not leq_clean.empty else None
-        # True instantaneous peak comes from the L-Max stream. peak_v is the
-        # loudest LEQ *interval average*, which is always lower — reporting it
-        # as the "loudest single moment" contradicted the summary above, which
-        # correctly quotes L-Max (77.8 vs 84.7 dB on one record).
-        lamax_v  = self._lamax_value(lmax_col)
-        exc = exceedance_levels_db(leq_clean.to_numpy()) or {} if not leq_clean.empty else {}
-        l90_v = exc.get('L90')
-
-        # Participant-friendly headline numbers.
-        #
-        # The previous headline card showed the share of individual one-second
-        # samples at or below 53 dB and labelled it "Time within the health
-        # guideline". That is a category error with a misleading direction: 53 dB
-        # is the WHO 2018 **Lden** guideline — a duration-weighted annual average
-        # carrying +5 dB evening and +10 dB night penalties — so it cannot be
-        # evaluated against instantaneous samples. On a home whose Lden of 58.0 dB
-        # exceeds the guideline by 5 dB, that card read "73% within the health
-        # guideline", telling a resident they were largely compliant when they
-        # were not.
-        #
-        # The honest headline is the guideline comparison itself.
-        WHO_LDEN_GUIDELINE = 53.0   # WHO 2018 road-traffic Lden guideline
-        guideline_excess = (float(lden_v) - WHO_LDEN_GUIDELINE) if lden_v is not None else None
-
-        # Loudest / quietest hour of day (from the precomputed hourly summary)
-        loud_hr = quiet_hr = None
-        loud_db = quiet_db = None
-        if self.hourly_summary is not None and not self.hourly_summary.empty:
-            hs = self.hourly_summary.dropna(subset=['Average_L_EQ_dB'])
-            if not hs.empty:
-                lrow = hs.loc[hs['Average_L_EQ_dB'].idxmax()]
-                qrow = hs.loc[hs['Average_L_EQ_dB'].idxmin()]
-                loud_hr, loud_db = int(lrow['Hour']), float(lrow['Average_L_EQ_dB'])
-                quiet_hr, quiet_db = int(qrow['Hour']), float(qrow['Average_L_EQ_dB'])
-
-        # Plain-English summary (reused; rendered as readable prose)
-        h = ts.dt.hour
-        is_day   = (h >= 7) & (h < 22)
-        is_night = ~is_day
-        laeq_day_v   = energetic_mean_db(leq[is_day])   if is_day.any()   else None
-        laeq_night_v = energetic_mean_db(leq[is_night]) if is_night.any() else None
-        summary_text = ReportGeneratorV2.generate_plain_english_summary(
-            laeq=laeq_v, lden=lden_v, lnight=lnight_v,
-            laeq_day=laeq_day_v, laeq_night=laeq_night_v,
-            laeq_min=float(leq_clean.min()) if not leq_clean.empty else None,
-            laeq_max=peak_v,
-            l10=exc.get('L10'), l90=l90_v,
-            start_date=start_str, end_date=end_str,
-            duration_label=self._compute_duration_label(ts),
-            data_completeness_pct=completeness, n_days=n_days_v,
-            environment=getattr(self, 'environment', 'outdoor'),
-            truncation_warning=bool(getattr(self.df, 'attrs', {}).get('truncated_at_row_limit')),
-            timestamps_unusable=bool(getattr(self, 'timestamps_synthetic', False)),
-            lamax=self._lamax_value(lmax_col),
-            logging_interval_s=self._logging_interval_s(ts),
-            energy_dominance=energy_concentration(leq_clean),
-        )
-
-        # Concern level → colour
-        _st_lower = summary_text.lower()
-        if 'concern level: high' in _st_lower or 'concern level: serious' in _st_lower:
-            concern_color, concern_bg, concern_label = '#991b1b', '#FEF2F2', 'HIGH'
-        elif 'concern level: moderate' in _st_lower:
-            concern_color, concern_bg, concern_label = '#92400e', '#FFFBEB', 'MODERATE'
-        else:
-            concern_color, concern_bg, concern_label = '#166534', '#F0FDF4', 'LOW'
-
-        def _hfmt(v):
-            try:
-                fv = float(v)
-                return f"{fv:.1f}" if fv is not None and np.isfinite(fv) else "N/A"
-            except Exception:
-                return "N/A"
-
-        def _esc(s):
-            return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-
-        def _summary_to_html(text: str) -> str:
-            """Convert structured summary text to clean single-box HTML with visual sections."""
-            paras = [p.strip() for p in text.split('\n\n') if p.strip()]
-            body_paras, who_para, concern_para = [], None, None
-            for para in paras:
-                first_line = para.split('\n')[0].strip()
-                if first_line.startswith('WHO ') or first_line.startswith('WHO '):
-                    who_para = para
-                elif first_line.startswith('Overall Concern'):
-                    concern_para = para
-                else:
-                    body_paras.append(para)
-
-            parts = []
-
-            # Concern level badge — shown first for instant visual cue
-            if concern_para:
-                level = 'HIGH'
-                for lv in ('SERIOUS', 'HIGH', 'MODERATE', 'LOW'):
-                    if lv in concern_para.upper():
-                        level = lv
-                        break
-                badge_colors = {
-                    'LOW':      ('#166534', '#dcfce7'),
-                    'MODERATE': ('#92400e', '#fef3c7'),
-                    'HIGH':     ('#991b1b', '#fee2e2'),
-                    'SERIOUS':  ('#7f1d1d', '#fca5a5'),
-                }
-                badge_fg, badge_bg = badge_colors.get(level, ('#1e3a5f', '#dbeafe'))
-                # Strip the "Overall Concern Level: X." prefix to get explanation text
-                explanation = concern_para
-                for prefix in (f'Overall Concern Level: {level}. ', f'Overall Concern Level: {level}.'):
-                    if explanation.startswith(prefix):
-                        explanation = explanation[len(prefix):]
-                        break
-                parts.append(
-                    f"<div style='display:flex;align-items:flex-start;gap:12px;margin-bottom:14px;"
-                    f"padding:10px 14px;background:{badge_bg};border-radius:6px;border-left:4px solid {badge_fg}'>"
-                    f"<span style='font-weight:700;font-size:13px;color:{badge_fg};white-space:nowrap;"
-                    f"letter-spacing:.05em;padding-top:1px'>CONCERN LEVEL: {level}</span>"
-                    f"<span style='font-size:13px;color:#374151;line-height:1.55'>{_esc(explanation)}</span>"
-                    f"</div>"
-                )
-
-            # Body paragraphs — flow as readable prose
-            for para in body_paras:
-                parts.append(
-                    f"<p style='margin:0 0 10px;line-height:1.7;color:#1f2937'>{_esc(para)}</p>"
-                )
-
-            # WHO compliance section — divider + bullet list
-            if who_para:
-                lines = who_para.split('\n')
-                bullet_lines  = [l for l in lines if l.strip().startswith('•')]
-                header_lines  = [l for l in lines if not l.strip().startswith('•')]
-                section_title = ' '.join(header_lines).strip()
-                items = ''.join(
-                    f"<li style='margin-bottom:5px;line-height:1.55'>{_esc(l.strip().lstrip('•').strip())}</li>"
-                    for l in bullet_lines
-                )
-                parts.append(
-                    f"<div style='margin-top:6px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.10)'>"
-                    f"<p style='margin:0 0 6px;font-weight:600;font-size:13px;color:#1e3a5f'>{_esc(section_title)}</p>"
-                    f"<ul style='margin:0;padding-left:18px;color:#374151;font-size:13px'>{items}</ul>"
-                    f"</div>"
-                )
-
-            return '\n'.join(parts)
-
-        def _level_word(v):
-            if v is None or not np.isfinite(v):
-                return ('not available', '#64748b')
-            if v < 45:  return ('quiet', '#166534')
-            if v < 55:  return ('moderate', '#15803d')
-            if v < 65:  return ('elevated', '#b45309')
-            if v < 75:  return ('high', '#c2410c')
-            return ('very high', '#991b1b')
-
-        avg_word, avg_color = _level_word(laeq_v)
-
-        # ── Participant-friendly charts ──
-        def _chart_html(fig):
-            return (fig.to_html(full_html=False, include_plotlyjs=False) if fig is not None
-                    else "<p style='color:#6b7280;font-style:italic'>Chart unavailable — not enough data.</p>")
-        fig_compare = self._fig_compare_to_references(laeq_v, lden=lden_v)
-        fig_daily   = self._fig_daily_simple()
-        fig_typical = self._fig_typical_day()
-
-        # ── Plain-language guidance ──
-        health_points, action_points = self._participant_guidance(lden_v, lnight_v, laeq_v)
-
-        # ── Plain within-guideline verdict ──
-        # Only Lden may be compared against the 53 dB guideline. Falling back to
-        # LAeq produces false passes: Lden applies +5 dB to evening and +10 dB to
-        # night samples, so it is always the higher figure — on these datasets by
-        # 3-6 dB. A home reading LAeq 52 / Lden 57 would have been declared
-        # "within the guideline" while exceeding it by 4 dB.
-        if lden_v is not None and np.isfinite(lden_v):
-            if lden_v <= WHO_LDEN_GUIDELINE:
-                verdict_txt = (f"Your overall day-and-night noise level (Lden) is {lden_v:.0f} dB, which is "
-                               f"<strong>within</strong> the World Health Organization health guideline of "
-                               f"{WHO_LDEN_GUIDELINE:.0f} dB.")
-                verdict_bg, verdict_clr = '#dcfce7', '#166534'
-            else:
-                verdict_txt = (f"Your overall day-and-night noise level (Lden) is {lden_v:.0f} dB, which is "
-                               f"<strong>{lden_v - WHO_LDEN_GUIDELINE:.0f} dB above</strong> the World Health "
-                               f"Organization health guideline of {WHO_LDEN_GUIDELINE:.0f} dB.")
-                verdict_bg, verdict_clr = '#fee2e2', '#991b1b'
-        else:
-            verdict_txt = (
-                "An overall guideline comparison could not be computed for this dataset. "
-                "The World Health Organization guideline applies to Lden, a day-evening-night "
-                "average that needs readable date and time information; that information could "
-                "not be read from this file, and it cannot be inferred from the average level alone."
-            )
-            verdict_bg, verdict_clr = '#f1f5f9', '#475569'
-
-        def _keycard(value, unit, label, sub):
-            return (
-                "<div class='kc'>"
-                f"<div class='kc-val'>{_esc(value)}<span class='kc-unit'>{_esc(unit)}</span></div>"
-                f"<div class='kc-label'>{_esc(label)}</div>"
-                f"<div class='kc-sub'>{_esc(sub)}</div>"
-                "</div>"
-            )
-
-        loud_txt  = f"{loud_hr:02d}:00" if loud_hr is not None else "N/A"
-        quiet_txt = f"{quiet_hr:02d}:00" if quiet_hr is not None else "N/A"
-
-        # ════════════════════════════════════════════════════════════════════
-        # PARTICIPANT-FRIENDLY ASSEMBLY
-        # ════════════════════════════════════════════════════════════════════
-        # self.source_files is de-identified in __init__; the single-file fallback
-        # must go through the same guard rather than printing the raw filename.
-        source_label = (_esc(", ".join(self.source_files)) if self.source_files
-                        else _esc(self._figure_source_label()))
-        # Floor, never round. Rounding 99.6% to "100%" contradicted the summary
-        # directly below, which reports the same figure as 99.6% with gaps, and
-        # erased a real one-hour outage from the header a reader sees first.
-        completeness_str = (
-            f"{math.floor(completeness * 10) / 10:.1f}%".replace(".0%", "%")
-            if completeness is not None else "N/A"
-        )
-        place = _esc(self.device_id) if self.device_id else "this location"
-
-        def _section(title, intro, body):
-            intro_html = f"<p class='sec-intro'>{intro}</p>" if intro else ""
-            return f"<section class='card'><h2>{_esc(title)}</h2>{intro_html}{body}</section>"
-
-        # Key-number cards
-        key_cards = "".join([
-            _keycard(_hfmt(laeq_v), " dB", "Average noise level",
-                     f"{avg_word} — the steady level with the same energy as the real noise"),
-            _keycard(quiet_txt, "", "Quietest time of day",
-                     (f"around {quiet_db:.0f} dB" if quiet_db is not None else "")),
-            _keycard(loud_txt, "", "Loudest time of day",
-                     (f"around {loud_db:.0f} dB" if loud_db is not None else "")),
-            _keycard(
-                (f"+{guideline_excess:.1f}" if guideline_excess is not None and guideline_excess > 0
-                 else f"{guideline_excess:.1f}" if guideline_excess is not None else "N/A"),
-                " dB",
-                ("Above the health guideline" if guideline_excess is not None and guideline_excess > 0
-                 else "Below the health guideline" if guideline_excess is not None
-                 else "Health guideline comparison"),
-                (f"your 24-hour weighted average (Lden) is {lden_v:.1f} dB against the WHO "
-                 f"guideline of {WHO_LDEN_GUIDELINE:.0f} dB"
-                 if lden_v is not None else
-                 "needs readable date and time information to calculate"),
-            ),
-        ])
-
-        # Health & action bullet lists
-        health_html = "<ul class='plain-list'>" + "".join(
-            f"<li>{_esc(p)}</li>" for p in health_points) + "</ul>"
-        action_html = "<ul class='plain-list'>" + "".join(
-            f"<li>{_esc(p)}</li>" for p in action_points) + "</ul>"
-
-        # Timestamp warning (only when dates were unreadable)
-        ts_warn_html = ""
-        if getattr(self, 'timestamps_synthetic', False):
-            ts_warn_html = (
-                "<div class='card warn'><strong>⚠ Timestamps could not be read from this file.</strong>"
-                "<p>The date/time information was missing or unreadable, so the day-by-day trend and "
-                "typical-day chart below are based on a substituted order and should not be read as real "
-                "dates or times. The average levels remain valid.</p></div>"
-            )
-
-        # Optional custom notes from the user
-        custom_html = ""
-        if self.custom_section_heading or self.custom_section_body:
-            body = "".join(f"<p>{_esc(ln)}</p>" for ln in (self.custom_section_body or '').splitlines() if ln.strip())
-            custom_html = _section(self.custom_section_heading or "Additional Notes", "", body)
-
-        html_parts = [
-            "<!DOCTYPE html>", "<html lang='en'>", "<head>",
-            "  <meta charset='UTF-8'>",
-            "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>",
-            "  <title>Community Noise Report</title>",
-            "  <script src='https://cdn.plot.ly/plotly-latest.min.js'></script>",
-            "  <style>",
-            "    *{box-sizing:border-box;margin:0;padding:0}",
-            "    body{font-family:'Inter',-apple-system,Segoe UI,Arial,sans-serif;background:#eef2f7;color:#1e293b;line-height:1.6;font-size:15px}",
-            "    .wrap{max-width:920px;margin:0 auto;padding:28px 20px 60px}",
-            "    .card{background:#fff;border:1px solid #e3e9f1;border-radius:16px;box-shadow:0 4px 14px rgba(15,37,64,.06);padding:30px 32px;margin-bottom:22px}",
-            "    .hero{background:linear-gradient(115deg,#13294a 0%,#1e3a5f 55%,#244c77 100%);color:#fff;border:none}",
-            "    .hero h1{font-size:30px;font-weight:800;letter-spacing:-.02em;margin-bottom:6px}",
-            "    .hero .sub{opacity:.9;font-size:14px}",
-            "    .hero .meta{margin-top:14px;font-size:13px;opacity:.85;display:flex;flex-wrap:wrap;gap:6px 22px}",
-            "    h2{font-size:20px;color:#13294a;letter-spacing:-.01em;margin-bottom:6px}",
-            "    .sec-intro{color:#64748b;font-size:14px;margin-bottom:16px}",
-            "    .badge{display:inline-block;font-weight:800;font-size:13px;letter-spacing:.05em;padding:5px 12px;border-radius:999px;margin-bottom:14px}",
-            "    .summary p{margin:0 0 10px;color:#334155}",
-            "    .summary ul{margin:6px 0 0 18px;color:#334155;font-size:14px}",
-            "    .keygrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px}",
-            "    .kc{background:#f7f9fc;border:1px solid #e3e9f1;border-radius:13px;padding:18px 18px}",
-            "    .kc-val{font-family:'JetBrains Mono',monospace;font-size:30px;font-weight:700;color:#1e3a5f;letter-spacing:-.02em}",
-            "    .kc-unit{font-size:14px;font-weight:600;color:#64748b;margin-left:3px}",
-            "    .kc-label{font-weight:700;font-size:13px;color:#334155;margin-top:6px}",
-            "    .kc-sub{font-size:12px;color:#94a3b8;margin-top:3px;line-height:1.45}",
-            "    .verdict{padding:14px 18px;border-radius:11px;font-size:15px;margin-bottom:18px}",
-            "    .plain-list{margin:0;padding-left:20px}",
-            "    .plain-list li{margin-bottom:9px;color:#334155}",
-            "    .warn{background:#fef2f2;border-color:#fca5a5;border-left:5px solid #dc2626}",
-            "    .warn strong{color:#991b1b}.warn p{color:#7f1d1d;font-size:14px;margin-top:6px}",
-            "    .chart-note{font-size:13px;color:#64748b;margin-top:8px;line-height:1.5}",
-            "    .about{font-size:13px;color:#475569}.about div{padding:5px 0;border-bottom:1px solid #eef2f7;display:flex;gap:10px}",
-            "    .about b{min-width:170px;color:#334155}",
-            "    .footer{text-align:center;font-size:12px;color:#94a3b8;padding:22px 10px}",
-            "    .disclaimer{font-size:12px;color:#94a3b8;line-height:1.6;margin-top:12px}",
-            "  </style>", "</head>", "<body>", "  <div class='wrap'>",
-
-            # ── Hero header ──
-            "  <section class='card hero'>",
-            "    <h1>Community Noise Report</h1>",
-            f"    <div class='sub'>A plain-language summary of the noise measured at {place}.</div>",
-            "    <div class='meta'>"
-            f"<span>📍 {place}</span>"
-            f"<span>🗓 {_esc(start_str)} → {_esc(end_str)}</span>"
-            f"<span>📊 {n_days_v} day(s), {completeness_str} data captured</span>"
-            f"<span>📄 Generated {datetime.now().strftime('%d %b %Y')}</span>"
-            "</div>",
-            "  </section>",
-
-            ts_warn_html,
-
-            # ── Headline: what we found ──
-            "  <section class='card summary'>",
-            "    <h2>What we found</h2>",
-            f"    <span class='badge' style='background:{concern_bg};color:{concern_color}'>OVERALL: {concern_label}</span>",
-            f"    {_summary_to_html(summary_text)}",
-            "  </section>",
-
-            # ── Key numbers ──
-            _section("Your noise at a glance", "", f"<div class='keygrid'>{key_cards}</div>"),
-
-            # ── How your noise compares ──
-            _section(
-                "How your noise compares",
-                "The bar below places your day-evening-night average (Lden) next to everyday sounds "
-                "and the World "
-                "Health Organization (WHO) health guideline, so you can see where your location sits.",
-                f"<div class='verdict' style='background:{verdict_bg};color:{verdict_clr}'>{verdict_txt}</div>"
-                + _chart_html(fig_compare)
-            ),
-
-            # ── Day-by-day ──
-            _section(
-                "Day by day",
-                "Each point is the average level (LAeq) for one day of monitoring, so you can see "
-                "which days were louder and whether the level is steady across the period. The dashed "
-                "line marks 53 dB for reference. It is the WHO guideline value, but that guideline "
-                "applies to Lden — a whole-period average that adds a penalty to evening and night "
-                "hours — so a single day rising above the line is a louder day, not a breach. Your "
-                "guideline comparison is the one shown above.",
-                _chart_html(fig_daily)
-                + "<div class='chart-note'>A higher line means a louder day overall.</div>"
-            ),
-
-            # ── A typical day ──
-            _section(
-                "A typical day",
-                "This shows the average noise for each hour of the day, combined across all monitored days. "
-                "The shaded band is night-time (11 PM – 7 AM), when quiet matters most for sleep.",
-                _chart_html(fig_typical)
-                + "<div class='chart-note'>Use this to see when your location is usually loudest and quietest.</div>"
-            ),
-
-            # ── Health meaning ──
-            _section("What this means for your health", "", health_html),
-
-            # ── Actions ──
-            _section("What you can do", "", action_html),
-
-            custom_html,
-
-            # ── About ──
-            "  <section class='card'>",
-            "    <h2>About this measurement</h2>",
-            "    <div class='about'>",
-            f"      <div><b>Location / device</b><span>{place}</span></div>",
-            f"      <div><b>Monitoring period</b><span>{_esc(start_str)} to {_esc(end_str)} ({n_days_v} days)</span></div>",
-            f"      <div><b>Data captured</b><span>{completeness_str} of the period</span></div>",
-            f"      <div><b>Source file(s)</b><span>{source_label}</span></div>",
-            (f"      <div><b>Loudest single moment (L-Max)</b><span>{_hfmt(lamax_v)} dB</span></div>"
-             if lamax_v is not None else
-             f"      <div><b>Loudest interval average (LAeq)</b><span>{_hfmt(peak_v)} dB</span></div>"),
-            f"      <div><b>Quiet background level</b><span>{_hfmt(l90_v)} dB (the noise stays above this 90% of the time)</span></div>",
-            "    </div>",
-            "    <p class='disclaimer'>Noise is measured in A-weighted decibels (dB), matched to how human hearing works. "
-            "Levels are energy-averaged (LAeq), the standard way to summarise changing noise. Guideline values come from "
-            "the WHO Environmental Noise Guidelines (2018). This is a community summary for general understanding and "
-            "research participation — it is not a clinical diagnosis or legal assessment. For a formal evaluation, consult "
-            "a certified acoustic professional.</p>",
-            "  </section>",
-
-            # ── Footer ──
-            "  <div class='footer'>",
-            "    Environmental Noise Analysis Platform · Developed by Chandra Prakash Choudhary · "
-            "PI: Dr. Ana María Rule, Johns Hopkins University",
-            "  </div>",
-            "  </div>", "</body>", "</html>",
-        ]
-
-        with open(report_path, 'w', encoding='utf-8') as fh:
-            fh.write('\n'.join(p for p in html_parts if p))
-
+        doc = self._resident_doc_template(report_path)
+        story = self._build_resident_story(doc)
+        doc.build(story, onFirstPage=self._add_page_template, onLaterPages=self._add_page_template)
         return report_path
 
-    # ============================================================
-    # PARTICIPANT-FRIENDLY CHART BUILDERS (HTML report)
-    # ============================================================
+    def generate_resident_docx_report(self, output_dir: str | None = None) -> str:
+        """The resident summary as an editable Word file, from the same story."""
+        report_filename = f"resident_noise_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        report_dir = output_dir or os.path.dirname(self.filepath)
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, report_filename)
 
-    def _fig_compare_to_references(self, laeq, lden=None):
-        """Horizontal bar placing the measured level next to everyday sounds.
+        doc = self._resident_doc_template(io.BytesIO())
+        story = self._build_resident_story(doc)
+        page_of = self._paginate(doc, story)
+        return render_story_to_docx(
+            story, report_path,
+            page_width_in=self.RESIDENT_PAGE['width_in'],
+            page_height_in=self.RESIDENT_PAGE['height_in'],
+            margins_in=self.RESIDENT_PAGE['margins_in'],
+            footer_lines=self._footer_lines(),
+            page_of=page_of,
+        )
 
-        The WHO 53 dB bar is drawn only when Lden is available, and the home's
-        bar then shows Lden too. Previously this chart plotted the home's LAeq
-        beside the WHO guideline bar: on a home whose LAeq was 52.8 and whose
-        Lden was 58.0, the two bars rendered at equal length, showing a resident
-        sitting exactly at the guideline when they exceeded it by 5 dB. LAeq
-        omits the +5 dB evening and +10 dB night penalties that Lden applies, so
-        the two are not comparable.
+    def _resident_doc_template(self, path: str) -> SimpleDocTemplate:
+        g = self.RESIDENT_PAGE
+        top, bottom, left, right = g['margins_in']
+        return PageTrackingDocTemplate(
+            path, pagesize=(g['width_in'] * inch, g['height_in'] * inch),
+            topMargin=top * inch, bottomMargin=bottom * inch,
+            leftMargin=left * inch, rightMargin=right * inch,
+            title="Resident Noise Summary", author="",
+        )
+
+    def _build_resident_story(self, doc) -> list:
+        """Assemble the resident summary as a ReportLab story (PDF and Word)."""
+        ts_col, leq_col, lmax_col, lmin_col = self._resolve_acoustic_columns()
+        styles = self._get_pdf_styles()
+        cap = ParagraphStyle('ResidentCaption', parent=styles['BodyText'],
+                             fontSize=8, leading=10.5,
+                             textColor=colors.HexColor('#374151'), spaceAfter=2)
+        story: list = []
+
+        ts = self._get_timestamp_series(ts_col)
+        leq = self._get_numeric_series(leq_col)
+        lmax = self._get_numeric_series(lmax_col) if (lmax_col and lmax_col in self.df.columns) else None
+        lmin = self._get_numeric_series(lmin_col) if (lmin_col and lmin_col in self.df.columns) else None
+
+        ts_valid = ts.dropna()
+        location = self._display_location_label()
+        suffix = self._chart_location_suffix()
+        period = self._period_title_label(ts_valid)
+
+        # ── Header ───────────────────────────────────────────────────────────
+        story.append(Paragraph("Resident Noise Summary", styles['Title']))
+        story.append(Spacer(1, 0.10 * inch))
+        header_bits = [b for b in (location, period) if b]
+        if header_bits:
+            story.append(Paragraph(" &nbsp;·&nbsp; ".join(escape(b) for b in header_bits), styles['SubTitle']))
+        story.append(Paragraph(
+            f"Generated {datetime.now().strftime('%d %b %Y')}", styles['Footer']))
+        story.append(Spacer(1, 0.10 * inch))
+
+        if self.timestamps_synthetic:
+            story.append(Paragraph(
+                "<b>The date and time information in this file could not be read.</b> The charts below "
+                "would show substituted dates rather than real ones, so this summary cannot be produced "
+                "from this file. Re-export the data keeping the full 'YYYY-MM-DD HH:MM:SS' timestamp column.",
+                styles['BodyText']))
+            return story
+
+        # ── Definitions, before anything that uses the terms ─────────────────
+        story.append(self._resident_definitions_table(ts))
+        story.append(Spacer(1, 0.10 * inch))
+
+        # ── Key numbers ──────────────────────────────────────────────────────
+        story.extend(self._resident_result_tables(ts=ts, leq=leq, lmax_col=lmax_col))
+        story.append(Spacer(1, 0.05 * inch))
+        story.append(Paragraph(self._exceedance_note(self._exceedance_summary(ts, leq), brief=True), cap))
+        story.append(Spacer(1, 0.08 * inch))
+
+        source_note = f" <b>Data source:</b> {escape(self._figure_source_label())}."
+        avail_w = doc.width / inch
+
+        # No forced break here. The definitions and results table fill page 1 and
+        # a little runs onto page 2; a hard break at this point left that page
+        # 21% full. Each figure is wrapped with its caption instead, so the
+        # pair moves as a unit and the pages pack themselves.
+
+        # ── Figure 1 — time series ───────────────────────────────────────────
+        t1 = f"{period} noise time series{suffix}".strip()
+        fig1, binning = self._fig_time_series_with_band(
+            ts=ts, leq=leq, lmax=lmax, lmin=lmin, title=t1)
+        img1 = self._chart_image(fig1, width_inch=avail_w, height_inch=3.0)
+        story.append(KeepTogether([
+            img1 if img1 else Paragraph("<i>Time series chart unavailable.</i>", styles['BodyText']),
+            Paragraph(
+                f"<b>Figure 1.</b> Sound level over the whole monitoring period. "
+                f"{self._chart1_method_sentences(binning, metrics_at='in Table 4')}"
+                + source_note,
+                cap),
+        ]))
+        story.append(Spacer(1, 0.16 * inch))
+
+        # ── Figure 2 — hourly distribution ───────────────────────────────────
+        reading_word = self._reading_word(ts)
+        # The box-plot vocabulary is defined here rather than in the definitions
+        # table on page 1, because it is only needed at this figure and reads
+        # better beside the thing it describes.
+        t2 = f"{period} noise Leq variability by time of day{suffix}".strip()
+        fig2 = self._fig_diurnal_box_whisker(ts=ts, leq=leq, title=t2)
+        img2 = self._chart_image(fig2, width_inch=avail_w, height_inch=3.0)
+        story.append(KeepTogether([
+            img2 if img2 else Paragraph("<i>Hourly variability chart unavailable.</i>", styles['BodyText']),
+            Paragraph(
+                "<b>Figure 2.</b> " + self._chart2_method_sentences(
+                    metrics_at="in Table 3", reading=reading_word)
+                + source_note,
+                cap),
+        ]))
+
+        story.append(PageBreak())
+
+        # ── Figure 3 — heatmap ───────────────────────────────────────────────
+        t3 = f"{period} noise levels by date and hour{suffix}".strip()
+        fig3 = self._fig_temporal_heatmap(ts=ts, leq=leq, title=t3)
+        img3 = self._chart_image(fig3, width_inch=avail_w, height_inch=3.4)
+        story.append(KeepTogether([
+            img3 if img3 else Paragraph("<i>Heatmap unavailable.</i>", styles['BodyText']),
+            Paragraph(
+                "<b>Figure 3.</b> LAeq for every hour of every measured day. "
+                + self._chart3_method_sentences() +
+                " Reading down a column shows how one day changed hour by hour; reading across a row "
+                "shows whether a given hour behaved the same way from day to day." + source_note,
+                cap),
+        ]))
+        story.append(Spacer(1, 0.12 * inch))
+
+        # ── Closing note ─────────────────────────────────────────────────────
+        # Kept short so the summary holds to two pages. The full instrument
+        # provenance, uncertainty budget and compliance assessment are in the
+        # comprehensive report, which this points to rather than reproducing.
+        story.append(Paragraph(
+            "<b>About the WHO guidelines.</b> The values quoted are the road-traffic guideline values. WHO "
+            "sets its guidelines separately for each transport source, and road traffic is the general, "
+            "widely cited benchmark; quoting it here does not assert that road traffic is the source of "
+            "the sound measured at this home. A sound level meter records total sound energy and cannot "
+            "identify what produced it. The WHO values are annual averages, so a record of days or weeks "
+            "is indicative rather than a determination. [1]",
+            cap))
+        story.append(Spacer(1, 0.06 * inch))
+        story.append(Paragraph(
+            "<b>About these measurements.</b> Levels were recorded with a Convergence Instruments "
+            "NSRT_W_mk4 sound level logger, A-weighted. Each unit is factory-calibrated and supplied with "
+            "its own manufacturer's certificate, retained by the study team and available on request. "
+            "A sound level meter records total sound energy; it does not identify what produced a sound, "
+            "so attributing any level here to a particular source requires evidence beyond these "
+            "measurements. ISO 1996-2 notes that the combined standard uncertainty of an environmental "
+            "noise measurement is typically 1 to 3 dB, so smaller differences should not be treated as "
+            "meaningful. The full technical report, with the compliance assessment, the calibration "
+            "statement and the data-quality record, is available from the study team.",
+            cap))
+        story.append(Spacer(1, 0.06 * inch))
+        story.append(Paragraph("<b>Sources</b>", cap))
+        ref_style = ParagraphStyle(
+            'Reference', parent=cap,
+            # Hanging indent: the marker sits in the margin and continuation
+            # lines align under the text, so the numbers stay scannable.
+            leftIndent=14, firstLineIndent=-14, spaceAfter=3,
+        )
+        for entry in self._limit_reference_entries():
+            story.append(Paragraph(entry, ref_style))
+
+        return story
+
+    @staticmethod
+    def _limit_reference_entries() -> list[str]:
+        """Numbered sources, one entry per item.
+
+        Returned as a list rather than one joined string so each reference is
+        rendered as its own paragraph. Run together they were unreadable: a
+        reader looking for [3] had to scan a block of prose for the marker.
+
+        Each entry names the specific provision rather than the document, so a
+        claim can be checked without reading the whole regulation. All were
+        verified against the primary text on 5 August 2026.
         """
-        have_lden = lden is not None and np.isfinite(lden)
-        measured = float(lden) if have_lden else (float(laeq) if laeq is not None and np.isfinite(laeq) else None)
-        if measured is None:
-            return None
+        return [
+            "[1] WHO, <i>Environmental Noise Guidelines for the European Region</i> (2018), "
+            "ISBN 978-92-890-5356-3: road traffic Lden 53 dB and Lnight 45 dB, both graded strong "
+            "recommendations. Lden and Lnight are defined in EU Directive 2002/49/EC, Annex I, as "
+            "long-term averages over a year.",
 
-        refs = [
-            ("Whisper / quiet bedroom", 30.0, '#cbd5e1'),
-            ("Library / soft rain", 40.0, '#cbd5e1'),
-            ("Normal conversation", 50.0, '#cbd5e1'),
-            ("Busy street traffic", 70.0, '#cbd5e1'),
-            ("Power tools (hearing risk)", 85.0, '#cbd5e1'),
+            "[2] COMAR 26.02.03.03A(1), Table 2, Maximum Allowable Noise Levels: residential "
+            "65 dB(A) by day and 55 dB(A) at night; measured at or within the property line of the "
+            "receiving property (.03D(2)); prominent discrete tones and periodic noises must be "
+            "5 dB(A) lower (.03A(3)).",
+
+            "[3] COMAR 26.02.03.01B(5) and B(15): daytime is 7 a.m. to 10 p.m., nighttime is "
+            "10 p.m. to 7 a.m. B(13) defines equivalent sound level; B(4) defines Ldn.",
+
+            "[4] ISO 1996-1 and ISO 1996-2, <i>Acoustics \u2014 Description, measurement and assessment "
+            "of environmental noise</i>: definition of the equivalent continuous sound level, and a "
+            "combined measurement uncertainty of the order of 1 to 3 dB.",
+
+            "[5] WHO, <i>Guidelines for Community Noise</i> (Berglund, Lindvall &amp; Schwela, 1999), "
+            "ISBN 92-4-154553-4: the decibel scale and its relation to perceived loudness; indoor "
+            "bedroom guidelines.",
         ]
-        if have_lden:
-            refs.append(("WHO health guideline (Lden)", 53.0, '#f59e0b'))
-            refs.append(("Your home (Lden)", measured, '#1e3a5f'))
+
+    def _reading_word(self, ts: pd.Series) -> str:
+        """Name the logging interval, e.g. '1-second'. Measured, never assumed."""
+        iv = self._logging_interval_s(ts)
+        if not iv:
+            return 'logged'
+        return f"{iv:.0f}-second" if iv < 60 else f"{iv / 60:.0f}-minute"
+
+    def _resident_definitions_table(self, ts: pd.Series) -> Table:
+        """Define every term before the report uses it.
+
+        A reader who meets "L90" or "share of time" for the first time inside a
+        results row has to infer the meaning from context, and usually infers
+        wrongly — L90 in particular reads as an average unless told otherwise.
+        Terms specific to the box plot are defined beside Figure 2 instead of
+        here, where they are actually needed.
+        """
+        styles = self._get_pdf_styles()
+        term = ParagraphStyle('DefTerm', parent=styles['BodyText'], fontSize=8.5,
+                              leading=10.5, fontName='Helvetica-Bold', spaceAfter=0)
+        body = ParagraphStyle('DefBody', parent=styles['BodyText'], fontSize=8.5,
+                              leading=10.5, spaceAfter=0)
+        head = ParagraphStyle('DefHead', parent=body, fontName='Helvetica-Bold',
+                              textColor=colors.white)
+
+        reading = self._reading_word(ts)
+
+        # Wording follows the PI's supplied definitions verbatim wherever they are
+        # correct, since that is the register she wants. Three were changed:
+        #   * "Leq — the loudness averaged over time": loudness is a perceptual
+        #     quantity; Leq is an energy average of sound level.
+        #   * L90 described as an average: it is a percentile, which is the
+        #     specific misreading this definition exists to prevent.
+        #   * Nothing here attributes sound to a source, which the meter cannot do.
+        rows = [
+            ("Table 1. Definitions", "", True),
+            ("A-weighted decibel, dB(A)",
+             "Measurement of sound intensity that adjusts raw decibel levels to match the frequency "
+             "sensitivity of the human ear (filters out very high and very low frequencies). Every 3 dB is a doubling of sound energy; every 10 dB "
+             "increase is about twice as loud in perceived loudness. [5]", False),
+            ("LAeq (average level)",
+             "The A-weighted equivalent continuous sound level over a period of time: the constant level that would contain the "
+             "same sound energy as the actual, varying sound over the same period. An energy average, not "
+             "an arithmetic mean. LAeq is used for the black line in Figure 1 and for the legal limits. "
+             "[2,4]", False),
+            ("L90, Background floor",
+             f"The noise level that is exceeded 90% of the time: the steady base beneath passing loud events. "
+             f"A percentile of every {reading} reading, not an average. This is a key number, because a "
+             f"source that runs all the time raises the floor.", False),
+            ("L10",
+             "The noise level exceeded 10% of the time, giving the louder end of the range. Quoted with L90 it "
+             "shows how wide the spread of noise levels is.", False),
+            ("L-Max",
+             "The single loudest noise level recorded during the measured period. Not an average.", False),
+            ("Lnight",
+             "The LAeq across the night only; LAeq averaged from 23:00–07:00. [1]", False),
+            ("Lden",
+             "The day–evening–night level: the LAeq of the day (07:00–19:00), evening (19:00–23:00) and "
+             "night (23:00–07:00) combined over 24 hours, with +5 dB added to the evening and +10 dB to "
+             "the night before averaging, because the same sound disturbs more at those hours. [1]", False),
+            ("Share of time",
+             f"The percentage of {reading} readings inside an averaged period that were at or above a stated "
+             f"level. It describes how exposure was distributed throughout the period.", False),
+        ]
+
+        data, style = [], [
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#D6DEE7')),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING', (0, 0), (-1, -1), 2.5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
+            ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+        ]
+        for i, (label, text, is_head) in enumerate(rows):
+            if is_head:
+                data.append([Paragraph(label, head), ''])
+                style += [('SPAN', (0, i), (-1, i)),
+                          ('BACKGROUND', (0, i), (-1, i), colors.HexColor('#3D5A80'))]
+            else:
+                data.append([Paragraph(label, term), Paragraph(text, body)])
+                style.append(('BACKGROUND', (0, i), (-1, i), colors.HexColor('#F7F9FB')))
+
+        table = Table(data, colWidths=[1.35 * inch, 5.95 * inch])
+        table.setStyle(TableStyle(style))
+        return table
+
+    def _resident_result_tables(self, *, ts: pd.Series, leq: pd.Series,
+                                lmax_col: str | None) -> list:
+        """The results, as three tables: summary, COMAR limits, WHO guidelines.
+
+        Every value comes from the same helpers the technical report uses, so the
+        two documents cannot disagree.
+        """
+        ts_valid = ts.dropna()
+        leq_clean = leq.dropna()
+
+        start_str = ts_valid.min().strftime('%d %b %Y') if not ts_valid.empty else 'N/A'
+        end_str = ts_valid.max().strftime('%d %b %Y') if not ts_valid.empty else 'N/A'
+        completeness = data_completeness_pct(ts_valid, actual_count=len(self.df))
+
+        laeq_v = energetic_mean_db(leq) if not leq_clean.empty else None
+        env = (compute_ldn_lden(ts, leq) or {}) if not leq_clean.empty else {}
+        exc = (exceedance_levels_db(leq_clean.to_numpy()) or {}) if not leq_clean.empty else {}
+
+        # Day and night averages come from compute_ldn_lden, never a local hour
+        # mask: it is the single vetted implementation of the window definitions,
+        # and it documents which window each key carries.
+        #   LAeq_day = 07:00-22:00   LAeq_night = 22:00-07:00   (Ldn / COMAR)
+        #   Lnight   = 23:00-07:00                              (WHO / Lden)
+        laeq_day = env.get('LAeq_day')
+        laeq_night = env.get('LAeq_night')
+
+        exc_stats = self._exceedance_summary(ts, leq)
+        reading = self._reading_word(ts)
+
+        # Per-period series behind the four range statements. Each range is the
+        # spread of whole-period averages — one LAeq per day or per night —
+        # never the min/max of individual readings, which would just restate
+        # L-Min and L-Max. Nights are keyed to the date they began, so a night
+        # is never split at midnight into two half-nights.
+        day_series = (pd.to_numeric(self.daily_summary.get('Daytime_LAeq'), errors='coerce').dropna()
+                      if self.daily_summary is not None else pd.Series(dtype=float))
+        night_comar_series = nightly_lnight(ts, leq, night_start=22, night_end=7)
+        lden_series = (pd.to_numeric(self.daily_summary.get('Daily_Lden'), errors='coerce').dropna()
+                       if self.daily_summary is not None else pd.Series(dtype=float))
+        lnight_series = nightly_lnight(ts, leq)
+        # Days that actually contain readings, not merely the calendar span. With
+        # an exclusion window applied the two differ, and the span alone would
+        # overstate coverage.
+        days_with_data = int(ts_valid.dt.date.nunique()) if not ts_valid.empty else 0
+
+        def _d(v) -> str:
+            try:
+                fv = float(v)
+                return f"{fv:.1f} dB(A)" if np.isfinite(fv) else "Not available"
+            except (TypeError, ValueError):
+                return "Not available"
+
+        def _lim(limit_db) -> str:
+            """The limit column: the number on its own."""
+            return f"<b>{float(limit_db):.0f} dB(A)</b>"
+
+        def _vs(value, limit_db) -> str:
+            """The measured column: the value and its distance from the limit.
+
+            No verdict wording — the margin states the position and the reader
+            draws the conclusion.
+            """
+            try:
+                fv = float(value)
+                if not np.isfinite(fv):
+                    return "Not available"
+            except (TypeError, ValueError):
+                return "Not available"
+            diff = fv - float(limit_db)
+            if abs(diff) < 0.05:
+                return f"{fv:.1f} dB(A), equal to the limit"
+            return (f"{fv:.1f} dB(A), which is {abs(diff):.1f} dB "
+                    f"{'above' if diff > 0 else 'below'} the limit")
+
+        def _vs_range(value, limit_db, per_period: pd.Series, period_word: str) -> str:
+            """Measured column with the average AND its per-period range.
+
+            The average carries the comparison against the limit; the range
+            shows the variability behind it, as the spread of the individual
+            per-day or per-night averages. The range of raw readings would be
+            wrong here — it restates L-Min/L-Max, not the variability of the
+            metric in this row.
+            """
+            base = _vs(value, limit_db)
+            per = pd.to_numeric(per_period, errors='coerce').dropna()
+            if base == "Not available" or len(per) < 2:
+                return base
+            return (f"{base}. Individual {period_word} values ranged "
+                    f"{per.min():.1f} to {per.max():.1f} dB(A) across "
+                    f"{len(per)} {period_word}s")
+
+        def _laeq_with_spread() -> str:
+            """LAeq with its day-to-day range.
+
+            LAeq must not carry a standard deviation: it is a logarithmic energy
+            average, so an SD of the dB values is an SD of logarithms rather than
+            the dispersion of the quantity being averaged, and "x plus or minus y
+            dB" reads as a mean and spread that LAeq is not. The honest companion
+            is the range of the individual daily LAeq values.
+            """
+            base = _d(laeq_v)
+            if base == "Not available" or self.daily_summary is None:
+                return base
+            daily = pd.to_numeric(
+                self.daily_summary.get('Average_L_EQ_dB'), errors='coerce').dropna()
+            if len(daily) < 2:
+                return base
+            return (f"{base}. Daily values ranged {daily.min():.1f} to "
+                    f"{daily.max():.1f} dB(A) across {len(daily)} days")
+
+        def _climate_spread() -> str:
+            """L90 to L10, the conventional spread descriptor for noise.
+
+            Both are percentiles of the logged readings, not averages, so neither
+            takes a plus-or-minus of its own. Quoted as a pair they are the
+            standard statement of how wide the acoustic climate is.
+            """
+            lo, hi = exc.get('L90'), exc.get('L10')
+            try:
+                lo_f, hi_f = float(lo), float(hi)
+                if not (np.isfinite(lo_f) and np.isfinite(hi_f)):
+                    raise ValueError
+            except (TypeError, ValueError):
+                return "Not available"
+            return (f"{lo_f:.1f} to {hi_f:.1f} dB(A), a spread of {hi_f - lo_f:.1f} dB "
+                    f"covering the middle 80% of readings")
+
+        def _periods_over() -> str:
+            """Counts of individual days and nights past each WHO guideline."""
+            bits = []
+            if exc_stats['days_over'] is not None:
+                bits.append(f"Lden above {WHO_ROAD_LDEN:.0f} dB(A) on "
+                            f"{exc_stats['days_over']} of {exc_stats['days_total']} days")
+            if exc_stats['nights_over'] is not None:
+                bits.append(f"Lnight above {WHO_ROAD_LNIGHT:.0f} dB(A) on "
+                            f"{exc_stats['nights_over']} of {exc_stats['nights_total']} nights")
+            return "; ".join(bits) if bits else "Not available"
+
+        # Completeness is floored, never rounded up: a 99.96% record contains a
+        # real outage, and printing "100%" would erase it.
+        if completeness is None:
+            completeness_str = "Not available"
         else:
-            # No guideline bar without the metric it is defined on.
-            refs.append(("Your home (average level)", measured, '#1e3a5f'))
-        refs.sort(key=lambda r: r[1])
-        labels = [r[0] for r in refs]
-        values = [r[1] for r in refs]
-        colors = [r[2] for r in refs]
-        fig = go.Figure(go.Bar(
-            x=values, y=labels, orientation='h',
-            marker=dict(color=colors),
-            text=[f"{v:.0f} dB" for v in values],
-            textposition='outside',
-            cliponaxis=False,
-            hovertemplate='%{y}: %{x:.0f} dB(A)<extra></extra>',
-        ))
-        fig.update_layout(
-            height=340, margin=dict(l=10, r=60, t=20, b=40),
-            xaxis=dict(title='Noise level, dB(A)', range=[0, 95], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
-            yaxis=dict(automargin=True),
-            plot_bgcolor='white', paper_bgcolor='white', showlegend=False,
-        )
-        return fig
+            cp = math.floor(float(completeness) * 10.0) / 10.0
+            completeness_str = f"{min(cp, 100.0):.1f}% of expected readings present"
 
-    def _fig_daily_simple(self):
-        """Simple day-by-day average noise trend vs the WHO guideline."""
-        ds = self.daily_summary
-        if ds is None or ds.empty or 'Average_L_EQ_dB' not in ds.columns:
-            return None
-        d = ds.dropna(subset=['Average_L_EQ_dB'])
-        if d.empty:
-            return None
-        try:
-            x = [pd.Timestamp(v).strftime('%d %b') for v in d['Date']]
-        except Exception:
-            x = [str(v) for v in d['Date']]
-        y = [float(v) for v in d['Average_L_EQ_dB']]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=x, y=y, mode='lines+markers', fill='tozeroy',
-            line=dict(color='#1e3a5f', width=2.5), marker=dict(size=7, color='#1e3a5f'),
-            fillcolor='rgba(30,58,95,0.08)', name='Daily average',
-            hovertemplate='%{x}<br>%{y:.1f} dB(A)<extra></extra>',
-        ))
-        ymax = max(y + [53]) + 6
-        ymin = min(y + [45]) - 4
-        fig.add_hline(y=53, line=dict(color='#dc2626', width=1.5, dash='dash'),
-                      annotation_text='WHO guideline 53 dB', annotation_position='top left',
-                      annotation_font=dict(size=11, color='#b91c1c'))
-        fig.update_layout(
-            height=360, margin=dict(l=55, r=30, t=30, b=60),
-            xaxis=dict(title='Date', automargin=True, gridcolor='rgba(0,0,0,0.06)'),
-            yaxis=dict(title='Average noise, dB(A)', range=[ymin, ymax], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
-            plot_bgcolor='white', paper_bgcolor='white', showlegend=False,
-        )
-        return fig
+        base_style = self._get_pdf_styles()['BodyText']
+        body = ParagraphStyle('ResidentCell', parent=base_style, fontSize=8.5, leading=10.5,
+                              spaceBefore=0, spaceAfter=0)
+        centred = ParagraphStyle('ResidentLimit', parent=body, alignment=TA_CENTER)
+        col_head = ParagraphStyle('ResidentColHead', parent=body,
+                                  fontName='Helvetica-Bold', textColor=colors.white)
+        col_head_c = ParagraphStyle('ResidentColHeadC', parent=col_head, alignment=TA_CENTER)
 
-    def _fig_typical_day(self):
-        """24-hour average profile with the WHO night window shaded."""
-        hs = self.hourly_summary
-        if hs is None or hs.empty or 'Average_L_EQ_dB' not in hs.columns:
-            return None
-        d = hs.dropna(subset=['Average_L_EQ_dB']).sort_values('Hour')
-        if d.empty:
-            return None
-        hours = [int(v) for v in d['Hour']]
-        labels = [f"{hh:02d}:00" for hh in hours]
-        y = [float(v) for v in d['Average_L_EQ_dB']]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=labels, y=y, mode='lines+markers', fill='tozeroy',
-            line=dict(color='#1e3a5f', width=2.5), marker=dict(size=6, color='#1e3a5f'),
-            fillcolor='rgba(30,58,95,0.07)', name='Hourly average',
-            hovertemplate='%{x}<br>%{y:.1f} dB(A)<extra></extra>',
-        ))
-        ymax = max(y + [53]) + 6
-        ymin = min(y + [40]) - 4
-        # Shade the WHO night window (23:00–07:00) by category index.
-        def _idx(hr):
-            return hours.index(hr) if hr in hours else None
-        shapes = []
-        a, b = _idx(0), _idx(6)
-        if a is not None and b is not None:
-            shapes.append(dict(type='rect', xref='x', yref='paper', x0=a - 0.5, x1=b + 0.5,
-                               y0=0, y1=1, fillcolor='rgba(30,58,95,0.07)', line=dict(width=0), layer='below'))
-        c = _idx(23)
-        if c is not None:
-            shapes.append(dict(type='rect', xref='x', yref='paper', x0=c - 0.5, x1=c + 0.5,
-                               y0=0, y1=1, fillcolor='rgba(30,58,95,0.07)', line=dict(width=0), layer='below'))
-        fig.add_hline(y=53, line=dict(color='#dc2626', width=1.3, dash='dot'))
-        fig.add_hline(y=45, line=dict(color='#d97706', width=1.3, dash='dot'))
-        fig.update_layout(
-            height=360, margin=dict(l=55, r=30, t=40, b=60), shapes=shapes,
-            xaxis=dict(title='Hour of day', automargin=True, gridcolor='rgba(0,0,0,0.06)'),
-            yaxis=dict(title='Average noise, dB(A)', range=[ymin, ymax], gridcolor='rgba(0,0,0,0.06)', zeroline=False),
-            plot_bgcolor='white', paper_bgcolor='white', showlegend=False,
-            annotations=[dict(xref='paper', yref='paper', x=0.01, y=0.98, showarrow=False,
-                              text='Shaded = night (11 PM–7 AM)', font=dict(size=11, color='rgba(30,58,95,0.65)'),
-                              xanchor='left', yanchor='top')],
+        GRID = colors.HexColor('#D6DEE7')
+        BANNER = colors.HexColor('#293241')
+        ROW_BG = colors.HexColor('#F0F4F8')
+        W_LABEL, W_LIMIT, W_VALUE = 2.45 * inch, 1.15 * inch, 3.7 * inch
+
+        def _build(headers: list[str], rows: list[tuple[str, ...]], widths: list[float]) -> Table:
+            """One table: a header row, then one row per measurement."""
+            cells = [[Paragraph(h, col_head_c if i == 1 and len(headers) == 3 else col_head)
+                      for i, h in enumerate(headers)]]
+            style = [
+                ('GRID', (0, 0), (-1, -1), 0.5, GRID),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('TOPPADDING', (0, 0), (-1, -1), 3),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+                ('BACKGROUND', (0, 0), (-1, 0), BANNER),
+            ]
+            for i, row in enumerate(rows, start=1):
+                rendered = [Paragraph(f"<b>{row[0]}</b>", body)]
+                if len(row) == 3:
+                    rendered += [Paragraph(row[1], centred), Paragraph(row[2], body)]
+                else:
+                    rendered += [Paragraph(row[1], body)]
+                cells.append(rendered)
+                style.append(('BACKGROUND', (0, i), (-1, i), ROW_BG))
+            t = Table(cells, colWidths=widths, repeatRows=1)
+            t.setStyle(TableStyle(style))
+            return t
+
+        # Three separate tables rather than one with group banners.
+        #
+        # The summary block has no limit to compare against, so in a shared
+        # three-column layout its middle column read "Not applicable" on every
+        # row — a column of noise. Splitting it off lets each table carry only
+        # the columns it actually uses, and gives the limit column a heading of
+        # its own in the two tables where a limit exists.
+        summary = _build(
+            ['Table 2. Summary of measurements', 'Measured at this home'],
+            [
+                ("Monitoring period", f"{start_str} to {end_str}, {days_with_data} days with data"),
+                ("Data completeness", completeness_str),
+                ("LAeq, whole period", _laeq_with_spread()),
+                ("Spread of levels, L90 to L10", _climate_spread()),
+                ("L-Max, loudest reading", _d(self._lamax_value(lmax_col))),
+            ],
+            [W_LABEL, W_LIMIT + W_VALUE],
         )
-        return fig
+
+        comar = _build(
+            ['Table 3. Maryland COMAR — enforceable legal limits (residential)',
+             'Legal limit', 'Measured at this home'],
+            [
+                ("Daytime LAeq, 07:00–22:00", _lim(MD_RESIDENTIAL_DAY),
+                 _vs_range(laeq_day, MD_RESIDENTIAL_DAY, day_series, "day")),
+                ("Night-time LAeq, 22:00–07:00", _lim(MD_RESIDENTIAL_NIGHT),
+                 _vs_range(laeq_night, MD_RESIDENTIAL_NIGHT, night_comar_series, "night")),
+                ("Share of time at or above the limit", "Not applicable",
+                 f"Daytime {self._fmt_share(exc_stats['day_pct'])} of the {reading} readings in "
+                 f"07:00–22:00; night-time {self._fmt_share(exc_stats['night_pct'])} of the "
+                 f"{reading} readings in 22:00–07:00"),
+            ],
+            [W_LABEL, W_LIMIT, W_VALUE],
+        )
+
+        who = _build(
+            ['Table 4. WHO 2018 — health-based guidelines (not law)',
+             'Guideline', 'Measured at this home'],
+            [
+                ("Lden, 24 h with evening and night penalties", _lim(WHO_ROAD_LDEN),
+                 _vs_range(env.get('Lden'), WHO_ROAD_LDEN, lden_series, "day")),
+                ("Lnight, 23:00–07:00", _lim(WHO_ROAD_LNIGHT),
+                 _vs_range(env.get('Lnight'), WHO_ROAD_LNIGHT, lnight_series, "night")),
+                ("Share of time at or above the Lnight guideline", "Not applicable",
+                 f"{self._fmt_share(exc_stats['who_night_pct'])} of the {reading} readings in "
+                 f"23:00–07:00"),
+                ("Individual periods above the guideline", "Not applicable", _periods_over()),
+            ],
+            [W_LABEL, W_LIMIT, W_VALUE],
+        )
+
+        return [summary, Spacer(1, 0.09 * inch), comar, Spacer(1, 0.09 * inch), who]
 
     @staticmethod
     def _participant_guidance(lden, lnight, laeq):
@@ -1724,7 +2338,7 @@ class ReportGeneratorV2:
         stem = re.sub(r"^\d{8}_\d{6}_", "", stem)
         if not self.deidentify or is_safe_label(stem):
             return stem or "not recorded"
-        return self.device_id or "withheld"
+        return self._display_location_label() or self.device_id or "withheld"
 
     def _lamax_value(self, lmax_col: str | None) -> float | None:
         """Highest reading in the instrument's L-Max stream, or None if absent.
@@ -1946,9 +2560,14 @@ class ReportGeneratorV2:
             spaceAfter=6,
         )
 
-        story.append(Paragraph(
-            "<b>Non-Technical Summary: Noise Exposure &amp; Health Assessment</b>", styles['h2']
-        ))
+        # The heading goes INSIDE the box below, as its first row.
+        #
+        # As a separate h2 above it, the style's keepWithNext bound the heading
+        # to the box, and a KeepTogether cannot split — so the pair jumped to
+        # the next page whenever the whole box did not fit, leaving page 1 at
+        # 56% on every report. Inside the table the block splits normally, and
+        # the heading cannot be orphaned because it is row 0 of the thing it
+        # heads.
 
         # Parse summary text into sections
         body_parts, who_part, concern_part = [], None, None
@@ -1977,7 +2596,15 @@ class ReportGeneratorV2:
             fontName='Helvetica-Bold', spaceAfter=2,
         )
 
-        inner_content = []
+        _heading_style = ParagraphStyle(
+            'SummaryHeading', parent=_plain_style,
+            fontName='Helvetica-Bold', fontSize=12, leading=15, spaceAfter=4,
+            textColor=colors.HexColor('#293241'),
+        )
+
+        inner_content = [
+            Paragraph("Non-Technical Summary: Noise Exposure &amp; Health Assessment", _heading_style)
+        ]
 
         # 1. Concern level — prominent coloured line
         if concern_part:
@@ -2010,17 +2637,35 @@ class ReportGeneratorV2:
             for bl in bullets:
                 inner_content.append(Paragraph(f'•  {escape(bl)}', _plain_style))
 
-        # Wrap all inner content in a KeepTogether inside a single-cell Table
-        # → one background, one border, no per-paragraph boxes
+        # One background and one border around the whole summary, rather than a
+        # box per paragraph — hence a single-cell table.
+        #
+        # splitInRow lets that cell break across a page boundary. Without it the
+        # box is indivisible: at roughly four inches tall it rarely fits in what
+        # remains of page 1, so it moved wholesale to page 2 and left the first
+        # page 44% empty on every report this platform has produced.
+        # One paragraph per ROW, not all of them in one cell.
+        #
+        # A cell holding a list of flowables is indivisible, so the whole box —
+        # about four inches tall — moved to the next page whenever it did not
+        # fit in what remained of the current one, leaving page 1 of every
+        # report this platform has produced 44% empty. Split between rows it
+        # flows like ordinary text, and the background and border still enclose
+        # the block because the style spans all rows.
         summary_table = Table(
-            [[ inner_content ]],
+            [[flowable] for flowable in inner_content],
             colWidths=[9.0 * inch],
+            splitByRow=1,
         )
         summary_table.setStyle(TableStyle([
             ('BACKGROUND',    (0, 0), (-1, -1), colors.HexColor(_box_bg)),
             ('BOX',           (0, 0), (-1, -1), 1.2, colors.HexColor(_box_border)),
-            ('TOPPADDING',    (0, 0), (-1, -1), 12),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+            # Tight between rows; the 12pt breathing room belongs at the two
+            # ends of the box, not between every paragraph inside it.
+            ('TOPPADDING',    (0, 0), (-1, -1), 1),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
+            ('TOPPADDING',    (0, 0), (0, 0), 12),
+            ('BOTTOMPADDING', (0, -1), (-1, -1), 12),
             ('LEFTPADDING',   (0, 0), (-1, -1), 14),
             ('RIGHTPADDING',  (0, 0), (-1, -1), 14),
             ('VALIGN',        (0, 0), (-1, -1), 'TOP'),
@@ -2377,7 +3022,7 @@ class ReportGeneratorV2:
 
         story.append(Paragraph(
             "Standards sourced from WHO Environmental Noise Guidelines (2018), "
-            "WHO Guidelines for Community Noise (1999), and Maryland COMAR 26.02.03.02. "
+            "WHO Guidelines for Community Noise (1999), and Maryland COMAR 26.02.03. "
             "OSHA/NIOSH occupational standards are excluded — this is an environmental assessment.",
             styles['BodyText']
         ))
@@ -2410,6 +3055,7 @@ class ReportGeneratorV2:
             results = evaluate_compliance(
                 lden=measured_lden,
                 lnight=measured_lnight,
+                ldn=env.get('Ldn') if isinstance(env, dict) else None,
                 laeq=laeq_overall,
                 laeq_day=laeq_day,
                 laeq_night=laeq_night,
@@ -2502,6 +3148,31 @@ class ReportGeneratorV2:
             "WHO 2018 health-based thresholds are stricter than most local zoning limits.</i>",
             styles['BodyText']
         ))
+        story.append(Spacer(1, 0.10 * inch))
+
+        # How often the level sat above each limit. The pass/fail rows above
+        # report whole-period averages, which say nothing about how the exposure
+        # was distributed: a period can pass on its average while spending a
+        # meaningful share of its hours above the level.
+        exc_stats = self._exceedance_summary(ts, self._get_numeric_series(leq_col))
+        story.append(Paragraph("Time and periods above the limits", styles['h2']))
+        story.append(Paragraph(
+            f"<b>Maryland COMAR.</b> The measured level was at or above the "
+            f"{MD_RESIDENTIAL_DAY:.0f} dB(A) day limit for "
+            f"<b>{self._fmt_share(exc_stats['day_pct'])}</b> of measured daytime (07:00–22:00), and at or "
+            f"above the {MD_RESIDENTIAL_NIGHT:.0f} dB(A) night limit for "
+            f"<b>{self._fmt_share(exc_stats['night_pct'])}</b> of measured night-time (22:00–07:00). "
+            f"<b>WHO 2018.</b> The measured level was at or above the {WHO_ROAD_LNIGHT:.0f} dB(A) Lnight "
+            f"guideline for <b>{self._fmt_share(exc_stats['who_night_pct'])}</b> of the measured WHO night "
+            f"window (23:00–07:00). "
+            + (f"Lnight exceeded {WHO_ROAD_LNIGHT:.0f} dB(A) on <b>{exc_stats['nights_over']} of "
+               f"{exc_stats['nights_total']}</b> nights, each computed over its own 23:00–07:00 window. "
+               if exc_stats['nights_over'] is not None else "")
+            + (f"Lden exceeded {WHO_ROAD_LDEN:.0f} dB(A) on <b>{exc_stats['days_over']} of "
+               f"{exc_stats['days_total']}</b> days. " if exc_stats['days_over'] is not None else ""),
+            styles['BodyText']
+        ))
+        story.append(Paragraph(self._exceedance_note(exc_stats), styles['BodyText']))
         story.append(Spacer(1, 0.10 * inch))
 
         # WHO source-attribution limitation note
@@ -2691,33 +3362,61 @@ class ReportGeneratorV2:
             story.append(Spacer(1, 0.12 * inch))
             return
 
-        # Build table with strict columns
-        data = [["Hour of Day", "Average LAeq (dB(A))", "Min (dB(A))", "Max (dB(A))", "Std Dev (dB)"]]
-
+        # Two half-day blocks side by side.
+        #
+        # Twenty-four rows in one column filled a whole landscape page top to
+        # bottom while leaving more than half its width empty, and pushed
+        # Section 7 onto a page of its own that then sat two-thirds blank. Split
+        # 00:00-11:00 against 12:00-23:00 the same table is half as tall, uses
+        # the width the page actually has, and puts morning beside afternoon
+        # where the two can be compared directly.
+        header = ["Hour", "Average LAeq (dB(A))", "Min (dB(A))", "Max (dB(A))", "Std Dev (dB)"]
+        rows = []
         for idx, row in self.hourly_summary.iterrows():
             hour = int(row.get('Hour', idx))
-            hour_str = f"{hour:02d}:00"
-            
-            avg_laeq = self._fmt_db_plain(row.get('Average_L_EQ_dB'))
-            min_val = self._fmt_db_plain(row.get('Min_L_EQ_dB'))
-            max_val = self._fmt_db_plain(row.get('Max_L_EQ_dB'))
-            std_dev = self._fmt_float(row.get('Std_Dev'), 2)
+            rows.append([
+                f"{hour:02d}:00",
+                self._fmt_db_plain(row.get('Average_L_EQ_dB')),
+                self._fmt_db_plain(row.get('Min_L_EQ_dB')),
+                self._fmt_db_plain(row.get('Max_L_EQ_dB')),
+                self._fmt_float(row.get('Std_Dev'), 2),
+            ])
 
-            data.append([hour_str, avg_laeq, min_val, max_val, std_dev])
-
-        table = Table(data, colWidths=[1.2*inch, 1.8*inch, 1.6*inch, 1.6*inch, 1.4*inch])
-        table.setStyle(TableStyle([
+        half = (len(rows) + 1) // 2
+        col_widths = [0.7 * inch, 1.35 * inch, 0.95 * inch, 0.95 * inch, 0.95 * inch]
+        block_style = TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3D5A80')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
             ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F0F4F8')),
-            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#DDDDDD')),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#DDDDDD')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
             ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ]))
-        story.append(table)
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 2.5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
+            ('LEFTPADDING', (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+        ])
+
+        blocks = []
+        for chunk in (rows[:half], rows[half:]):
+            if not chunk:
+                continue
+            t = Table([header] + chunk, colWidths=col_widths)
+            t.setStyle(block_style)
+            blocks.append(t)
+
+        if len(blocks) == 2:
+            side_by_side = Table([blocks], colWidths=[4.95 * inch, 4.95 * inch])
+            side_by_side.setStyle(TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('LEFTPADDING', (0, 0), (0, 0), 0),
+                ('RIGHTPADDING', (1, 0), (1, 0), 0),
+            ]))
+            story.append(side_by_side)
+        elif blocks:
+            story.append(blocks[0])
         story.append(Spacer(1, 0.12 * inch))
 
     # ============================================================
@@ -2767,6 +3466,9 @@ class ReportGeneratorV2:
     # ============================================================
 
     def _add_section_8_visualizations(self, story, styles, *, ts: pd.Series, leq_col: str | None, lmax_col: str | None, lmin_col: str | None):
+        # Kept: removing it changes no page count (Chart 1 cannot fit under
+        # Section 7's table either way) and a clean start for the figures reads
+        # better than a heading stranded under an unrelated table.
         story.append(PageBreak())
         story.append(Paragraph("Section 8: Advanced Visualizations", styles['h1']))
 
@@ -2775,27 +3477,27 @@ class ReportGeneratorV2:
             story.append(Paragraph("LEQ stream not available; visualizations cannot be generated.", styles['BodyText']))
             return
 
+        # Provenance now travels in the caption rather than inside the image.
+        src = f" <b>Data source:</b> {escape(self._figure_source_label())}."
+
         lmax = self._get_numeric_series(lmax_col) if (lmax_col and lmax_col in self.df.columns) else None
         lmin = self._get_numeric_series(lmin_col) if (lmin_col and lmin_col in self.df.columns) else None
 
         # Chart 1: Time Series with WHO band
         story.append(Paragraph("Chart 1: Time Series (LAeq with L-Max/L-Min envelope &amp; WHO limits)", styles['h2']))
-        fig1 = self._fig_time_series_with_band(ts=ts, leq=leq, lmax=lmax, lmin=lmin)
+        fig1, binning = self._fig_time_series_with_band(ts=ts, leq=leq, lmax=lmax, lmin=lmin)
         if fig1:
-            img1 = self._plotly_fig_to_image(fig1, width_inch=9.4, height_inch=4.5)
+            img1 = self._chart_image(fig1, width_inch=9.4, height_inch=4.5)
             if img1:
                 story.append(img1)
             else:
                 story.append(Paragraph("<i>Unable to render chart image.</i>", styles['BodyText']))
         story.append(Paragraph(
-            "<b>What it is:</b> This time series shows the continuous LAeq (equivalent continuous noise level) "
-            "across the full measurement period. "
-            "<b>How it is calculated:</b> Each plotted point is an energy-averaged LAeq over the resampling interval "
-            "(adaptive: 15 min for short datasets, up to 1 day for multi-month records). The L-Max/L-Min dotted "
-            "lines show the Maximum and Minimum envelope; the purple line is a 1-hour rolling median. "
-            "<b>How to read it:</b> The dark line is the sustained acoustic load. Dashed red horizontal lines "
-            "mark WHO 2018 road-traffic thresholds (Lden 53 dB; Lnight 45 dB). Any sustained period above these "
-            "lines represents a documented health risk window.",
+            "<b>What it is:</b> LAeq across the full measurement period, with the L-Min to L-Max envelope. "
+            "<b>How it is calculated:</b> "
+            + self._chart1_method_sentences(binning, metrics_at="in Section 3") + " "
+            "<b>How to read it:</b> The dark line is the sustained acoustic load; the width of the shaded "
+            "band is the spread between the quietest and loudest moments within each bin." + src,
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.2 * inch))
@@ -2804,19 +3506,19 @@ class ReportGeneratorV2:
         story.append(Paragraph("Chart 2: Diurnal Box-and-Whisker (Hourly LEQ Volatility)", styles['h2']))
         fig2 = self._fig_diurnal_box_whisker(ts=ts, leq=leq)
         if fig2:
-            img2 = self._plotly_fig_to_image(fig2, width_inch=9.4, height_inch=5.0)
+            img2 = self._chart_image(fig2, width_inch=9.4, height_inch=5.0)
             if img2:
                 story.append(img2)
             else:
                 story.append(Paragraph("<i>Unable to render chart image.</i>", styles['BodyText']))
         story.append(Paragraph(
-            "<b>What it is:</b> This box-and-whisker plot breaks down the LEQ noise levels for each of the 24 hours "
-            "of the day, pooled across all measurement days in the dataset. "
-            "<b>How it is calculated:</b> It uses the raw continuous LEQ data to show the full statistical spread — "
-            "not a single average. The box spans the IQR (25th–75th percentile); the centre line is the median (L50). "
-            "<b>How to read it:</b> A tall box indicates acoustically unpredictable conditions at that hour. "
-            "Dots above the upper whisker are extreme transient events (e.g. sirens, lorries). "
-            "Hours with short, low boxes are stable and quiet.",
+            "<b>What it is:</b> The full statistical spread of LAeq at each hour of the day, not a single "
+            "average. "
+            "<b>How it is calculated:</b> " + self._chart2_method_sentences(
+                metrics_at="in Section 3", reading=self._reading_word(ts)) + " "
+            "<b>How to read it:</b> A tall box indicates acoustically variable conditions at that hour; "
+            "hours with short, low boxes are steady and quiet. What produces either pattern cannot be "
+            "determined from sound level data alone." + src,
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.2 * inch))
@@ -2825,46 +3527,54 @@ class ReportGeneratorV2:
         story.append(Paragraph("Chart 3: Temporal Heatmap (LAeq Intensity by Date &amp; Hour)", styles['h2']))
         fig3 = self._fig_temporal_heatmap(ts=ts, leq=leq)
         if fig3:
-            img3 = self._plotly_fig_to_image(fig3, width_inch=9.0, height_inch=4.8)
+            img3 = self._chart_image(fig3, width_inch=9.0, height_inch=4.8)
             if img3:
                 story.append(img3)
             else:
                 story.append(Paragraph("<i>Unable to render chart image.</i>", styles['BodyText']))
         story.append(Paragraph(
-            "<b>What it is:</b> This heatmap shows the LAeq noise intensity for every hour of every day in the "
-            "filtered dataset. Each coloured cell represents one calendar hour on one date. "
-            "<b>How it is calculated:</b> Each cell is computed using strict logarithmic energy averaging (LAeq) — "
-            "never an arithmetic mean. Green cells indicate quieter hours; red and orange cells indicate louder "
-            "hours. Cell colour reflects the measured level only: a single hour cannot be compared against the "
-            "WHO guidelines, which are defined on Lden and Lnight rather than on individual hours. Blank cells "
-            "are hours with no data. "
-            "<b>How to read it:</b> Scan vertically to identify the noisiest times of day; scan horizontally to "
-            "spot unusually loud or quiet individual days. A consistently red row at a given hour indicates a "
-            "recurring daily pattern; identifying what produces it requires observations beyond sound level data. "
-            "The Y-axis tick for each hour aligns precisely to the centre of its corresponding cell.",
+            "<b>What it is:</b> LAeq for every hour of every day in the record. "
+            "<b>How it is calculated:</b> " + self._chart3_method_sentences() + " "
+            "<b>How to read it:</b> Read down a column to see how one day changed hour by hour; read across "
+            "a row to see whether a given hour behaved the same way from day to day. A consistently bright "
+            "row indicates a recurring daily pattern; identifying what produces it requires observations "
+            "beyond sound level data." + src,
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.2 * inch))
 
-        # Chart 4: Diurnal Noise Fingerprint — KeepTogether so chart + caption stay on same page
+        # Charts 4 and 5 side by side.
+        #
+        # Both are square. Stacked one per page on an 11-inch-wide landscape
+        # sheet each wasted about four inches of width, and the pair spanned
+        # three pages: a full one each, plus an entirely blank sheet between
+        # them where a KeepTogether that slightly overran the frame forced a
+        # break and then rendered on the page after. Laid out in two columns the
+        # pair occupies one page, and neither can trigger that break.
         story.append(PageBreak())
-        c4_parts = [Paragraph("Chart 4: Diurnal Noise Fingerprint (24-Hour Polar Radar)", styles['h2'])]
+        radar_w = (doc_width := 9.5) / 2 - 0.15   # two columns inside the text block
+        radar_h = 4.2
+
+        cap_col = ParagraphStyle('RadarCaption', parent=styles['BodyText'], fontSize=8, leading=10)
+
         try:
             fig4 = self._fig_diurnal_radar(ts=ts, leq=leq)
-            if fig4:
-                img4 = self._plotly_fig_to_image(fig4, width_inch=6.0, height_inch=5.5)
-                c4_parts.append(img4 if img4 else Paragraph("<i>Unable to render polar chart image.</i>", styles['BodyText']))
-            else:
-                c4_parts.append(Paragraph("<i>Insufficient hourly data to generate diurnal radar chart.</i>", styles['BodyText']))
+            img4 = self._chart_image(fig4, width_inch=radar_w, height_inch=radar_h) if fig4 else None
+            cell4 = img4 or Paragraph(
+                "<i>Insufficient hourly data to generate the diurnal radar chart.</i>", styles['BodyText'])
         except Exception as e:
             print(f"[Report] Diurnal radar chart failed: {str(e)[:120]}")
-            c4_parts.append(Paragraph("<i>Diurnal radar chart could not be generated.</i>", styles['BodyText']))
-        c4_parts.append(Paragraph(
+            cell4 = Paragraph("<i>Diurnal radar chart could not be generated.</i>", styles['BodyText'])
+
+        cap4 = Paragraph(
             "<b>What it is:</b> A polar radar chart showing the mean LAeq noise level for each of the 24 hours of the day, "
             "plotted clockwise from midnight (00:00) around the circle. "
             "<b>How it is calculated:</b> All measurements falling within each clock hour are energy-averaged (LAeq) across "
-            "every day in the dataset. "
-            "<b>How to read it:</b> The polygon shape summarises the site's daily level pattern. "
+            "every day in the dataset. Each spoke is labelled by the hour it starts: the 06:00 spoke is the "
+            "06:00–06:59 bin. "
+            "<b>How to read it:</b> The shaded sector spans the night period, 22:00 to 07:00 (Maryland COMAR), "
+            "and so covers the hourly bins from 22:00 through 06:00. "
+            "The polygon shape summarises the site's daily level pattern. "
             "A lopsided polygon with morning and late-afternoon peaks indicates activity concentrated at "
             "those hours; a uniformly expanded polygon indicates a level that is broadly steady around the "
             "clock. What produces either pattern cannot be determined from sound level data alone and "
@@ -2872,33 +3582,28 @@ class ReportGeneratorV2:
             "The dashed rings mark 45 dB and 53 dB for visual orientation only. They are the WHO guideline "
             "VALUES, but those guidelines are defined on Lnight and Lden — a night-long and a 24-hour "
             "penalty-weighted average respectively — so an individual hour rising above a ring is not an "
-            "exceedance. The compliance assessment in Section 3 evaluates the correct metrics.",
-            styles['BodyText']
-        ))
-        c4_parts.append(Spacer(1, 0.15 * inch))
-        story.append(KeepTogether(c4_parts))
+            "exceedance. The compliance assessment in Section 3 evaluates the correct metrics." + src,
+            cap_col
+        )
 
-        # Chart 5: Weekly Noise Profile — only add PageBreak when chart will actually render
         try:
             fig5 = self._fig_weekly_radar(ts=ts, leq=leq)
         except Exception as _e5:
             print(f"[Report] Weekly radar chart failed: {str(_e5)[:120]}")
             fig5 = None
 
-        story.append(PageBreak())
-        c5_parts = [Paragraph("Chart 5: Weekly Noise Profile (Day-of-Week Radar)", styles['h2'])]
         if fig5 is not None:
-            img5 = self._plotly_fig_to_image(fig5, width_inch=6.0, height_inch=5.5)
-            c5_parts.append(img5 if img5 is not None else
-                            Paragraph("<i>Unable to render weekly radar chart image.</i>", styles['BodyText']))
+            img5 = self._chart_image(fig5, width_inch=radar_w, height_inch=radar_h)
+            cell5 = img5 or Paragraph("<i>Unable to render the weekly radar chart image.</i>",
+                                      styles['BodyText'])
         else:
-            c5_parts.append(Paragraph(
-                "<i>Weekly radar chart requires data spanning at least 3 distinct calendar days "
-                "covering multiple days of the week. The current dataset does not meet that threshold — "
+            cell5 = Paragraph(
+                "<i>The weekly radar chart requires data spanning at least 3 distinct calendar days "
+                "covering multiple days of the week. This dataset does not meet that threshold — "
                 "extend the measurement period to see day-of-week noise patterns.</i>",
-                styles['BodyText']
-            ))
-        c5_parts.append(Paragraph(
+                styles['BodyText'])
+
+        cap5 = Paragraph(
             "<b>What it is:</b> A 7-spoke radar chart showing the mean LAeq noise level for each day of the week "
             "(Monday–Sunday), with separate traces for daytime (07:00–22:00) and nighttime (22:00–07:00). "
             "<b>How it is calculated:</b> All measurements are grouped by day-of-week and time-of-day period, "
@@ -2906,16 +3611,46 @@ class ReportGeneratorV2:
             "<b>How to read it:</b> A wider daytime polygon shows that daytime levels exceed nighttime levels. "
             "Shorter weekend than weekday spokes indicate a level that falls at weekends, and roughly equal "
             "spokes indicate a level that does not vary by day of week. These are descriptions of the measured "
-            "pattern; attributing any of them to a particular source requires evidence beyond sound level data.",
-            styles['BodyText']
-        ))
-        story.append(KeepTogether(c5_parts))
+            "pattern; attributing any of them to a particular source requires evidence beyond sound level data." + src,
+            cap_col
+        )
+
+        col_w = radar_w * inch + 0.15 * inch
+        radar_block = Table(
+            [[Paragraph("Chart 4: Diurnal Noise Fingerprint (24-Hour Polar Radar)", styles['h2']),
+              Paragraph("Chart 5: Weekly Noise Profile (Day-of-Week Radar)", styles['h2'])],
+             [cell4, cell5],
+             [cap4, cap5]],
+            colWidths=[col_w, col_w],
+        )
+        radar_block.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, 0), 'BOTTOM'),
+            ('VALIGN', (0, 1), (-1, 1), 'MIDDLE'),
+            ('VALIGN', (0, 2), (-1, 2), 'TOP'),
+            ('ALIGN', (0, 1), (-1, 1), 'CENTER'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+            ('RIGHTPADDING', (0, 0), (0, -1), 12),
+            ('LEFTPADDING', (1, 0), (1, -1), 12),
+            ('TOPPADDING', (0, 0), (-1, -1), 2),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+        ]))
+        story.append(radar_block)
 
     # ============================================================
     # CHART GENERATION
     # ============================================================
 
-    def _fig_time_series_with_band(self, *, ts: pd.Series, leq: pd.Series, lmax: pd.Series | None, lmin: pd.Series | None):
+    def _fig_time_series_with_band(self, *, ts: pd.Series, leq: pd.Series, lmax: pd.Series | None, lmin: pd.Series | None,
+                                   title: str | None = None):
+        """Build Chart 1.
+
+        Returns
+        -------
+        tuple of (plotly.graph_objects.Figure or None, TimeSeriesBinning)
+            The figure and a record of how it was binned, so the caption states
+            what was actually done rather than reciting the adaptive ladder.
+            The binning is empty when no figure could be built.
+        """
         df = pd.DataFrame({'ts': ts, 'leq': leq})
         if lmax is not None:
             df['lmax'] = lmax
@@ -2924,19 +3659,12 @@ class ReportGeneratorV2:
 
         df = df.dropna(subset=['ts', 'leq']).sort_values('ts')
         if df.empty:
-            return None
+            return None, TimeSeriesBinning()
 
         # Multi-week reports become unreadable if every raw point is plotted.
         # Resample adaptively to preserve the envelope while keeping the LEQ trace legible.
         span = df['ts'].iloc[-1] - df['ts'].iloc[0]
-        if span <= pd.Timedelta(days=3):
-            freq = '15min'
-        elif span <= pd.Timedelta(days=14):
-            freq = '1h'
-        elif span <= pd.Timedelta(days=60):
-            freq = '6h'
-        else:
-            freq = '1D'
+        freq, bin_label = ts_resample_rule(span)
 
         df = df.set_index('ts')
 
@@ -2966,39 +3694,92 @@ class ReportGeneratorV2:
         # NaNs that would have broken the line — so this trace was drawn straight
         # across every outage while the LAeq trace beneath it correctly broke.
         # Keep the NaNs and mask the smooth wherever there is no measurement.
-        roll_w = min(4, max(1, len(df_plot)))
-        rolling_1h = df_plot['leq'].rolling(window=roll_w, min_periods=1).median()
+        # Window chosen from the diurnal cycle, not from a fixed bin count.
+        bin_interval = pd.Timedelta(freq if freq[0].isdigit() else f'1{freq}')
+        roll_window, roll_span_label = ts_rolling_window(span, bin_interval)
+        roll_w = max(3, int(round(roll_window / bin_interval)))
+        roll_w = min(roll_w, max(1, len(df_plot)))
+
+        # CENTRED. A trailing window reports the median of the preceding N bins
+        # at the position of the last one, which shifts the whole trend line
+        # forward by half the window — on a 24-hour window that placed every
+        # feature 12 hours later than it occurred. Centring puts the median at
+        # the middle of the data it summarises.
+        #
+        # min_periods of half the window keeps the two ends honest: with
+        # min_periods=1 the first and last points were medians of a single bin,
+        # so the trend line ran out to the edges carrying no smoothing at all.
+        rolling_1h = df_plot['leq'].rolling(
+            window=roll_w, center=True, min_periods=max(1, roll_w // 2)).median()
         rolling_1h = rolling_1h.where(df_plot['leq'].notna())
+        roll_label = f'Rolling median ({roll_span_label}, centered)'
 
         fig = go.Figure()
 
         # Draw the envelope first so the LAeq trace stays visually dominant.
         if 'lmax' in df_plot.columns and 'lmin' in df_plot.columns:
+            # Shade the L-Max/L-Min band, one filled polygon per contiguous run
+            # of measured bins.
+            #
+            # A single 'tonexty' fill across the whole series cannot be used:
+            # plotly pairs the two traces positionally, and the NaN gaps that
+            # must be present (so outages are not drawn as data) break that
+            # pairing — the earlier attempt rendered a triangular wedge spanning
+            # several days of no measurement. Splitting on the gaps and filling
+            # each run as its own closed polygon (up the L-Max side, back down
+            # the L-Min side) gives the shaded envelope with the outages left
+            # genuinely blank.
+            measured = df_plot['lmax'].notna() & df_plot['lmin'].notna()
+            run_id = (measured != measured.shift()).cumsum()
+            first_band = True
+            for _, seg in df_plot[measured].groupby(run_id[measured], sort=False):
+                if len(seg) < 2:
+                    continue
+                seg_x = list(seg.index)
+                fig.add_trace(go.Scatter(
+                    x=seg_x + seg_x[::-1],
+                    y=list(seg['lmax']) + list(seg['lmin'])[::-1],
+                    mode='lines',
+                    line=dict(color='rgba(0,0,0,0)', width=0),
+                    fill='toself',
+                    fillcolor='rgba(61,90,128,0.13)',
+                    name='Envelope (L-Min–L-Max)',
+                    legendgroup='envelope',
+                    showlegend=first_band,
+                    hoverinfo='skip',
+                ))
+                first_band = False
+
             fig.add_trace(go.Scatter(
                 x=df_plot.index,
                 y=df_plot['lmax'],
                 mode='lines',
-                name='L-Max envelope',
+                name='L-Max',
                 line=dict(color='rgba(244,162,97,0.55)', width=1.5, dash='dot'),
                 connectgaps=False,
                 hoverinfo='skip',
+                showlegend=False,
             ))
             fig.add_trace(go.Scatter(
                 x=df_plot.index,
                 y=df_plot['lmin'],
                 mode='lines',
-                name='L-Min envelope',
+                name='L-Min',
                 line=dict(color='rgba(42,157,143,0.55)', width=1.5, dash='dot'),
                 connectgaps=False,
-                # No 'tonexty' fill. Plotly fills between this trace and the
-                # previous one by pairing points positionally, and once NaN gaps
-                # are present (which they must be, so outages are not drawn as
-                # data) that pairing breaks: the rendered figure showed a large
-                # triangular wedge spanning several days that corresponded to no
-                # measurement at all. The two dotted envelope lines carry the same
-                # information without inventing a shape.
                 hoverinfo='skip',
+                showlegend=False,
             ))
+            # Full-strength legend proxies: the faded dotted plot style is
+            # near-invisible at swatch size (PI comment), but the plotted lines
+            # must stay subtle so they don't compete with the LAeq trace.
+            for proxy_name, proxy_color in (('L-Max', 'rgb(230,126,34)'),
+                                            ('L-Min', 'rgb(26,148,133)')):
+                fig.add_trace(go.Scatter(
+                    x=[None], y=[None], mode='lines', name=proxy_name,
+                    line=dict(color=proxy_color, width=2.5, dash='dot'),
+                    hoverinfo='skip', showlegend=True,
+                ))
 
         fig.add_trace(go.Scatter(
             x=df_plot.index,
@@ -3015,35 +3796,58 @@ class ReportGeneratorV2:
                 x=rolling_1h.index,
                 y=rolling_1h.values,
                 mode='lines',
-                name='Rolling 1-Hour Median (L50)',
+                name=roll_label,
                 line=dict(color='#8E44AD', width=2.5),
                 connectgaps=False,
-                hovertemplate='%{x|%d %b %Y %H:%M}<br>Rolling 1-Hour Median: %{y:.1f} dB(A)<extra></extra>',
+                hovertemplate='%{x|%d %b %Y %H:%M}<br>Rolling median: %{y:.1f} dB(A)<extra></extra>',
             ))
 
         # Fixed orientation levels. Both lines previously read "WHO 24-Hr
         # Threshold", which was wrong twice: 45 dB is the Lnight guideline, not a
         # 24-hour one, and neither guideline applies to the LAeq trace plotted
         # here — Lden and Lnight are penalty-weighted long-term averages.
-        fig.add_hline(
-            y=53.0,
-            line_dash='dash',
-            line_color='rgba(231,111,81,0.95)',
-            annotation_text='53 dB reference',
-            annotation_position='top left'
-        )
-        fig.add_hline(
-            y=45.0,
-            line_dash='dash',
-            line_color='rgba(231,111,81,0.7)',
-            annotation_text='45 dB reference',
-            annotation_position='bottom left'
-        )
+        #
+        # Labelled in the right margin rather than inside the frame: an in-plot
+        # label sat on top of the traces, and on a dense multi-week record it was
+        # unreadable against them.
+        for ref_y, ref_alpha in ((53.0, 0.95), (45.0, 0.7)):
+            fig.add_hline(y=ref_y, line_dash='dash',
+                          line_color=f'rgba(231,111,81,{ref_alpha})')
+            fig.add_annotation(
+                x=1.012, xref='paper', xanchor='left',
+                y=ref_y, yref='y', yanchor='middle',
+                text=f'{ref_y:.0f} dB',
+                showarrow=False, align='left',
+                # Named so _size_fig_for_print can widen the right margin to fit
+                # whatever width this text renders at, rather than trusting a
+                # hand-set margin that clipped the "dB" when the type grew.
+                name=self.REF_LABEL_ANNOTATION_NAME,
+                font=dict(size=9, color='rgba(196,78,52,1)'),
+            )
+
+        # Stable y-axis window.
+        #
+        # Autoscaling put the reference lines somewhere different in every
+        # report, and on a loud record the 45 dB line was pushed onto the very
+        # bottom edge of the frame where it could barely be seen. Anchoring the
+        # window means both lines land in the same place every time, so two
+        # reports can be held side by side and compared by eye. The window only
+        # ever grows: data outside it extends the axis rather than being clipped.
+        plotted = [df_plot['leq']]
+        for extra in ('lmax', 'lmin'):
+            if extra in df_plot.columns:
+                plotted.append(df_plot[extra])
+        observed = pd.concat(plotted).dropna()
+        y_lo, y_hi = Y_AXIS_BASE_WINDOW_DB
+        if not observed.empty:
+            y_lo = min(y_lo, math.floor(float(observed.min())) - 2.0)
+            y_hi = max(y_hi, math.ceil(float(observed.max())) + 2.0)
 
         tickformat = '%d %b\n%H:%M' if span <= pd.Timedelta(days=3) else '%d %b'
+        chart_title = title or (
+            f'Chart 1: Time Series — LAeq with L-Max/L-Min envelope ({bin_label} bins)'
+        )
         fig.update_layout(
-            title=dict(text='Chart 1: Time Series — LAeq with L-Max/L-Min envelope',
-                       y=0.96, yanchor='top'),
             xaxis=dict(
                 title='Time',
                 tickformat=tickformat,
@@ -3061,45 +3865,56 @@ class ReportGeneratorV2:
                 showgrid=True,
                 gridcolor='rgba(0,0,0,0.08)',
                 zeroline=False,
+                range=[y_lo, y_hi],
+                dtick=10,
             ),
             legend=dict(
                 orientation='h',
                 yanchor='bottom',
-                y=1.02,
-                xanchor='left',
-                x=0,
+                y=1.015,
+                xanchor='center',
+                x=0.5,
                 bgcolor='rgba(255,255,255,0.85)',
                 bordercolor='rgba(0,0,0,0.08)',
                 borderwidth=1,
             ),
-            margin=dict(l=55, r=25, t=115, b=55),
+            title=dict(y=0.975, yanchor='top', x=0.5, xanchor='center'),
+            # Right margin holds the two reference-line labels; the top carries
+            # the title above the legend; the bottom clears the x-axis title AND
+            # the source caption beneath it.
+            margin=dict(l=62, r=84, t=150, b=90),
             autosize=True,
-            height=420,
+            height=470,
             hovermode='x unified',
             plot_bgcolor='white',
             paper_bgcolor='white',
-            annotations=[dict(
-                text=f"Source: {self._figure_source_label()}",
-                xref='paper',
-                yref='paper',
-                x=1,
-                y=-0.20,
-                xanchor='right',
-                yanchor='top',
-                showarrow=False,
-                font=dict(size=9, color='rgba(80,80,80,0.85)')
-            )],
         )
-        return fig
+        self._apply_chart_typography(fig, title=chart_title)
+        self._add_source_annotation(fig, y=-0.20)
+        return fig, TimeSeriesBinning(freq=freq, bin_label=bin_label, window_label=roll_span_label)
 
-    def _fig_diurnal_box_whisker(self, *, ts: pd.Series, leq: pd.Series):
-        """Generate a diurnal box-and-whisker chart for hourly LEQ volatility."""
+    def _fig_diurnal_box_whisker(self, *, ts: pd.Series, leq: pd.Series, title: str | None = None):
+        """Generate a diurnal box-and-whisker chart for hourly LEQ volatility.
+
+        Day (07:00–22:00) and night (22:00–07:00) hours are coloured apart, the
+        night hours shaded, and the COMAR residential limit for each period drawn
+        across only the hours that period covers — the limits are defined on the
+        LAeq of the whole period, so a line spanning all 24 hours would assert a
+        limit over hours it does not govern.
+        """
         try:
             df = pd.DataFrame({'ts': ts, 'leq': leq}).dropna()
             if df.empty:
                 return None
             df['hour'] = df['ts'].dt.hour
             fig = go.Figure()
+
+            # Maryland COMAR day period is 07:00–22:00, i.e. the hourly bins
+            # labelled 07:00 through 21:00. Everything else is night.
+            day_hours = set(range(7, 22))
+            # Colourblind-safe pair (Okabe-Ito orange / report slate blue).
+            DAY_LINE, DAY_FILL = '#B37700', 'rgba(230,159,0,0.35)'
+            NIGHT_LINE, NIGHT_FILL = '#293241', 'rgba(61,90,128,0.45)'
 
             for h in range(24):
                 hour_values = pd.to_numeric(df.loc[df['hour'] == h, 'leq'], errors='coerce').dropna()
@@ -3116,6 +3931,9 @@ class ReportGeneratorV2:
                 lf  = float(max(hour_values.min(), q1 - 1.5 * iqr))
                 uf  = float(min(hour_values.max(), q3 + 1.5 * iqr))
                 label = f'{h:02d}:00'
+                is_day = h in day_hours
+                box_line = DAY_LINE if is_day else NIGHT_LINE
+                box_fill = DAY_FILL if is_day else NIGHT_FILL
 
                 # Box with analytically computed stats (no raw data bulk)
                 fig.add_trace(go.Box(
@@ -3123,9 +3941,9 @@ class ReportGeneratorV2:
                     lowerfence=[lf], upperfence=[uf],
                     x=[label],
                     name=label,
-                    marker=dict(color='#3D5A80'),
-                    line=dict(color='#293241', width=1.5),
-                    fillcolor='rgba(61, 90, 128, 0.35)',
+                    marker=dict(color=box_line),
+                    line=dict(color=box_line, width=1.5),
+                    fillcolor=box_fill,
                     showlegend=False,
                     boxpoints=False,
                     hovertemplate='Hour: %{x}<br>Median: %{median:.1f} dB(A)<extra></extra>',
@@ -3152,13 +3970,71 @@ class ReportGeneratorV2:
                         x=[label] * len(vals),
                         y=vals,
                         mode='markers',
-                        marker=dict(color='#3D5A80', size=3, opacity=0.35),
+                        marker=dict(color=box_line, size=3, opacity=0.35),
                         showlegend=False,
                         hovertemplate='Hour: %{x}<br>LEQ: %{y:.1f} dB(A) (beyond 1.5×IQR)<extra></extra>',
                     ))
 
+            # Night shading and period limits.
+            #
+            # On a categorical axis plotly places category i at x = i, so the
+            # band edges sit on the half-integers between categories. Night is
+            # two spans because it wraps midnight: 00:00–06:00 and 22:00–23:00.
+            NIGHT_SPANS = ((-0.5, 6.5), (21.5, 23.5))
+            DAY_SPAN = (6.5, 21.5)
+            for x0, x1 in NIGHT_SPANS:
+                fig.add_vrect(x0=x0, x1=x1, fillcolor='rgba(44,62,80,0.07)',
+                              line_width=0, layer='below')
+
+            # COMAR residential limits, each drawn only across the hours its
+            # period covers. Imported from the compliance matrix so the resident
+            # report cannot drift from the technical report's limit values.
+            limit_spans = [
+                (MD_RESIDENTIAL_DAY, [DAY_SPAN], 'rgba(179,119,0,0.95)',
+                 f'COMAR day limit {MD_RESIDENTIAL_DAY:.0f} dB(A), 07:00–22:00'),
+                (MD_RESIDENTIAL_NIGHT, list(NIGHT_SPANS), 'rgba(41,50,65,0.95)',
+                 f'COMAR night limit {MD_RESIDENTIAL_NIGHT:.0f} dB(A), 22:00–07:00'),
+            ]
+            # Drawn as shapes, not traces. On a category axis a Scatter with
+            # numeric x is not positioned at those category indices — plotly
+            # appends the numbers as new categories, which put the limit lines
+            # in empty space to the right of 23:00. Shapes take the numeric
+            # coordinate directly.
+            for limit_db, spans, colour, _legend_name in limit_spans:
+                for x0, x1 in spans:
+                    fig.add_shape(type='line', xref='x', yref='y',
+                                  x0=x0, x1=x1, y0=limit_db, y1=limit_db,
+                                  line=dict(color=colour, width=2, dash='dash'),
+                                  layer='above')
+
+            # Legend keys. Each hour is its own Box trace, and the limits are
+            # shapes, so neither can carry a legend entry — these empty traces
+            # do it instead.
+            legend_keys = [
+                ('Daytime hours (07:00–22:00)', DAY_LINE, 'square', None),
+                ('Night hours (22:00–07:00)', NIGHT_LINE, 'square', None),
+            ] + [(name, colour, None, 'dash') for _l, _s, colour, name in limit_spans]
+            for legend_name, colour, symbol, dash in legend_keys:
+                fig.add_trace(go.Scatter(
+                    x=[None], y=[None],
+                    mode='markers' if symbol else 'lines',
+                    marker=dict(color=colour, size=11, symbol=symbol) if symbol else None,
+                    line=dict(color=colour, width=2, dash=dash) if dash else None,
+                    name=legend_name, showlegend=True, hoverinfo='skip',
+                ))
+
+            # Same anchored window as Chart 1, extended if the data or the
+            # limit lines fall outside it, so both COMAR lines are always in frame.
+            leq_all = pd.to_numeric(df['leq'], errors='coerce').dropna()
+            y_lo, y_hi = Y_AXIS_BASE_WINDOW_DB
+            if not leq_all.empty:
+                y_lo = min(y_lo, math.floor(float(leq_all.min())) - 2.0)
+                y_hi = max(y_hi, math.ceil(float(leq_all.max())) + 2.0)
+            y_lo = min(y_lo, MD_RESIDENTIAL_NIGHT - 5.0)
+            y_hi = max(y_hi, MD_RESIDENTIAL_DAY + 5.0)
+
+            chart2_title = title or 'Chart 2: Diurnal Box-and-Whisker (Hourly LEQ Volatility)'
             fig.update_layout(
-                title='Chart 2: Diurnal Box-and-Whisker (Hourly LEQ Volatility)',
                 xaxis=dict(
                     title='Hour of Day',
                     categoryorder='array',
@@ -3169,34 +4045,35 @@ class ReportGeneratorV2:
                     automargin=True,
                 ),
                 yaxis=dict(
-                    title='LEQ dB(A)',
+                    title='LAeq (dB(A))',
                     showgrid=True,
                     gridcolor='rgba(0,0,0,0.08)',
                     zeroline=False,
+                    range=[y_lo, y_hi],
+                    dtick=10,
                 ),
-                margin=dict(l=55, r=25, t=80, b=90),
+                title=dict(y=0.975, yanchor='top', x=0.5, xanchor='center'),
+                legend=dict(
+                    orientation='h', yanchor='bottom', y=1.015,
+                    xanchor='center', x=0.5,
+                    bgcolor='rgba(255,255,255,0.85)',
+                    bordercolor='rgba(0,0,0,0.08)', borderwidth=1,
+                ),
+                # Top margin carries the title plus a two-row legend.
+                margin=dict(l=70, r=25, t=170, b=105),
                 autosize=True,
-                height=500,
+                height=620,
                 paper_bgcolor='white',
                 plot_bgcolor='white',
-                annotations=[dict(
-                    text=f"Source: {self._figure_source_label()}",
-                    xref='paper',
-                    yref='paper',
-                    x=1,
-                    y=-0.24,
-                    xanchor='right',
-                    yanchor='top',
-                    showarrow=False,
-                    font=dict(size=9, color='rgba(80,80,80,0.85)')
-                )],
             )
+            self._apply_chart_typography(fig, title=chart2_title)
+            self._add_source_annotation(fig, y=-0.26)
             return fig
         except Exception as e:
             print(f"[Report] Box plot failed: {str(e)[:100]}")
             return None
 
-    def _fig_temporal_heatmap(self, *, ts: pd.Series, leq: pd.Series):
+    def _fig_temporal_heatmap(self, *, ts: pd.Series, leq: pd.Series, title: str | None = None):
         """Generate temporal heatmap (date x hour)."""
         df = pd.DataFrame({'ts': ts, 'leq': leq}).dropna()
         if df.empty:
@@ -3248,26 +4125,29 @@ class ReportGeneratorV2:
         )
 
         fig.update_layout(
-            title='Chart 3: Temporal Heatmap (LAeq intensity by date & hour)',
             xaxis_title='Date', yaxis_title='Hour of Day',
-            margin=dict(l=65, r=20, t=70, b=70), height=500,
+            margin=dict(l=80, r=20, t=85, b=85), height=520,
             plot_bgcolor='white',
             paper_bgcolor='white',
-            annotations=[dict(
-                text=f"Source: {self._figure_source_label()}",
-                xref='paper', yref='paper', x=1, y=-0.22,
-                xanchor='right', yanchor='top', showarrow=False,
-                font=dict(size=9, color='rgba(80,80,80,0.85)')
-            )],
         )
+        # Colourbar title only; its font size is set with everything else by
+        # _scale_fig_fonts once the print box is known.
+        fig.update_traces(colorbar=dict(title=dict(text='LAeq dB(A)')),
+                          selector=dict(type='heatmap'))
+        self._apply_chart_typography(
+            fig, title=title or 'Chart 3: Temporal Heatmap (LAeq intensity by date & hour)')
+        self._add_source_annotation(fig, y=-0.22)
 
-        # Tick labels are the same string list used as y — zero-offset alignment.
+        # Tick labels are drawn from the same string list used as y, so each tick
+        # lands exactly on its cell centre. Every second hour is labelled: at the
+        # type size this report prints at, 24 labels overlap into an unreadable
+        # block in the shorter (resident) layout.
+        y_ticks = y[::2]
         fig.update_yaxes(
             tickmode='array',
-            tickvals=y,
-            ticktext=y,
+            tickvals=y_ticks,
+            ticktext=y_ticks,
             automargin=True,
-            tickfont=dict(size=9),
             autorange='reversed',
         )
         fig.update_xaxes(tickangle=-45, automargin=True)
@@ -3354,22 +4234,26 @@ class ReportGeneratorV2:
                 showlegend=True,
             ))
 
-        # Night band shading (22:00–07:00 spokes dimmed via a filled area near centre)
-        night_hours = list(range(22, 24)) + list(range(0, 7))
-        night_theta = [f"{h:02d}:00" for h in night_hours] + [f"{night_hours[0]:02d}:00"]
-        # Draw the night wedge to the OUTER edge, not 1 dB above the axis
-        # minimum — at the centre it was invisible, so the legend advertised a
-        # band the reader could not see.
-        night_r = [r_max] * len(night_theta)
+        # Night sector shading, 22:00–07:00 (Maryland COMAR night period).
+        #
+        # Built as a true centre-anchored wedge: down the 22:00 radius, round the
+        # rim to the 07:00 spoke, back down the 07:00 radius. The previous
+        # version listed only the 22:00–06:00 spokes at constant r_max and let
+        # fill='toself' close the shape, which produced a circular segment cut
+        # off by a chord — the shading visibly ended at 06:00 while the legend
+        # said 07:00. The rim must reach the 07:00 spoke because the 06:00 hour
+        # bin covers 06:00–06:59 and is a night hour.
+        night_labels = [f"{h % 24:02d}:00" for h in range(22, 32)]   # 22:00 … 07:00
         fig.add_trace(go.Scatterpolar(
-            r=night_r,
-            theta=night_theta,
+            r=[r_min] + [r_max] * len(night_labels) + [r_min],
+            theta=[night_labels[0]] + night_labels + [night_labels[-1]],
             mode='lines',
             fill='toself',
             fillcolor='rgba(44,62,80,0.07)',
             line=dict(color='rgba(0,0,0,0)', width=0),
             name='Night (22:00–07:00)',
             showlegend=True,
+            hoverinfo='skip',
         ))
 
         # Main LAeq trace
@@ -3390,28 +4274,29 @@ class ReportGeneratorV2:
                     visible=True,
                     range=[r_min, r_max],
                     ticksuffix=' dB',
-                    tickfont=dict(size=9),
+                    # Fixed 5 dB step, drawn horizontally. Letting plotly choose
+                    # produced a tick every 2 dB, which at print type size it
+                    # then rotated upright and packed into an unreadable column
+                    # through the middle of the chart.
+                    dtick=5,
+                    tickangle=0,
                     gridcolor='rgba(180,180,180,0.5)',
                     linecolor='rgba(150,150,150,0.6)',
                 ),
                 angularaxis=dict(
                     direction='clockwise',
-                    tickfont=dict(size=10),
                     gridcolor='rgba(180,180,180,0.4)',
                 ),
                 bgcolor='rgba(248,249,250,1)',
             ),
-            title=dict(
-                text='Mean LAeq by Hour of Day',
-                font=dict(size=14, color='#1a1a2e'),
-                x=0.5,
-            ),
-            legend=dict(orientation='h', yanchor='bottom', y=-0.15, xanchor='center', x=0.5, font=dict(size=9)),
+            title=dict(x=0.5),
+            legend=dict(orientation='h', yanchor='bottom', y=-0.15, xanchor='center', x=0.5),
             paper_bgcolor='white',
             width=700,
             height=700,
-            margin=dict(l=60, r=60, t=80, b=80),
+            margin=dict(l=60, r=60, t=90, b=95),
         )
+        self._apply_chart_typography(fig, title='Mean LAeq by Hour of Day')
         return fig
 
     def _fig_weekly_radar(self, *, ts: pd.Series, leq: pd.Series):
@@ -3506,28 +4391,25 @@ class ReportGeneratorV2:
                     visible=True,
                     range=[r_min, r_max],
                     ticksuffix=' dB',
-                    tickfont=dict(size=9),
+                    dtick=5,
+                    tickangle=0,
                     gridcolor='rgba(180,180,180,0.5)',
                     linecolor='rgba(150,150,150,0.6)',
                 ),
                 angularaxis=dict(
                     direction='clockwise',
-                    tickfont=dict(size=11),
                     gridcolor='rgba(180,180,180,0.4)',
                 ),
                 bgcolor='rgba(248,249,250,1)',
             ),
-            title=dict(
-                text='Weekly Noise Profile — Daytime vs Nighttime LAeq by Day of Week',
-                font=dict(size=14, color='#1a1a2e'),
-                x=0.5,
-            ),
-            legend=dict(orientation='h', yanchor='bottom', y=-0.18, xanchor='center', x=0.5, font=dict(size=9)),
+            title=dict(x=0.5),
+            legend=dict(orientation='h', yanchor='bottom', y=-0.18, xanchor='center', x=0.5),
             paper_bgcolor='white',
             width=700,
             height=700,
-            margin=dict(l=60, r=60, t=80, b=100),
+            margin=dict(l=60, r=60, t=90, b=115),
         )
+        self._apply_chart_typography(fig, title='Weekly Profile — Daytime vs Nighttime LAeq')
         return fig
 
     # ============================================================
@@ -3542,6 +4424,11 @@ class ReportGeneratorV2:
             scale = 1.25 if len(self.df) > 500_000 else 2
             img_bytes = fig.to_image(format="png", scale=scale)
             img = Image(io.BytesIO(img_bytes))
+            # Keep the PNG on the flowable. ReportLab replaces a BytesIO passed
+            # as `filename` with str(buffer) — the repr, not the data — so the
+            # bytes are otherwise unrecoverable, and the Word renderer needs
+            # them to embed the same image the PDF shows.
+            img._png_bytes = img_bytes
             aspect = img.imageHeight / img.imageWidth if img.imageWidth > 0 else 1
             img.drawWidth  = width_inch * inch
             img.drawHeight = (width_inch * inch) * aspect

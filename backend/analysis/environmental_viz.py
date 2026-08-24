@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
 """
 Enhanced Environmental Visualization Module
 Implements Phase 1 quick wins for advanced environmental analysis

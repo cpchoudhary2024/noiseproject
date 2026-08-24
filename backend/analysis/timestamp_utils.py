@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
 """Robust timestamp parsing and integrity assessment.
 
 Device exports are inconsistent: some carry full ISO datetimes, some carry

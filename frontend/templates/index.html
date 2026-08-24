@@ -268,6 +268,13 @@
                     </div>
                 </div>
 
+                <!-- Active date-filter banner. Shown whenever the analysis ran on a
+                     subset, so the filter's effect is visible rather than assumed. -->
+                <div id="filterActiveBanner" style="display:none;margin-bottom:16px;padding:12px 16px;border-radius:8px;border-left:5px solid #7c3aed;background:#faf5ff;color:#4c1d95;font-size:13px;line-height:1.6;">
+                    <i class="fas fa-filter"></i> <strong>Date filter applied.</strong>
+                    <span id="filterActiveText"></span>
+                </div>
+
                 <!-- Timestamp-integrity warning (shown when timestamps are unreadable) -->
                 <div id="timestampWarning" class="ts-warning" style="display:none;" role="alert">
                     <i class="fas fa-triangle-exclamation ts-warning-icon"></i>
@@ -482,10 +489,23 @@
                             <button class="btn btn-primary" onclick="openReportFormatModal('comprehensive')">
                                 <i class="fas fa-file-download"></i> Download Report (PDF / Word)
                             </button>
+                            <button class="btn btn-secondary" onclick="openReportFormatModal('resident')">
+                                <i class="fas fa-house-chimney"></i> Download Resident Report (PDF / Word)
+                            </button>
                             <button class="btn btn-info" onclick="generateReport('comprehensive', 'html')">
                                 <i class="fas fa-file-code"></i> View HTML Report
                             </button>
                         </div>
+                        <p style="font-size:12px;color:#6b7280;margin-top:10px;">
+                            <i class="fas fa-info-circle"></i> The <strong>resident report</strong> is a two-page
+                            summary: headline numbers plus the time series, the hourly variability box plot, and the
+                            date × hour heatmap. It uses the <strong>Device / Location ID</strong> above in its chart
+                            titles — enter <em>Home A</em> (or <em>House A</em>) before downloading and the titles read
+                            &ldquo;… at Home A&rdquo;.
+                            <br><i class="fas fa-file-word" style="color:#2b579a;"></i> The <strong>Word version</strong>
+                            of either report is rendered from the same content as its PDF — same pages, same margins,
+                            same figures — as an editable document that works with track changes.
+                        </p>
 
                         <!-- Custom Notes Section (appears in report after Section 4) -->
                         <div style="margin-top:18px; padding:16px 18px; background:#f8fafc; border:1px solid #e5e7eb; border-radius:8px;">

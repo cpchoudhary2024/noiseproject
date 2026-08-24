@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
 """Educational content about noise, decibels, and health impacts.
 
 This module provides reference information for reports and educational materials

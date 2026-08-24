@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
 """
 WLG File Parser for Larson Davis Sound Level Meter Data
 

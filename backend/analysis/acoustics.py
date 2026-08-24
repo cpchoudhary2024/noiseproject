@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
 """Acoustics utilities for environmental noise metrics.
 
 This module centralizes correct decibel-domain computations.
@@ -48,6 +49,14 @@ def exceedance_levels_db(levels_db: Iterable[float] | pd.Series | np.ndarray) ->
         return None
 
     def p(q: float) -> float:
+        """Percentile of the finite sample array.
+
+        Args:
+            q (float): Percentile rank, 0-100, ASCENDING (so Lx = p(100 - x)).
+
+        Returns:
+            float: Sound level at that percentile, dB(A).
+        """
         return float(np.percentile(arr, q))
 
     return {
@@ -307,3 +316,213 @@ def compute_ldn_lden(
         out["Lden"] = float(lden)
 
     return out if out else None
+
+
+# ── Exceedance statistics ────────────────────────────────────────────────────
+#
+# What may and may not be expressed as a "percentage of time above a limit".
+#
+# A percentage of time above a level is a statement about the DISTRIBUTION of
+# the measured levels — it is the complement of the Lx percentile family, and it
+# is well defined for any level. It is a description of exposure, not a
+# compliance verdict, and it is only meaningful for limits that are themselves
+# defined on the measured level.
+#
+# The line to draw is NOT "regulatory limit versus health guideline" — it is
+# whether the limit's number lives on the same scale as a measured reading.
+#
+#   * Maryland COMAR 65/55 dB(A) and WHO Lnight 45 dB(A) all sit on the scale of
+#     the measurement itself. COMAR's night level is an LAeq over 22:00-07:00
+#     and Lnight is an LAeq over 23:00-07:00 — both plain energy averages of the
+#     measured levels, differing in their window and their number, not in kind.
+#     A share of time at or above any of them is computable and meaningful, as
+#     long as each uses its OWN window as the denominator.
+#
+#   * WHO Lden 53 dB(A) does not. Lden adds +5 dB to evening and +10 dB to night
+#     readings before averaging, so its number is on a penalty-weighted scale
+#     that no measured reading is on. "Time above 53 dB(A)" is a real statistic
+#     about the data but it is unrelated to Lden, so it must not be presented
+#     beside it. For Lden the answerable question is how many individual days
+#     had an Lden above the guideline.
+#
+# In every case the share of time is a DESCRIPTION OF EXPOSURE, never a
+# compliance verdict: all four limits above are assessed on a period average,
+# and a period can pass on its average while spending real time above the level.
+# Report the two side by side and label them for what they are.
+
+
+def time_above_level_pct(levels_db: pd.Series, threshold_db: float) -> float | None:
+    """Share of measured readings at or above ``threshold_db``.
+
+    Parameters
+    ----------
+    levels_db : pandas.Series
+        A-weighted sound levels, dB(A). NaN entries are excluded from both the
+        numerator and the denominator, so the result is a share of *measured*
+        time rather than of elapsed time.
+    threshold_db : float
+        Level to compare against, dB(A).
+
+    Returns
+    -------
+    float or None
+        Percentage in 0-100, or None when there are no valid readings.
+
+    Notes
+    -----
+    The count of readings equals a share of time only when readings are evenly
+    spaced, which holds for a fixed-interval logger. The value also depends on
+    the logging interval: a level that breaches the threshold for five seconds
+    is visible in a 1-second record and averaged away in a 1-minute one. Report
+    the interval alongside the percentage.
+    """
+    clean = pd.to_numeric(levels_db, errors='coerce').dropna()
+    if clean.empty:
+        return None
+    return float((clean >= float(threshold_db)).sum()) / len(clean) * 100.0
+
+
+def time_above_level_in_window(
+    timestamps: pd.Series,
+    levels_db: pd.Series,
+    *,
+    threshold_db: float,
+    start_hour: int,
+    end_hour: int,
+) -> tuple[float | None, int]:
+    """Share of time at or above ``threshold_db``, within one hour window.
+
+    The window is the denominator. Every limit carries its own window — COMAR
+    night is 22:00-07:00 and WHO Lnight is 23:00-07:00 — and a share computed
+    over the wrong one is not the share for that limit.
+
+    Parameters
+    ----------
+    timestamps, levels_db : pandas.Series
+        Aligned sample times and A-weighted levels in dB(A).
+    threshold_db : float
+        Level to compare against, dB(A).
+    start_hour, end_hour : int
+        Window, start inclusive and end exclusive; may wrap midnight.
+
+    Returns
+    -------
+    tuple of (float or None, int)
+        Percentage in 0-100, and the number of readings it was computed from.
+    """
+    df = pd.DataFrame({'ts': pd.to_datetime(timestamps, errors='coerce'),
+                       'leq': pd.to_numeric(levels_db, errors='coerce')}).dropna()
+    if df.empty:
+        return None, 0
+    in_window = df.loc[_mask_in_range(df['ts'].dt.hour, int(start_hour), int(end_hour)), 'leq']
+    return time_above_level_pct(in_window, threshold_db), int(len(in_window))
+
+
+def time_above_level_by_period(
+    timestamps: pd.Series,
+    levels_db: pd.Series,
+    *,
+    day_threshold_db: float,
+    night_threshold_db: float,
+    day_def: DayEveningNightDefinition = LDN_DEFAULT,
+) -> dict[str, float | int | None]:
+    """Share of day-period and of night-period time at or above each threshold.
+
+    Each period is its own denominator: the daytime figure is a share of
+    measured daytime only and the night figure a share of measured night only.
+    Pooling them over 24 hours would dilute a night statistic with the daytime
+    hours the night limit does not govern, and would understate night exposure
+    for exactly the readers who care about it.
+
+    Parameters
+    ----------
+    timestamps, levels_db : pandas.Series
+        Aligned sample times and A-weighted levels in dB(A).
+    day_threshold_db, night_threshold_db : float
+        Level to compare against within each period, dB(A).
+    day_def : DayEveningNightDefinition
+        Supplies the period boundaries. Defaults to the Ldn windows
+        (day 07:00-22:00, night 22:00-07:00), which are the Maryland COMAR
+        periods.
+
+    Returns
+    -------
+    dict
+        ``day_pct``, ``night_pct`` (float or None) and ``n_day``, ``n_night``
+        (int) — the readings behind each percentage.
+    """
+    day_pct, n_day = time_above_level_in_window(
+        timestamps, levels_db, threshold_db=day_threshold_db,
+        start_hour=day_def.day_start, end_hour=day_def.day_end)
+    night_pct, n_night = time_above_level_in_window(
+        timestamps, levels_db, threshold_db=night_threshold_db,
+        start_hour=day_def.night_start, end_hour=day_def.night_end)
+    return {'day_pct': day_pct, 'night_pct': night_pct,
+            'n_day': n_day, 'n_night': n_night}
+
+
+def nightly_lnight(
+    timestamps: pd.Series,
+    levels_db: pd.Series,
+    *,
+    night_start: int = 23,
+    night_end: int = 7,
+    min_coverage: float = 0.5,
+) -> pd.Series:
+    """Lnight for each individual night in the record.
+
+    A night spans midnight, so samples are keyed by the date the night *began*:
+    23:00 on the 4th through 07:00 on the 5th is the night of the 4th. Grouping
+    by calendar date instead would split every night into two half-nights and
+    average each against the wrong neighbour.
+
+    Parameters
+    ----------
+    timestamps, levels_db : pandas.Series
+        Aligned sample times and A-weighted levels in dB(A).
+    night_start, night_end : int
+        Night window, start inclusive and end exclusive. Defaults to the WHO
+        Lnight window of 23:00-07:00.
+    min_coverage : float
+        Least fraction of the night window that must be covered for the night to
+        be returned. A record almost always begins and ends mid-night, and those
+        two stub nights are not comparable with the full ones between them — an
+        hour of data at the quiet end of a night yields a low Lnight that would
+        otherwise be counted as a night below the guideline.
+
+    Returns
+    -------
+    pandas.Series
+        Lnight in dB(A), indexed by the date each night began. Empty when the
+        record contains no night-period samples.
+
+    Notes
+    -----
+    WHO defines Lnight as a long-term (yearly) average. A per-night value is the
+    same energy average over one night, and is reported as such: it supports
+    "how many nights were above the guideline", not a verdict on the guideline
+    itself, which needs the long-term figure.
+    """
+    df = pd.DataFrame({'ts': pd.to_datetime(timestamps, errors='coerce'),
+                       'leq': pd.to_numeric(levels_db, errors='coerce')}).dropna()
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    hours = df['ts'].dt.hour
+    df = df[_mask_in_range(hours, int(night_start), int(night_end))]
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    # Hours at or after night_start belong to that calendar date's night; hours
+    # before night_end are the tail of the previous date's night.
+    starts_tonight = df['ts'].dt.hour >= int(night_start)
+    df = df.assign(night_date=df['ts'].dt.normalize().where(
+        starts_tonight, df['ts'].dt.normalize() - pd.Timedelta(days=1)))
+
+    window_hours = (int(night_end) - int(night_start)) % 24 or 24
+    grouped = df.groupby('night_date')
+    out = grouped['leq'].apply(energetic_mean_db).dropna()
+
+    covered_hours = grouped['ts'].agg(lambda s: (s.max() - s.min()).total_seconds() / 3600.0)
+    keep = covered_hours >= float(min_coverage) * window_hours
+    return out[keep.reindex(out.index, fill_value=False)]

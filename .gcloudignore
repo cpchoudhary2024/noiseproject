@@ -1,0 +1,54 @@
+# Build context for `gcloud run deploy --source .`
+#
+# The working tree is ~3.5 GB (2 GB of raw logger exports, an 879 MB venv,
+# 399 MB of generated artifacts). None of it belongs in the image, and all of it
+# would otherwise be uploaded to Cloud Build on every deploy.
+#
+# Allow-list, not deny-list: ignore everything, then re-admit only what the
+# container needs. A new data folder dropped in the repo is then excluded by
+# default rather than silently shipped.
+#
+# NOTE: gcloud uses this file INSTEAD of .gitignore once it exists.
+
+# 1. Ignore everything ...
+*
+
+# 2. ... but keep descending into directories so the rules below can match.
+!*/
+
+# 3. Re-admit exactly what the Dockerfile needs.
+!/Dockerfile
+!/requirements.txt
+!/backend/**
+!/frontend/**
+
+# 4. Re-exclude heavy or irrelevant paths inside the admitted trees.
+#    (Later rules win, so these override the negations above.)
+backend/venv/
+backend/*.pdf
+**/__pycache__/
+*.pyc
+*.pyo
+
+# 5. Belt-and-braces: never walk these at all.
+.git/
+/artifacts/
+/uploads/
+/logs/
+/tools/
+/data/
+/reports/
+/docs/
+/tests/
+.vercel/
+.vscode/
+
+# 6. Data and report files, wherever they appear.
+*.xls
+*.xlsx
+*.csv
+*.wlg
+*.parquet
+*.docx
+*.pdf
+*.png

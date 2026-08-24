@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
 """
 Word Document Report Generator for Noise Analysis
 Generates publication-grade .docx reports with all analysis data

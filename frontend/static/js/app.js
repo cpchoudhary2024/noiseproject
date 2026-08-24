@@ -475,6 +475,7 @@ function runAnalysis() {
             currentAnalysis = data.analysis;
             currentStandards = data.standards;
             window.timestampIntegrity = data.timestamp_integrity || { status: 'ok', time_metrics_valid: true };
+            window.filterSummary = data.filter_summary || null;
             window.keyFindings = data.key_findings || {};
             // Display plain-English summary if returned by server
             displayPlainEnglishSummary(data.plain_english_summary || '');
@@ -488,6 +489,13 @@ function runAnalysis() {
                 setStatus('error', 'Display error');
                 showSection('preview-section');
             }
+        } else if (data.error_kind === 'temporal_filter') {
+            // The date range could not be honoured. Send the user back to the
+            // filter screen with the reason, rather than analysing the whole
+            // file and letting them believe the filter worked.
+            showError(data.error);
+            setStatus('error', 'Date range not applied');
+            showSection('preview-section');
         } else {
             const details = data.traceback || data.hint || '';
             const msg = 'Analysis error: ' + (data.error || 'Unknown error') + (details ? '\n\n' + details : '');
@@ -1029,7 +1037,7 @@ function renderComplianceMatrix(matrixRows) {
     const categories = {
         who_env:    { label: 'WHO 2018 — Environmental (Road Traffic, Aircraft & Railway)', rows: [] },
         who_indoor: { label: 'WHO 1999 / 2018 — Indoor (Bedroom)', rows: [] },
-        maryland:   { label: 'Maryland COMAR 26.02.03.02 — Legal Limits', rows: [] },
+        maryland:   { label: 'Maryland COMAR 26.02.03 — Legal Limits &amp; State Goals', rows: [] },
     };
 
     matrixRows.forEach(r => {
@@ -1143,7 +1151,28 @@ function renderDataInsights(statistics) {
     }
 }
 
+function renderFilterBanner() {
+    const bar = document.getElementById('filterActiveBanner');
+    const txt = document.getElementById('filterActiveText');
+    if (!bar || !txt) return;
+    const f = window.filterSummary;
+    if (!f || !f.applied) { bar.style.display = 'none'; return; }
+    const fmt = (iso) => {
+        if (!iso) return '\u2014';
+        const d = new Date(iso);
+        return Number.isNaN(d.getTime()) ? '\u2014'
+            : d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
+    };
+    const pct = f.rows_before ? Math.round(1000 * f.rows_after / f.rows_before) / 10 : 0;
+    txt.textContent = ' Everything below \u2014 and every report you download \u2014 covers '
+        + fmt(f.range_start) + ' to ' + fmt(f.range_end) + ' only: '
+        + Number(f.rows_after).toLocaleString() + ' of '
+        + Number(f.rows_before).toLocaleString() + ' readings (' + pct + '%).';
+    bar.style.display = 'block';
+}
+
 function displayResults() {
+    renderFilterBanner();
     if (!currentAnalysis) return;
 
     const analysis = currentAnalysis;
@@ -1707,7 +1736,7 @@ function displayCharts(analysis) {
             <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:16px;font-size:11px;color:#6b7280;line-height:1.6;">
                 <span><strong>WHO 2018:</strong> Road traffic Lden ≤ 53 dB(A), Lnight ≤ 45 dB(A) (Environmental Noise Guidelines for the European Region)</span>
                 <span><strong>EPA 1974:</strong> Outdoor Leq(24h) ≤ 55 dB(A) to prevent activity interference; ≤ 70 dB(A) to prevent hearing loss</span>
-                <span><strong>Maryland COMAR 26.02.03.02:</strong> Residential Zone — Daytime (7am–10pm) ≤ 65 dB(A), Nighttime (10pm–7am) ≤ 55 dB(A)</span>
+                <span><strong>Maryland COMAR 26.02.03.03 Table 2:</strong> Residential receiving property — Daytime (7am–10pm) ≤ 65 dB(A), Nighttime (10pm–7am) ≤ 55 dB(A)</span>
             </div>
             <div style="margin-top:6px;font-size:11px;color:#94a3b8;font-style:italic;">Note: Lx percentile levels are instantaneous exceedance statistics and differ from time-weighted Leq or Lden metrics required by each standard. Comparison is indicative only.</div>
         </div>`;
@@ -1927,20 +1956,24 @@ function displayStandards(_standards) {
         ${sectionHeader('🌍', 'WHO 2018 Environmental Noise Guidelines', 'Environmental Noise Guidelines for the European Region — World Health Organization, 2018', '#3b82f6')}
         <p style="font-size:12px;color:#64748b;margin:0 0 14px;">These are health-based recommendations expressed as annual average outdoor noise levels. They apply to transport noise sources near residential areas.</p>
         ${stdTable(
-            ['Noise Source', 'Metric', 'Guideline Level', 'Strength of Recommendation'],
+            ['Noise Source', 'Metric', 'Guideline Level', 'Averaging period', 'Strength'],
             [
-                ['Road Traffic', 'Lden', limitBadge('≤ 53 dB(A)'), strengthBadge('Strong')],
-                ['Road Traffic', 'Lnight', limitBadge('≤ 45 dB(A)'), strengthBadge('Strong')],
-                ['Railway', 'Lden', limitBadge('≤ 54 dB(A)'), strengthBadge('Strong')],
-                ['Railway', 'Lnight', limitBadge('≤ 44 dB(A)'), strengthBadge('Conditional')],
-                ['Aircraft', 'Lden', limitBadge('≤ 45 dB(A)'), strengthBadge('Strong')],
-                ['Aircraft', 'Lnight', limitBadge('≤ 40 dB(A)'), strengthBadge('Strong')],
-                ['Leisure / Amplified Music', 'LAeq,24h', limitBadge('≤ 70 dB(A)'), strengthBadge('Strong')],
-                ['Wind Turbines', 'Lden', limitBadge('≤ 45 dB(A)'), strengthBadge('Conditional')],
+                ['Road Traffic', 'Lden', limitBadge('≤ 53 dB(A)'), 'Year', strengthBadge('Strong')],
+                ['Road Traffic', 'Lnight', limitBadge('≤ 45 dB(A)'), 'Year, 23:00–07:00', strengthBadge('Strong')],
+                ['Railway', 'Lden', limitBadge('≤ 54 dB(A)'), 'Year', strengthBadge('Strong')],
+                ['Railway', 'Lnight', limitBadge('≤ 44 dB(A)'), 'Year, 23:00–07:00', strengthBadge('Strong')],
+                ['Aircraft', 'Lden', limitBadge('≤ 45 dB(A)'), 'Year', strengthBadge('Strong')],
+                ['Aircraft', 'Lnight', limitBadge('≤ 40 dB(A)'), 'Year, 23:00–07:00', strengthBadge('Strong')],
+                ['Wind Turbines', 'Lden', limitBadge('≤ 45 dB(A)'), 'Year', strengthBadge('Conditional')],
+                ['Leisure / Amplified Music', 'LAeq,24h', limitBadge('≤ 70 dB(A)'), 'Year, all leisure sources combined', strengthBadge('Conditional')],
             ],
             '#3b82f6'
         )}
-        <p style="font-size:11px;color:#94a3b8;margin:10px 0 0;">Lden = Day-Evening-Night level (with +5 dB evening / +10 dB night penalties). Lnight = 23:00–07:00 equivalent continuous level. Source: WHO (2018), ISBN 978-92-890-5356-3.</p>
+        <div style="margin-top:10px;background:#eff6ff;border-radius:8px;padding:11px 13px;font-size:12px;color:#1e3a8a;line-height:1.6;">
+          <strong>Strong vs Conditional.</strong> WHO grades a recommendation <em>strong</em> when it is confident the benefits outweigh the harms and it can be adopted as policy in most circumstances; <em>conditional</em> when the evidence base is thinner and a policy-maker needs to weigh local factors. A conditional recommendation is still a recommendation — the difference is in the certainty of the evidence, not in whether the level matters.
+          <br><br><strong>These are annual averages</strong>, and they are outdoor levels. Comparing them against a week or a month is indicative only — see &ldquo;What can I report from my measurement?&rdquo; above.
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin:10px 0 0;">Source: WHO, <em>Environmental Noise Guidelines for the European Region</em> (2018), ISBN 978-92-890-5356-3. Indicator definitions follow EU Directive 2002/49/EC Annex I. Values and gradings verified 5 Aug 2026.</p>
     `);
 
     // ── 2. WHO 1999 Indoor / Community Guidelines ───────────────────────────
@@ -1964,20 +1997,36 @@ function displayStandards(_standards) {
         <p style="font-size:11px;color:#94a3b8;margin:10px 0 0;">Source: WHO (1999) Guidelines for Community Noise, Geneva. Edited by Berglund B, Lindvall T, Schwela DH. ISBN 92-4-154553-4.</p>
     `);
 
-    // ── 3. Maryland COMAR 26.02.03.02 ──────────────────────────────────────
+    // ── 3. Maryland COMAR 26.02.03 ─────────────────────────────────────────
+    // Two different tables in two different regulations, previously merged into
+    // one and cited to the wrong section. Table 2 (.03) is the enforceable
+    // limit; Table 1 (.02) is the state's goal and is stated on Ldn.
     const s3 = section(`
-        ${sectionHeader('⚖️', 'Maryland COMAR 26.02.03.02 — Noise Control', 'Code of Maryland Regulations — Noise Pollution, Department of the Environment', '#f97316')}
-        <p style="font-size:12px;color:#64748b;margin:0 0 14px;">Maryland's enforceable outdoor noise limits at the property boundary of the <em>receiving</em> land-use zone. These are maximum permissible levels measured at the property line of the affected property.</p>
+        ${sectionHeader('⚖️', 'Maryland COMAR 26.02.03 — Noise Control', 'Code of Maryland Regulations — Control of Noise Pollution, Maryland Department of the Environment', '#f97316')}
+        <p style="font-size:12px;color:#64748b;margin:0 0 6px;"><strong>Enforceable limits — COMAR 26.02.03.03, Table 2.</strong> &ldquo;A person may not cause or permit noise levels which exceed those specified in Table 2.&rdquo; Measured at or within the property line of the <em>receiving</em> property (.03D(2)).</p>
         ${stdTable(
-            ['Receiving Zone', 'Daytime Limit (7am–10pm)', 'Nighttime Limit (10pm–7am)', 'Metric'],
+            ['Receiving Zone', 'Day (7 am – 10 pm)', 'Night (10 pm – 7 am)', 'Averaging period'],
             [
-                ['Residential', limitBadge('65 dB(A)'), limitBadge('55 dB(A)'), 'LAeq or Lmax (per measurement protocol)'],
-                ['Commercial', limitBadge('67 dB(A)'), limitBadge('62 dB(A)'), 'LAeq or Lmax'],
-                ['Industrial', limitBadge('75 dB(A)'), limitBadge('75 dB(A)'), 'LAeq or Lmax'],
+                ['Residential', limitBadge('65 dB(A)'), limitBadge('55 dB(A)'), 'Not stated in the regulation'],
+                ['Commercial', limitBadge('67 dB(A)'), limitBadge('62 dB(A)'), 'Not stated in the regulation'],
+                ['Industrial', limitBadge('75 dB(A)'), limitBadge('75 dB(A)'), 'Not stated in the regulation'],
             ],
             '#f97316'
         )}
-        <p style="font-size:11px;color:#94a3b8;margin:10px 0 0;">Source: COMAR 26.02.03.02, Maryland Department of the Environment (MDE). Limits apply at the boundary of the receiving property. Impulsive and tonal noise may have additional penalties under state regulations.</p>
+        <div style="margin-top:10px;background:#fff7ed;border-radius:8px;padding:11px 13px;font-size:12px;color:#7c2d12;line-height:1.6;">
+          <strong>On the averaging period.</strong> Table 2 is headed &ldquo;Maximum Allowable Noise Levels (dBA)&rdquo; and gives no averaging time. COMAR defines &ldquo;equivalent sound level&rdquo; (.01B(13)) and says the <em>standards</em> in Table 1 are expressed in equivalent levels, but says nothing of the kind about Table 2. This platform compares Table 2 against the <strong>LAeq of the period</strong>, which is the common reading — a not-to-exceed reading of the same table would be stricter. Prominent discrete tones and periodic noises must be <strong>5 dB(A) below</strong> these levels (.03A(3)).
+        </div>
+        <p style="font-size:12px;color:#64748b;margin:16px 0 6px;"><strong>State goals — COMAR 26.02.03.02, Table 1.</strong> &ldquo;Goals for the attainment of an adequate environment&rdquo;, which the Table 2 limits above are intended to achieve. These are targets, not levels a person may not exceed.</p>
+        ${stdTable(
+            ['Zoning District', 'Level', 'Metric', 'Averaging period'],
+            [
+                ['Residential', limitBadge('55 dB(A)'), 'Ldn', '24 hours, +10 dB applied to 10 pm – 7 am'],
+                ['Commercial', limitBadge('64 dB(A)'), 'Ldn', '24 hours, +10 dB applied to 10 pm – 7 am'],
+                ['Industrial', limitBadge('70 dB(A)'), 'Leq(24)', '24 hours, no penalty'],
+            ],
+            '#f97316'
+        )}
+        <p style="font-size:11px;color:#94a3b8;margin:10px 0 0;">Day and night hours are defined in COMAR 26.02.03.01B(5) and B(15); Ldn in B(4). Verified against the regulation text, 5 Aug 2026. Note that Maryland's night starts at 10 pm, an hour earlier than the 11 pm night used by WHO Lnight — the two cover different windows and are not interchangeable.</p>
     `);
 
     // ── 4. Occupational Standards ──────────────────────────────────────────
@@ -2020,13 +2069,73 @@ function displayStandards(_standards) {
         <p style="font-size:11px;color:#94a3b8;margin:10px 0 0;">Source: US EPA (1974). Information on Levels of Environmental Noise Requisite to Protect Public Health and Welfare with an Adequate Margin of Safety. EPA/ONAC 550/9-74-004.</p>
     `);
 
+    // ── 0. How to read a noise limit ───────────────────────────────────────
+    // Placed first because every table below is unreadable without it: a limit
+    // is a number AND an averaging period, and comparing the right number over
+    // the wrong period is the most common way these figures get misused.
+    const s0 = section(`
+        ${sectionHeader('📖', 'How to read a noise limit', 'Every limit below is a number plus an averaging period. Both matter.', '#0f766e')}
+        <p style="font-size:13px;color:#334155;margin:0 0 12px;line-height:1.7;">
+          A noise limit is never just a decibel value. It is a value <em>attached to a stated period of time</em>.
+          45 dB measured over eight hours and 45 dB measured over one second are entirely different claims, and a
+          reading compared against the wrong period is meaningless — however carefully it was measured.
+        </p>
+        ${stdTable(
+            ['Metric', 'What it measures', 'Period it is defined over'],
+            [
+                ['<strong>LAeq,T</strong>', 'The steady level carrying the same sound energy as the real, varying sound. An <em>energy</em> average, not an arithmetic one.', 'Whatever T says — LAeq,1h, LAeq,8h, LAeq,24h'],
+                ['<strong>L<sub>night</sub></strong>', 'LAeq across the night only. No penalty applied.', '<strong>23:00–07:00 (8 h)</strong>, averaged over a <strong>year</strong>'],
+                ['<strong>L<sub>den</sub></strong>', 'A 24-hour LAeq with +5 dB added to evening and +10 dB to night readings before averaging, because the same sound harms more at those hours.', 'Day 07:00–19:00, evening 19:00–23:00, night 23:00–07:00, averaged over a <strong>year</strong>'],
+                ['<strong>L<sub>dn</sub></strong>', 'The US/Maryland equivalent of Lden: 24-hour average, +10 dB at night, no separate evening.', 'Day 07:00–22:00, night 22:00–07:00, over 24 hours'],
+                ['<strong>L<sub>Amax</sub></strong>', 'The single loudest moment. Not an average at all.', 'One event'],
+                ['<strong>L90 / L50 / L10</strong>', 'Percentiles: the level exceeded 90%, 50% or 10% of the time. L90 is the background; L10 the louder events. Not averages.', 'The whole measurement, computed across every reading'],
+            ],
+            '#0f766e'
+        )}
+        <div style="margin-top:12px;background:#f0fdfa;border-radius:8px;padding:12px 14px;font-size:12px;color:#134e4a;line-height:1.65;">
+          <strong>Two traps worth knowing.</strong>
+          <br>· <strong>Night is not one thing.</strong> WHO L<sub>night</sub> runs 23:00–07:00 (8 h). Maryland's night runs 22:00–07:00 (9 h). A figure computed on one window cannot be checked against the other's limit.
+          <br>· <strong>L<sub>den</sub> is penalty-weighted.</strong> Its 53 dB is not on the scale of anything your meter displays, because evening and night readings are raised by 5 and 10 dB before averaging. No single reading can be compared against it.
+        </div>
+    `);
+
+    // ── 0b. Choosing an averaging period for your own monitoring ───────────
+    const s0b = section(`
+        ${sectionHeader('📅', 'What can I report from my measurement?', 'WHO Lden and Lnight are defined as YEARLY averages. Shorter records are still useful — but say what they are.', '#7c3aed')}
+        <p style="font-size:13px;color:#334155;margin:0 0 12px;line-height:1.7;">
+          WHO's guideline values are written for a <strong>long-term annual average</strong> (Directive 2002/49/EC, Annex I).
+          Almost nobody measures for a year. That does not make a shorter record invalid — it changes what you are
+          entitled to claim from it.
+        </p>
+        ${stdTable(
+            ['You measured for', 'You can report', 'Say it like this', 'Do not claim'],
+            [
+                ['<strong>1–3 days</strong>', 'LAeq per hour and per day, L90/L10, L<sub>Amax</sub>, the day/night split', '&ldquo;Over three days in April, the night-time LAeq was X dB(A).&rdquo;', 'An Lden or Lnight verdict — too few days to represent a typical period'],
+                ['<strong>1 week</strong>', 'All of the above, plus per-night L<sub>night</sub> and per-day L<sub>den</sub>, and how many exceeded the guideline', '&ldquo;L<sub>night</sub> exceeded 45 dB(A) on 6 of 7 nights measured.&rdquo;', 'That the site&rsquo;s annual Lnight is X — one week is not a year'],
+                ['<strong>1 month</strong>', 'All of the above, plus a stable diurnal pattern and weekday/weekend difference', '&ldquo;Across 28 days in March, the mean of the nightly L<sub>night</sub> values was X dB(A).&rdquo;', 'A seasonal or annual figure — one month carries one season&rsquo;s weather and activity'],
+                ['<strong>1 year</strong>', 'L<sub>den</sub> and L<sub>night</sub> as WHO defines them', '&ldquo;The annual L<sub>den</sub> was X dB(A), against the WHO guideline of 53 dB(A).&rdquo;', '—'],
+            ],
+            '#7c3aed'
+        )}
+        <div style="margin-top:12px;background:#faf5ff;border-radius:8px;padding:12px 14px;font-size:12px;color:#581c87;line-height:1.65;">
+          <strong>The honest way to use a short record.</strong> Report the measured period as the measured period, and
+          compare it to the guideline as an <em>indication</em> rather than a verdict. Reporting how many individual
+          nights or days crossed the line is stronger than a single averaged number, because it survives the objection
+          that the record was too short: &ldquo;6 of 7 nights above 45 dB(A)&rdquo; is a fact about those seven nights and
+          needs no extrapolation.
+          <br><br>ISO 1996-2 puts the combined uncertainty of an environmental noise measurement at roughly
+          <strong>1–3 dB</strong> once instrument, microphone position, source variability and weather are accounted for.
+          Differences smaller than that should not be treated as meaningful, whichever standard you are comparing against.
+        </div>
+    `);
+
     container.innerHTML = `
         <div style="max-width:900px;">
           <div style="margin-bottom:20px;">
             <h3 style="margin:0 0 4px;font-size:17px;font-weight:700;color:#1e293b;">Noise Standards Reference</h3>
-            <p style="margin:0;font-size:12px;color:#94a3b8;">Reference-quality summary of major noise standards applicable to environmental, community, indoor, and occupational contexts. Use the section headers to navigate to your relevant standard.</p>
+            <p style="margin:0;font-size:12px;color:#94a3b8;">Every value below was checked against the primary source document, not a secondary summary. Each limit is shown with the averaging period it is defined over. Start with &ldquo;How to read a noise limit&rdquo; if any of the metrics are unfamiliar.</p>
           </div>
-          ${s1}${s2}${s3}${s4}${s5}
+          ${s0}${s0b}${s1}${s2}${s3}${s4}${s5}
         </div>`;
 }
 

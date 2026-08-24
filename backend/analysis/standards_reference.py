@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
 """Authoritative standards & guideline reference data.
 
 This module centralizes externally-sourced guideline values so they can be reused
