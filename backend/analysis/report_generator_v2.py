@@ -1197,6 +1197,36 @@ class ReportGeneratorV2:
         px_per_pt = (canvas_w / width_inch) / 72.0
         self._scale_fig_fonts(fig, px_per_pt=px_per_pt)
 
+        # Reserve room under a polar chart for its horizontal legend. A polar
+        # chart draws its angular tick labels on the circle's perimeter, so the
+        # bottom labels and the legend compete for the same band — and unlike a
+        # cartesian axis a polar one has no automargin to settle it. The radar
+        # layouts set that band in pixels against plotly's default 700 px
+        # canvas; this method then resizes the canvas and scales the fonts up
+        # for print, leaving the band too small. That is what clipped the 11:00
+        # to 13:00 labels on Chart 4 and hid "Friday" behind the legend on
+        # Chart 5. Size the band from the legend's own metrics instead, and take
+        # the legend's fill off so it can never cover a label it overlaps.
+        if any(getattr(tr, 'type', '') in ('scatterpolar', 'barpolar') for tr in fig.data):
+            canvas_h = int(round(height_inch * dpi / export_scale))
+            row_px = 1.8 * CHART_LEGEND_PT * px_per_pt
+            names = [str(tr.name or '') for tr in fig.data
+                     if getattr(tr, 'showlegend', True) is not False and tr.name]
+            if names:
+                # 0.55 em per character plus 4 em for the swatch and gutter.
+                entry_px = [(len(n) * 0.55 + 4.0) * CHART_LEGEND_PT * px_per_pt for n in names]
+                inner_w = max(1.0, canvas_w - (fig.layout.margin.l or 0) - (fig.layout.margin.r or 0))
+                rows = max(1, math.ceil(sum(entry_px) / inner_w))
+                band = int(round(rows * row_px + 0.6 * row_px))
+                if band > (fig.layout.margin.b or 0):
+                    fig.update_layout(margin=dict(b=band))
+                plot_h = max(1, canvas_h - (fig.layout.margin.t or 0) - band)
+                fig.update_layout(legend=dict(
+                    orientation='h', xanchor='center', x=0.5,
+                    yanchor='top', y=-(0.35 * row_px / plot_h),
+                    bgcolor='rgba(0,0,0,0)', borderwidth=0,
+                ))
+
         # Reserve room for any label parked in the right margin. Its width scales
         # with the font, so a fixed margin clips it as soon as the type size
         # changes — which is what cut the "dB" off "53 dB" on Chart 1.
