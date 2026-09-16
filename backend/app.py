@@ -734,20 +734,42 @@ def _parse_date_range_from_filename(filename: str) -> tuple[datetime | None, dat
         'dec': 12, 'december': 12,
     }
 
-    def _year_guess() -> int:
-        # Heuristic: most sample datasets here are 2026.
-        # Prefer current year, but keep deterministic.
-        return datetime.now().year
+    def _year_guess(month: int, day: int) -> int | None:
+        """Year for a filename that names a month and day but no year.
+
+        The wall clock is not evidence. A 2019 dataset uploaded in 2027 is not a
+        2027 dataset, and the year fixes the weekday, so taking it from
+        ``datetime.now()`` silently misplaces every reading in the day-of-week
+        matrix and in any weekday/weekend split. Use the year the filename
+        states; failing that the file's own modification time, since an export
+        cannot predate the recording it contains. If the resulting date would
+        fall after the file was written, step back one year. When neither is
+        available the year is unknown and the caller is told so rather than
+        handed a guess.
+        """
+        stated = re.search(r'(?<!\d)(?:19|20)\d{2}(?!\d)', name)
+        if stated:
+            return int(stated.group(0))
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(filename))
+        except OSError:
+            return None
+        try:
+            return mtime.year - 1 if datetime(mtime.year, month, day) > mtime else mtime.year
+        except ValueError:
+            return None
 
     # Pattern: 21_feb-_12_march
     m = re.search(r'(?P<d1>\d{1,2})\s*[_\-\. ]*(?P<m1>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*[_\- ]*[_\-]?\s*(?P<d2>\d{1,2})\s*[_\-\. ]*(?P<m2>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)', lower)
     if m:
-        y = _year_guess()
         d1 = int(m.group('d1'))
         d2 = int(m.group('d2'))
         mo1 = month_map.get(m.group('m1'), None)
         mo2 = month_map.get(m.group('m2'), None)
         if mo1 and mo2:
+            y = _year_guess(mo1, d1)
+            if y is None:
+                return None, None
             try:
                 return datetime(y, mo1, d1), datetime(y, mo2, d2)
             except ValueError:
@@ -756,7 +778,9 @@ def _parse_date_range_from_filename(filename: str) -> tuple[datetime | None, dat
     # Pattern: 3.12-3.16 (month.day-month.day)
     m = re.search(r'(?P<m1>\d{1,2})\.(?P<d1>\d{1,2})\s*[-_ ]\s*(?P<m2>\d{1,2})\.(?P<d2>\d{1,2})', lower)
     if m:
-        y = _year_guess()
+        y = _year_guess(int(m.group('m1')), int(m.group('d1')))
+        if y is None:
+            return None, None
         try:
             return (
                 datetime(y, int(m.group('m1')), int(m.group('d1'))),
