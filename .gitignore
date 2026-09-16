@@ -193,3 +193,8 @@ data/raw/community-loggers/
 # Resident-facing deliverables carry names/addresses on the page.
 Resident*Report*.docx
 *Home ?*.docx
+
+# Study analysis, data and figures — local only, not part of the public package
+/tools/*
+!/tools/make_demo_dataset.py
+!/tools/convert_to_parquet.py
