@@ -32,7 +32,6 @@ venv.bak/
 *.sublime-workspace
 .code/
 
-# Local tooling config
 
 # Project runtime directories (generated at runtime)
 uploads/
