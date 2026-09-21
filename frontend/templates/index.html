@@ -3,706 +3,455 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Noise Analysis Platform | WHO Health-Based Assessment</title>
+    <title>Noise Analysis Platform</title>
     <!-- Pinned. "plotly-latest" is an alias frozen at v1.58.5 (July 2021) and is
          never updated again, so the browser was rendering with a five-year-old
          library while the server generated PDF figures with Plotly 6.x. -->
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
-    <!-- Modern Navigation -->
-    <nav class="navbar">
+    <header class="navbar">
         <div class="nav-container">
             <div class="logo-section">
-                <div class="logo-icon">🔊</div>
                 <div class="logo-text">
-                    <h1>Noise Analysis</h1>
-                    <p>WHO Health-Based Assessment</p>
+                    <h1>Noise Analysis Platform</h1>
+                    <p>Community noise monitoring · WHO 2018 and Maryland COMAR 26.02.03</p>
                 </div>
             </div>
-            <div class="nav-links">
-                <button class="nav-link-btn" id="navAnalyzeBtn" onclick="showSection('upload-section')" title="Single-file analysis">
-                    <i class="fas fa-chart-line"></i> Analyze
-                </button>
-                <button class="nav-link-btn" id="navCompareBtn" onclick="showCompareSection()" title="Compare multiple datasets">
-                    <i class="fas fa-balance-scale"></i> Compare
-                </button>
-            </div>
+            <nav class="nav-links">
+                <button class="nav-link-btn" id="navAnalyzeBtn" onclick="showSection('upload-section')">Analyze</button>
+                <button class="nav-link-btn" id="navCompareBtn" onclick="showCompareSection()">Compare</button>
+            </nav>
             <div class="nav-status">
                 <span class="status-dot" id="status-indicator"></span>
                 <span id="status-text">Ready</span>
             </div>
         </div>
-    </nav>
+    </header>
 
-    <!-- Main Container -->
-    <div class="main-container">
-        <!-- Upload Section -->
+    <main class="main-container">
+        <!-- Upload -->
         <section id="upload-section" class="section section-active">
             <div class="content-wrapper">
+                <div class="page-intro">
+                    <h2>Analyze a monitoring record</h2>
+                    <p>Computes LAeq, Lden, Lnight, Ldn and percentile levels (L5–L95) from sound level logger
+                    exports and compares them with the WHO Environmental Noise Guidelines (2018) and
+                    Maryland COMAR 26.02.03. Files are processed on the server and are not retained after the session.</p>
+                </div>
+
                 <div class="upload-card">
-                    <div class="upload-header">
-                        <h2>Upload Noise Data</h2>
-                        <p>Compatible with <strong>NSRTW MK4</strong> sound level meter &nbsp;·&nbsp; Accepted formats: CSV &nbsp;·&nbsp; XLSX &nbsp;·&nbsp; XLS &nbsp;·&nbsp; Parquet &nbsp;·&nbsp; WLG</p>
-                    </div>
-
-                    <!-- Drop zone (always visible, always clickable) -->
                     <div class="upload-zone" id="dropzone">
-                        <i class="fas fa-cloud-upload-alt"></i>
-                        <h3>Drop files here or click to browse</h3>
-                        <p>CSV, XLSX, XLS, Parquet, WLG &nbsp;·&nbsp; You can also drag-and-drop multiple files at once<br><small>For records over ~500k rows, Parquet uploads about half the size and reads roughly 7x faster. Results are identical.</small></p>
-                        <input type="file" id="fileInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.wlg" multiple style="display: none;">
+                        <h3>Drop logger files here, or click to select</h3>
+                        <p>CSV, XLSX, XLS, Parquet or WLG. Select several files to merge consecutive deployments into one record.</p>
+                        <p class="upload-hint">Tested with NSRT_W mk4 exports. For records over about 500,000 rows, Parquet uploads at roughly half the size of XLSX with identical results.</p>
+                        <input type="file" id="fileInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.wlg" multiple hidden>
                     </div>
 
-                    <!-- Staged file list — shown once ≥1 file is staged -->
                     <div class="staged-files-area" id="stagedFilesArea" style="display:none;">
                         <div class="staged-files-header">
-                            <span class="staged-files-title">
-                                <i class="fas fa-layer-group"></i>
-                                Staged Files <span class="staged-count-badge" id="stagedCountBadge">0</span>
-                            </span>
-                            <button class="btn-add-more" id="addMoreBtn" onclick="document.getElementById('fileInput').click()">
-                                <i class="fas fa-plus"></i> Add More Files
-                            </button>
+                            <span class="staged-files-title">Files to merge <span class="staged-count-badge" id="stagedCountBadge">0</span></span>
+                            <button class="btn-add-more" id="addMoreBtn" onclick="document.getElementById('fileInput').click()">Add files</button>
                         </div>
                         <ul class="staged-file-list" id="stagedFileList"></ul>
                         <div class="staged-files-footer">
-                            <button class="btn btn-secondary btn-sm" onclick="clearStagedFiles()">
-                                <i class="fas fa-trash"></i> Clear All
-                            </button>
+                            <button class="btn btn-secondary btn-sm" onclick="clearStagedFiles()">Clear</button>
                             <button class="btn btn-primary" id="uploadStagedBtn" onclick="uploadStagedFiles()">
-                                <i class="fas fa-upload"></i>
-                                <span id="uploadStagedLabel">Upload File</span>
+                                <span id="uploadStagedLabel">Upload</span>
                             </button>
                         </div>
                     </div>
 
                     <div id="error-message" class="alert alert-error" style="display: none;"></div>
                 </div>
-
-                <!-- Quick Info Cards -->
-                <div class="info-grid">
-                    <div class="info-card">
-                        <div class="info-icon">📊</div>
-                        <h3>Fast Processing</h3>
-                        <p>Analyzes your data instantly</p>
-                    </div>
-                    <div class="info-card">
-                        <div class="info-icon">🏥</div>
-                        <h3>Health-Based</h3>
-                        <p>WHO 2018 standards</p>
-                    </div>
-                    <div class="info-card">
-                        <div class="info-icon">📋</div>
-                        <h3>Detailed Reports</h3>
-                        <p>Comprehensive PDF reports</p>
-                    </div>
-                </div>
             </div>
         </section>
 
-        <!-- Data Preview Section -->
+        <!-- Preview -->
         <section id="preview-section" class="section section-hidden">
             <div class="content-wrapper">
                 <div class="preview-header">
-                    <h2>Data Preview</h2>
-                    <div class="preview-stats">
-                        <div class="stat">
-                            <span class="stat-label">Records</span>
-                            <span class="stat-value" id="preview-rows">0</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Columns</span>
-                            <span class="stat-value" id="preview-cols">0</span>
-                        </div>
-                    </div>
+                    <h2>Data preview</h2>
+                    <dl class="preview-stats">
+                        <div class="stat"><dt class="stat-label">Records</dt><dd class="stat-value" id="preview-rows">0</dd></div>
+                        <div class="stat"><dt class="stat-label">Columns</dt><dd class="stat-value" id="preview-cols">0</dd></div>
+                    </dl>
                 </div>
+                <p class="section-note">First 10 rows as read from the file. Times are the logger's local clock time.</p>
                 <div id="previewTable" class="table-container" style="display: none;">
-                    <table id="dataPreviewTable"></table>
+                    <table id="dataPreviewTable" class="data-table"></table>
                 </div>
 
-                <!-- Batch Files Panel — shows all files in the current batch -->
                 <div class="batch-files-panel" id="batchFilesPanel" style="display:none;">
                     <div class="batch-files-header">
-                        <i class="fas fa-layer-group"></i>
-                        <span>Files in Current Batch</span>
+                        <span>Files in this record</span>
                         <span class="batch-total-badge" id="batchTotalBadge"></span>
                     </div>
                     <div id="batchFilesList"></div>
-                    <div class="batch-files-footer">
-                        <input type="file" id="addMoreInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.wlg" multiple style="display:none;">
-                        <button class="btn-add-more" onclick="addMoreFiles()">
-                            <i class="fas fa-plus"></i> Add More Files to Batch
-                        </button>
-                    </div>
+                    <input type="file" id="addMoreInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.wlg" multiple hidden>
                 </div>
 
                 <div class="button-group">
-                    <button id="proceedBtn" class="btn btn-primary">Analyze Data →</button>
-                    <button class="btn btn-outline" onclick="addMoreFiles()" style="display:none;" id="previewAddMoreBtn">
-                        <i class="fas fa-plus"></i> Add More Files
-                    </button>
-                    <button id="uploadAnotherBtn" class="btn btn-secondary">Start Over</button>
+                    <button id="proceedBtn" class="btn btn-primary">Continue to analysis</button>
+                    <button class="btn btn-secondary" onclick="addMoreFiles()" style="display:none;" id="previewAddMoreBtn">Add files to this record</button>
+                    <button id="uploadAnotherBtn" class="btn btn-tertiary">Start over</button>
                 </div>
             </div>
         </section>
 
-        <!-- ══════════════════════════════════════════════════════════
-             TEMPORAL FILTRATION PANEL  (between Upload and Analysis)
-             ══════════════════════════════════════════════════════════ -->
+        <!-- Filters -->
         <section id="filter-section" class="section section-hidden">
             <div class="content-wrapper">
                 <div class="filter-card">
                     <div class="filter-header">
-                        <div class="filter-header-top">
-                            <h2>Data Filtration &amp; Cleaning</h2>
-                            <button class="btn-add-more" onclick="addMoreFiles()" id="filterAddMoreBtn">
-                                <i class="fas fa-plus"></i> Add More Files to Batch
-                            </button>
-                        </div>
-                        <p>Optionally remove bad windows or restrict the analysis date range before generating results. All WHO metrics and charts will reflect only the cleaned dataset.</p>
+                        <h2>Analysis period</h2>
+                        <p>Optionally restrict the period analysed or exclude windows of invalid data. Every result, chart, report and export uses the filtered record.</p>
                     </div>
 
-                    <!-- Dataset date range info bar -->
                     <div class="filter-info-bar" id="filterInfoBar" style="display:none;">
-                        <span class="filter-info-icon">📅</span>
                         <span id="filterInfoText"></span>
                         <span class="filter-info-rows" id="filterInfoRows"></span>
                     </div>
 
-                    <!-- Feature B: Master Bounding Dates -->
                     <div class="filter-group">
-                        <h3 class="filter-group-title">
-                            <span class="filter-step">B</span>
-                            Restrict Analysis Date Range <span class="filter-optional">(optional)</span>
-                        </h3>
-                        <p class="filter-desc">Only data within this window will be used for analysis. Leave blank to use all data.</p>
+                        <h3 class="filter-group-title">Date range <span class="filter-optional">optional</span></h3>
+                        <p class="filter-desc">Pre-filled with the full extent of the record. Leave unchanged to analyse all of it.</p>
                         <div class="filter-date-row">
                             <div class="filter-field">
-                                <label for="filter-bound-start">Start Date / Time</label>
+                                <label for="filter-bound-start">Start</label>
                                 <input type="datetime-local" id="filter-bound-start" class="filter-input" step="1">
                             </div>
                             <div class="filter-field">
-                                <label for="filter-bound-end">End Date / Time</label>
+                                <label for="filter-bound-end">End</label>
                                 <input type="datetime-local" id="filter-bound-end" class="filter-input" step="1">
                             </div>
                         </div>
                     </div>
 
-                    <!-- Feature A: Exclusion Windows -->
                     <div class="filter-group">
-                        <h3 class="filter-group-title">
-                            <span class="filter-step">A</span>
-                            Exclude Bad Data Windows <span class="filter-optional">(optional)</span>
-                        </h3>
-                        <p class="filter-desc">Add one row per window to drop (e.g., a 2-hour period when the microphone was bumped). These timestamps are removed from the clean dataset before any calculation.</p>
+                        <h3 class="filter-group-title">Excluded windows <span class="filter-optional">optional</span></h3>
+                        <p class="filter-desc">One row per window to remove, for example a period when the microphone was disturbed. Excluded readings are removed before any calculation.</p>
                         <div id="exclusionList"></div>
-                        <button class="btn btn-outline" id="addExclusionBtn" onclick="addExclusionRow()">
-                            + Add Exclusion Window
-                        </button>
+                        <button class="btn btn-secondary btn-sm" id="addExclusionBtn" onclick="addExclusionRow()">Add window</button>
                     </div>
 
-                    <!-- Preview row count feedback -->
                     <div class="filter-preview-bar" id="filterPreviewBar" style="display:none;">
                         <span id="filterPreviewText"></span>
                     </div>
 
-                    <!-- Actions -->
                     <div class="filter-actions">
-                        <button class="btn btn-secondary" onclick="skipFilters()">
-                            Skip — Use All Data
-                        </button>
-                        <button class="btn btn-outline" id="previewFilterBtn" onclick="previewFilters()">
-                            Preview Row Count
-                        </button>
-                        <button class="btn btn-primary" id="applyFiltersBtn" onclick="applyFiltersAndAnalyze()">
-                            Apply Filters &amp; Analyze →
-                        </button>
+                        <button class="btn btn-tertiary" onclick="skipFilters()">Use all data</button>
+                        <button class="btn btn-secondary" id="previewFilterBtn" onclick="previewFilters()">Count retained rows</button>
+                        <button class="btn btn-primary" id="applyFiltersBtn" onclick="applyFiltersAndAnalyze()">Run analysis</button>
                     </div>
                 </div>
             </div>
         </section>
 
-        <!-- Analysis Loading Section -->
+        <!-- Loading -->
         <section id="analysis-section" class="section section-hidden">
             <div class="content-wrapper">
                 <div class="loading-container">
                     <div class="loading-spinner"></div>
-                    <h2 id="analysis-status">Analyzing your data...</h2>
-                    <p>Computing metrics against WHO health thresholds</p>
+                    <h2 id="analysis-status">Running analysis</h2>
+                    <p>Computing energy averages, period levels and percentiles.</p>
                 </div>
             </div>
         </section>
 
-        <!-- Results Section -->
+        <!-- Results -->
         <section id="results-section" class="section section-hidden">
             <div class="content-wrapper">
 
-                <!-- Device / Location ID bar — label appears in PDF/Word report -->
                 <div class="device-id-bar">
                     <div class="device-id-inner">
-                        <i class="fas fa-microchip device-id-icon"></i>
-                        <label class="device-id-label" for="deviceIdInput">Device / Location ID</label>
+                        <label class="device-id-label" for="deviceIdInput">Location ID</label>
                         <input type="text" id="deviceIdInput" class="device-id-input"
-                               placeholder="e.g. SLM-Unit-A, Rooftop Sensor 3, Site B — printed in report"
-                               maxlength="80">
-                        <span class="device-id-hint">Appears alongside the file name in the PDF &amp; Word report</span>
+                               placeholder="e.g. Home A" maxlength="80">
+                        <span class="device-id-hint">Printed on the PDF and Word reports and in chart titles.</span>
                     </div>
                     <div class="device-env-inner">
-                        <i class="fas fa-location-dot device-id-icon"></i>
-                        <span class="device-id-label">Sensor placement</span>
-                        <div class="env-toggle" id="envToggle" role="group" aria-label="Sensor placement">
+                        <span class="device-id-label">Microphone</span>
+                        <div class="env-toggle" id="envToggle" role="group" aria-label="Microphone placement">
                             <button type="button" class="env-toggle-btn active" data-env="outdoor"
-                                    onclick="setDeploymentEnvironment('outdoor')">
-                                <i class="fas fa-tree"></i> Outdoor
-                            </button>
+                                    onclick="setDeploymentEnvironment('outdoor')">Outdoor</button>
                             <button type="button" class="env-toggle-btn" data-env="indoor"
-                                    onclick="setDeploymentEnvironment('indoor')">
-                                <i class="fas fa-house"></i> Indoor
-                            </button>
+                                    onclick="setDeploymentEnvironment('indoor')">Indoor</button>
                         </div>
-                        <span class="device-id-hint" id="envHint">Outdoor: WHO indoor bedroom limits are omitted (not comparable to an outdoor mic)</span>
+                        <span class="device-id-hint" id="envHint">Outdoor: WHO indoor bedroom values are not evaluated.</span>
                     </div>
                 </div>
 
-                <!-- Active date-filter banner. Shown whenever the analysis ran on a
-                     subset, so the filter's effect is visible rather than assumed. -->
-                <div id="filterActiveBanner" style="display:none;margin-bottom:16px;padding:12px 16px;border-radius:8px;border-left:5px solid #7c3aed;background:#faf5ff;color:#4c1d95;font-size:13px;line-height:1.6;">
-                    <i class="fas fa-filter"></i> <strong>Date filter applied.</strong>
+                <div id="filterActiveBanner" class="notice notice-info" style="display:none;">
+                    <strong>Filtered record.</strong>
                     <span id="filterActiveText"></span>
                 </div>
 
-                <!-- Timestamp-integrity warning (shown when timestamps are unreadable) -->
                 <div id="timestampWarning" class="ts-warning" style="display:none;" role="alert">
-                    <i class="fas fa-triangle-exclamation ts-warning-icon"></i>
                     <div class="ts-warning-body">
                         <strong>Timestamps could not be read reliably</strong>
                         <p id="timestampWarningText"></p>
                     </div>
                 </div>
 
-                <!-- Plain-English Summary Card -->
-                <div id="plainEnglishSummaryCard" style="display:none; margin-bottom:20px; padding:18px 22px; border-radius:10px; border-left:5px solid #3D5A80; background:#EFF6FF; line-height:1.75; font-size:14px; color:#1e293b;">
-                    <div style="font-weight:700; font-size:13px; text-transform:uppercase; letter-spacing:0.06em; color:#3D5A80; margin-bottom:10px;">
-                        Non-Technical Summary: Noise Exposure &amp; Health Assessment
-                    </div>
-                    <div id="plainEnglishSummaryText"></div>
+                <div class="results-overview">
+                    <section class="panel" id="plainEnglishSummaryCard" style="display:none;">
+                        <h3 class="panel-title">Summary</h3>
+                        <div id="plainEnglishSummaryText" class="summary-text"></div>
+                    </section>
+
+                    <section class="panel metrics-panel">
+                        <h3 class="panel-title">Headline values</h3>
+                        <div id="metricsGrid"></div>
+                    </section>
                 </div>
 
-                <!-- Health Status Cards -->
-                <div class="health-cards-grid" id="healthStatusCards"></div>
-
-                <!-- Data Continuity Log (MODULE 6) -->
-                <div class="gap-log-section" id="gapLogSection" style="display:none;">
-                    <h3><i class="fas fa-shield-alt" style="color:#3D5A80;"></i> Data Continuity Log</h3>
+                <section class="panel gap-log-section" id="gapLogSection" style="display:none;">
+                    <h3 class="panel-title">Data continuity</h3>
                     <div id="gapLogContent"></div>
-                </div>
+                </section>
 
-                <!-- Key Findings Panel (at-a-glance) -->
-                <div class="metrics-panel">
-                    <h3>Key Findings at a Glance</h3>
-                    <p style="margin:-8px 0 4px;font-size:13px;color:#64748b;">The headline numbers for this location. Full per-channel statistics are in the <strong>Statistics</strong> tab.</p>
-                    <div class="metrics-grid" id="metricsGrid"></div>
-                </div>
-
-                <!-- Results Tabs -->
                 <div class="results-tabs">
-                    <div class="tab-header">
-                        <button class="tab-btn active" data-tab="health-assessment">
-                            <i class="fas fa-heartbeat"></i> Health Impact
-                        </button>
-                        <button class="tab-btn" data-tab="statistics">
-                            <i class="fas fa-chart-bar"></i> Statistics
-                        </button>
-                        <button class="tab-btn" data-tab="standards-comparison">
-                            <i class="fas fa-balance-scale"></i> Standards
-                        </button>
-                        <button class="tab-btn" data-tab="visualizations">
-                            <i class="fas fa-chart-line"></i> Charts
-                        </button>
-                        <button class="tab-btn" data-tab="compliance">
-                            <i class="fas fa-check-circle"></i> Compliance
-                        </button>
+                    <div class="tab-header" role="tablist">
+                        <button class="tab-btn active" data-tab="health-assessment">Period levels</button>
+                        <button class="tab-btn" data-tab="compliance">Compliance matrix</button>
+                        <button class="tab-btn" data-tab="visualizations">Charts</button>
+                        <button class="tab-btn" data-tab="statistics">Statistics</button>
+                        <button class="tab-btn" data-tab="standards-comparison">Standards reference</button>
                     </div>
 
-                    <!-- Health Assessment Tab -->
                     <div id="health-assessment" class="tab-content active">
                         <div id="healthAssessmentContainer"></div>
                     </div>
 
-                    <!-- Statistics Tab -->
-                    <div id="statistics" class="tab-content">
-                        <h3>Detailed Statistical Analysis</h3>
-                        <div style="margin-bottom: 30px; padding: 20px; background: #f9f9f9; border-radius: 8px; border-left: 4px solid #0066ff;">
-                            <p style="color: #666; font-size: 14px;"><strong>📈 Complete noise statistics including:</strong></p>
-                            <ul style="margin-left: 20px; color: #666; font-size: 13px; line-height: 1.8;">
-                                <li><strong>LAeq (Energy-Average):</strong> Equivalent continuous noise level for energy-based analysis</li>
-                                <li><strong>Statistical Distribution:</strong> Mean, median (L50), standard deviation, coefficient of variation</li>
-                                <li><strong>Range Analysis:</strong> Minimum, maximum, and range for all noise measurements</li>
-                                <li><strong>Percentile Levels:</strong> L5, L10, L50, L90, L95 showing exceedance patterns</li>
-                            </ul>
-                        </div>
-                        <div id="statisticsContainer" style="background: white; padding: 20px; border-radius: 8px; border: 1px solid #e5e7eb;"></div>
-                    </div>
-
-                    <!-- Standards Comparison Tab -->
-                    <div id="standards-comparison" class="tab-content">
-                        <h3>Standards & Regulatory Comparison</h3>
-                        <div style="margin-bottom: 30px; padding: 20px; background: #f9f9f9; border-radius: 8px; border-left: 4px solid #10b981;">
-                            <p style="color: #666; font-size: 14px;"><strong>📋 WHO 2018 & International Standards Comparison:</strong></p>
-                            <ul style="margin-left: 20px; color: #666; font-size: 13px; line-height: 1.8;">
-                                <li><strong>WHO 2018 Environmental Guidelines:</strong> Road traffic (53 dB Lden / 45 dB Lnight), Aircraft, Railways, Indoor bedroom</li>
-                                <li><strong>OSHA/NIOSH Occupational Standards:</strong> 90 dB (OSHA PEL) and 85 dB (NIOSH REL) with 3-5 dB exchange rates</li>
-                                <li><strong>Health Impact Thresholds:</strong> LOAEL (40 dB Lnight), Cardiovascular risk (55 dB Lden), Sleep disturbance levels</li>
-                                <li><strong>Recommendation Strength:</strong> Strong vs. Conditional recommendations based on evidence</li>
-                            </ul>
-                        </div>
-                        <div id="standardsComparisonContainer" style="background: white; padding: 20px; border-radius: 8px; border: 1px solid #e5e7eb;"></div>
-                    </div>
-
-                    <!-- Visualizations Tab -->
-                    <div id="visualizations" class="tab-content">
-                        <h3>Data Visualizations &amp; Analysis</h3>
-                        <div id="analysisFileNote" style="text-align: right; font-size: 11px; color: #6b7280; margin-bottom: 16px;"></div>
-
-                        <!-- Hourly Diurnal Trend Chart -->
-                        <div class="chart-section">
-                            <div class="chart-section-header">
-                                <h4>24-Hour Diurnal LAeq Profile</h4>
-                                <button class="btn-chart-dl" onclick="downloadChartImage('rollingMedianChart', 'Hourly_Diurnal_LAeq_Profile')">
-                                    <i class="fas fa-download"></i> Download PNG
-                                </button>
-                            </div>
-                            <div id="rollingMedianChart" class="chart-box" style="min-height: 450px;"></div>
-                            <div class="chart-explainer">
-                                <strong>What it is:</strong> The energy-average LAeq for each hour of the day (00:00–23:00), averaged across all monitoring days in the dataset, with the WHO night window (23:00–07:00) shaded and WHO 2018 road-traffic reference lines (53 dB Lden, 45 dB Lnight).
-                                <strong>How it is calculated:</strong> Each hourly point is the logarithmic energy average (LAeq) of all measurements taken during that hour across every recording day — not a simple arithmetic mean.
-                                <strong>How to read it:</strong> Peaks show the hours at which levels are consistently highest; what produces them cannot be determined from level data alone. The 45 dB line is drawn for orientation and is the WHO Lnight guideline value, which applies to the average across the whole 23:00–07:00 period rather than to any single hour. The filled area shows the level profile across the day.
-                            </div>
-                        </div>
-
-                        <!-- Diurnal Box-and-Whisker Chart -->
-                        <div class="chart-section">
-                            <div class="chart-section-header">
-                                <h4>Diurnal Box-and-Whisker — Hourly LEQ Volatility</h4>
-                                <button class="btn-chart-dl" onclick="downloadChartImage('boxWhiskerChart', 'Diurnal_BoxWhisker')">
-                                    <i class="fas fa-download"></i> Download PNG
-                                </button>
-                            </div>
-                            <div id="boxWhiskerChart" class="chart-box" style="min-height: 460px;"></div>
-                            <div class="chart-explainer">
-                                <strong>What it is:</strong> Statistical spread of LEQ noise levels for each clock hour (00:00–23:00), pooled across all measurement days in the dataset.
-                                <strong>How it is calculated:</strong> The box spans the interquartile range (IQR: 25th–75th percentile); the centre line is the median (L50); whiskers extend to 1.5 × IQR; individual dots beyond whiskers are statistical outliers (e.g., isolated events such as sirens).
-                                <strong>How to read it:</strong> A tall box at a given hour means levels at that hour vary widely between days; a short box means they are consistent. The line inside each box is the median and the box spans the interquartile range (IQR), the middle 50% of readings. A consistently high median through 23:00–07:00 indicates raised night levels; whether the WHO Lnight guideline is met is determined in the Compliance section, which evaluates the night-period average rather than individual hours.
-                            </div>
-                        </div>
-
-                        <!-- Temporal Heatmap -->
-                        <div class="chart-section">
-                            <div class="chart-section-header">
-                                <h4>Temporal Heatmap — Date × Hour of Day</h4>
-                                <button class="btn-chart-dl" onclick="downloadChartImage('heatmapChart', 'Temporal_Heatmap')">
-                                    <i class="fas fa-download"></i> Download PNG
-                                </button>
-                            </div>
-                            <div id="heatmapChart" class="chart-box" style="min-height: 520px;"></div>
-                            <div class="chart-explainer">
-                                <strong>What it is:</strong> A colour-coded matrix showing LAeq noise intensity for every hour of every calendar day in the dataset. Each cell represents one hour on one date.
-                                <strong>How it is calculated:</strong> Each cell value is the logarithmic energy average (LAeq) of all measurements within that hour — never an arithmetic mean. Colour scale: green (quiet, &lt;55 dB) → yellow (moderate, 55–65 dB) → orange (high, 65–75 dB) → red (critical, &gt;75 dB).
-                                <strong>How to read it:</strong> Scan down a column to see how one day compares across hours. Scan across a row to see how one hour behaves day-over-day. A consistently red/orange row at 07:00–09:00 indicates a chronic morning traffic peak. Isolated red cells flag one-off events.
-                            </div>
-                        </div>
-
-                        <!-- Percentile Exceedance Table -->
-                        <div class="chart-section">
-                            <div class="chart-section-header">
-                                <h4>Noise Exceedance Percentiles — L5, L10, L50, L90, L95</h4>
-                            </div>
-                            <div id="thresholdChart"></div>
-                            <div class="chart-explainer">
-                                <strong>What it is:</strong> The five standard acoustic exceedance levels showing the dB(A) value exceeded for a given fraction of the monitoring period.
-                                <strong>How it is calculated:</strong> Lₓ is the level exceeded x% of the total monitoring time. L5 = loudest 5% (acute events). L50 = median acoustic climate. L90 = statistical background floor (the level the site is noisier than 90% of the time).
-                                <strong>How to read it:</strong> A wide L10–L90 gap (&gt;15 dB) signals a highly variable, event-driven environment. If L90 alone exceeds 45 dB(A), persistent background noise is the primary health concern — not just peaks.
-                            </div>
-                        </div>
-
-                        <!-- Daily Acoustic Trend Chart -->
-                        <div class="chart-section">
-                            <div class="chart-section-header">
-                                <h4>Daily Acoustic Trend — 24-hr LAeq &amp; Nighttime LAeq</h4>
-                                <button class="btn-chart-dl" onclick="downloadChartImage('timeSeriesChart', 'Daily_Acoustic_Trend')">
-                                    <i class="fas fa-download"></i> Download PNG
-                                </button>
-                            </div>
-                            <div id="timeSeriesChart" class="chart-box" style="min-height: 460px;"></div>
-                            <div class="chart-explainer">
-                                <strong>What it is:</strong> Day-by-day acoustic trend showing the 24-hr energy-average LAeq and the nighttime LAeq (22:00–07:00) for each calendar day in the monitoring period. The dashed 53 dB and 45 dB lines are drawn for visual orientation only: they are the WHO 2018 Lden and Lnight guideline values, and those guidelines apply to penalty-weighted long-term averages, not to a single day's LAeq. A day's trace rising above a line is therefore not an exceedance — the compliance verdict is given in the Compliance section, which evaluates Lden and Lnight directly.
-                                <strong>How it is calculated:</strong> Each daily point is the logarithmic energy average (LAeq) of all measurements within that calendar day. Nighttime points use only samples between 22:00–07:00. WHO reference lines are drawn at 53 dB(A) (Lden limit) and 45 dB(A) (Lnight limit).
-                                <strong>How to read it:</strong> Compare days against each other to find the loudest and quietest in the record, and compare the two traces to see how far each day's level falls after dark. The dashed lines are fixed reference levels, not per-day limits: a point above one is a louder day, not a guideline exceedance.
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Compliance Tab -->
                     <div id="compliance" class="tab-content">
-                        <div class="compliance-matrix-section">
-                            <h3>Standards &amp; Health Compliance — Pass/Fail Matrix</h3>
-                            <div class="compliance-matrix-note">
-                                Standards sourced exclusively from <strong>WHO Environmental Noise Guidelines (2018)</strong>,
-                                <strong>WHO Guidelines for Community Noise (1999)</strong>, and
-                                <strong>Maryland COMAR 26.02.03.02</strong>.
-                                OSHA/NIOSH occupational limits are listed separately in the Standards tab — they apply to
-                                workplaces, not residential or community environments.
-                                <br><br>
-                                <strong>How to read:</strong> A green PASS means your measured level is at or below the
-                                health/legal limit. A red FAIL means the limit is exceeded by the number of dB shown in
-                                the Delta column. Hover the <span style="font-weight:700;">ⓘ</span> icon for the clinical
-                                basis behind each standard.
-                            </div>
-                            <div id="complianceContainer">
-                                <p style="color:#6b7280; font-size:13px;">Run an analysis to see compliance results.</p>
-                            </div>
+                        <p class="section-note">
+                            WHO Environmental Noise Guidelines (2018), WHO Guidelines for Community Noise (1999) and
+                            Maryland COMAR 26.02.03. Occupational limits (OSHA, NIOSH) do not apply to community
+                            monitoring and are listed only in the Standards reference.
+                            Δ = measured − limit; a positive Δ is an exceedance.
+                        </p>
+                        <div id="complianceContainer">
+                            <p class="empty-note">Run an analysis to see compliance results.</p>
                         </div>
                     </div>
-                </div>
 
-                <!-- Recommendations Section -->
-                <div class="recommendations-section">
-                    <h3><i class="fas fa-lightbulb"></i> Health-Based Recommendations</h3>
-                    <div style="margin-bottom: 20px; padding: 16px; background: #f0f4f8; border-radius: 6px; font-size: 13px; color: #666;">
-                        Based on WHO 2018 Environmental Noise Guidelines, the following actions are recommended to reduce health impacts and protect public health.
+                    <div id="visualizations" class="tab-content">
+                        <div id="analysisFileNote" class="file-note"></div>
+
+                        <figure class="chart-section">
+                            <div class="chart-section-header">
+                                <h4>Figure 1. Hourly LAeq by hour of day</h4>
+                                <button class="btn-chart-dl" onclick="downloadChartImage('rollingMedianChart', 'Figure1_Hourly_LAeq_by_hour')">PNG</button>
+                            </div>
+                            <div id="rollingMedianChart" class="chart-box" style="min-height: 420px;"></div>
+                            <figcaption class="chart-explainer">
+                                Energy-average level (LAeq) for each clock hour, pooled across all days in the record.
+                                The shaded band is the WHO night period (23:00–07:00). The 53 and 45 dB(A) lines are the WHO 2018
+                                road-traffic Lden and Lnight guideline values, drawn for reference: those guidelines apply to
+                                penalty-weighted long-term averages, not to a single hour.
+                            </figcaption>
+                        </figure>
+
+                        <figure class="chart-section">
+                            <div class="chart-section-header">
+                                <h4>Figure 2. Distribution of readings by hour of day</h4>
+                                <button class="btn-chart-dl" onclick="downloadChartImage('boxWhiskerChart', 'Figure2_Hourly_distribution')">PNG</button>
+                            </div>
+                            <div id="boxWhiskerChart" class="chart-box" style="min-height: 440px;"></div>
+                            <figcaption class="chart-explainer">
+                                Box plot of the individual LEQ readings in each clock hour, pooled across all days. The box
+                                spans the interquartile range (IQR, 25th–75th percentile); the solid line is the median and the
+                                dashed line the energy average (LAeq) of the hour. Whiskers extend to the most extreme reading
+                                within 1.5 × IQR of the box. Readings beyond the whiskers are plotted as points, up to the
+                                40 most extreme per hour.
+                            </figcaption>
+                        </figure>
+
+                        <figure class="chart-section">
+                            <div class="chart-section-header">
+                                <h4>Figure 3. Hourly LAeq by date and hour</h4>
+                                <button class="btn-chart-dl" onclick="downloadChartImage('heatmapChart', 'Figure3_Date_by_hour')">PNG</button>
+                            </div>
+                            <div id="heatmapChart" class="chart-box" style="min-height: 500px;"></div>
+                            <figcaption class="chart-explainer">
+                                Each cell is the energy-average level (LAeq) of one clock hour on one date. Columns are dates;
+                                rows are hours of the day. Blank cells have no readings.
+                            </figcaption>
+                        </figure>
+
+                        <figure class="chart-section">
+                            <div class="chart-section-header">
+                                <h4>Figure 4. Daily LAeq and night-time LAeq</h4>
+                                <button class="btn-chart-dl" onclick="downloadChartImage('timeSeriesChart', 'Figure4_Daily_LAeq')">PNG</button>
+                            </div>
+                            <div id="timeSeriesChart" class="chart-box" style="min-height: 420px;"></div>
+                            <figcaption class="chart-explainer">
+                                Energy-average level (LAeq) for each calendar day, and for the night-time readings of that
+                                day (22:00–07:00). The 53 and 45 dB(A) lines are reference values only: the WHO guidelines
+                                they correspond to are evaluated on Lden and Lnight in the Compliance matrix.
+                            </figcaption>
+                        </figure>
                     </div>
-                    <div id="recommendationsContainer"></div>
+
+                    <div id="statistics" class="tab-content">
+                        <div id="statisticsContainer"></div>
+                    </div>
+
+                    <div id="standards-comparison" class="tab-content">
+                        <div id="standardsComparisonContainer"></div>
+                    </div>
                 </div>
 
-                <!-- Download & Export Section -->
-                <div class="download-export-section">
-                    <h3><i class="fas fa-download"></i> Download &amp; Export Data</h3>
+                <section class="panel download-export-section">
+                    <h3 class="panel-title">Reports and data</h3>
 
-                    <!-- Report Downloads -->
                     <div class="download-group">
                         <h4>Reports</h4>
                         <div class="download-buttons-grid">
-                            <button class="btn btn-primary" onclick="openReportFormatModal('comprehensive')">
-                                <i class="fas fa-file-download"></i> Download Report (PDF / Word)
-                            </button>
-                            <button class="btn btn-secondary" onclick="openReportFormatModal('resident')">
-                                <i class="fas fa-house-chimney"></i> Download Resident Report (PDF / Word)
-                            </button>
-                            <button class="btn btn-info" onclick="generateReport('comprehensive', 'html')">
-                                <i class="fas fa-file-code"></i> View HTML Report
-                            </button>
+                            <button class="btn btn-primary" onclick="openReportFormatModal('comprehensive')">Technical report</button>
+                            <button class="btn btn-secondary" onclick="openReportFormatModal('resident')">Resident summary</button>
                         </div>
-                        <p style="font-size:12px;color:#6b7280;margin-top:10px;">
-                            <i class="fas fa-info-circle"></i> The <strong>resident report</strong> is a two-page
-                            summary: headline numbers plus the time series, the hourly variability box plot, and the
-                            date × hour heatmap. It uses the <strong>Device / Location ID</strong> above in its chart
-                            titles — enter <em>Home A</em> (or <em>House A</em>) before downloading and the titles read
-                            &ldquo;… at Home A&rdquo;.
-                            <br><i class="fas fa-file-word" style="color:#2b579a;"></i> The <strong>Word version</strong>
-                            of either report is rendered from the same content as its PDF — same pages, same margins,
-                            same figures — as an editable document that works with track changes.
+                        <p class="section-note">
+                            The technical report contains every result on this page with methods and sources. The resident
+                            summary is two pages: headline values, the time series, the hourly box plot and the date × hour
+                            chart. Both are available as PDF or as an editable Word document with identical content.
                         </p>
 
-                        <!-- Custom Notes Section (appears in report after Section 4) -->
-                        <div style="margin-top:18px; padding:16px 18px; background:#f8fafc; border:1px solid #e5e7eb; border-radius:8px;">
-                            <div style="font-size:13px; font-weight:600; color:#374151; margin-bottom:4px;">
-                                <i class="fas fa-sticky-note" style="color:#6b7280;"></i>
-                                Add Custom Notes to Report <span style="font-weight:400; color:#9ca3af;">(optional — appears after Section 4 in PDF &amp; HTML)</span>
-                            </div>
-                            <div style="font-size:12px; color:#6b7280; margin-bottom:10px;">
-                                If you enter anything below, it will appear as a dedicated section in the report. Leave blank to omit.
-                            </div>
-                            <input type="text" id="customSectionHeading"
-                                   placeholder="Section heading (e.g. Site Description, Monitoring Purpose)"
-                                   maxlength="120"
-                                   style="width:100%; padding:8px 10px; border:1px solid #d1d5db; border-radius:6px; font-size:13px; margin-bottom:8px; box-sizing:border-box;">
-                            <textarea id="customSectionBody"
-                                      placeholder="Enter your notes here. Each paragraph on a new line will appear as a separate paragraph in the report."
-                                      rows="4"
-                                      maxlength="3000"
-                                      style="width:100%; padding:8px 10px; border:1px solid #d1d5db; border-radius:6px; font-size:13px; resize:vertical; box-sizing:border-box;"></textarea>
-                        </div>
+                        <details class="custom-notes">
+                            <summary>Add a section to the technical report</summary>
+                            <p class="section-note">Printed after Section 4. Leave blank to omit.</p>
+                            <input type="text" id="customSectionHeading" class="text-input"
+                                   placeholder="Heading, e.g. Site description" maxlength="120">
+                            <textarea id="customSectionBody" class="text-input" rows="4" maxlength="3000"
+                                      placeholder="Text. Each line becomes a paragraph."></textarea>
+                        </details>
                     </div>
 
-                    <!-- Data Exports -->
                     <div class="download-group">
-                        <h4>Data Exports (CSV / Excel)</h4>
+                        <h4>Data</h4>
                         <div class="download-buttons-grid">
-                            <button class="btn btn-warning" onclick="exportData()">
-                                <i class="fas fa-file-excel"></i> Export Full Analysis (Excel)
-                            </button>
-                            <button class="btn btn-warning" onclick="downloadDailySummaryCSV()">
-                                <i class="fas fa-file-csv"></i> Daily Summary (CSV)
-                            </button>
-                            <button class="btn btn-warning" onclick="downloadHourlySummaryCSV()">
-                                <i class="fas fa-file-csv"></i> Hourly Summary (CSV)
-                            </button>
+                            <button class="btn btn-secondary" onclick="exportData()">Full analysis (.xlsx)</button>
+                            <button class="btn btn-secondary" onclick="downloadDailySummaryCSV()">Daily summary (.csv)</button>
+                            <button class="btn btn-secondary" onclick="downloadHourlySummaryCSV()">Hourly summary (.csv)</button>
                         </div>
-                        <p style="font-size:12px;color:#6b7280;margin-top:10px;">
-                            <i class="fas fa-info-circle"></i> Individual chart PNG downloads are available directly below each chart in the <strong>Charts</strong> tab.
-                        </p>
                     </div>
-                </div>
+                </section>
 
-                <!-- Action Buttons -->
                 <div class="action-buttons">
-                    <button class="btn btn-tertiary" onclick="resetToUpload()">
-                        <i class="fas fa-plus"></i> New Analysis
-                    </button>
+                    <button class="btn btn-tertiary" onclick="resetToUpload()">Analyze another record</button>
                 </div>
 
                 <div id="reportFormatModal" class="report-modal" aria-hidden="true" style="display:none;">
                     <div class="report-modal-backdrop" onclick="closeReportFormatModal()"></div>
                     <div class="report-modal-card" role="dialog" aria-modal="true" aria-labelledby="reportFormatTitle">
                         <div class="report-modal-header">
-                            <h3 id="reportFormatTitle">Choose report format</h3>
+                            <h3 id="reportFormatTitle">Report format</h3>
                             <button class="report-modal-close" onclick="closeReportFormatModal()" aria-label="Close">&times;</button>
                         </div>
-                        <p class="report-modal-copy">Select the format you want to download.</p>
                         <div class="report-modal-actions">
-                            <button class="btn btn-primary" onclick="chooseReportFormat('pdf')">
-                                <i class="fas fa-file-pdf"></i> PDF
-                            </button>
-                            <button class="btn btn-primary" onclick="chooseReportFormat('docx')">
-                                <i class="fas fa-file-word"></i> Word (.docx)
-                            </button>
+                            <button class="btn btn-primary" onclick="chooseReportFormat('pdf')">PDF</button>
+                            <button class="btn btn-secondary" onclick="chooseReportFormat('docx')">Word (.docx)</button>
                         </div>
                     </div>
                 </div>
             </div>
         </section>
-        <!-- ══════════════════════════════════════════════════════════
-             MULTI-FILE COMPARISON SECTION
-             ══════════════════════════════════════════════════════════ -->
+
+        <!-- Comparison -->
         <section id="compare-section" class="section section-hidden">
             <div class="content-wrapper">
-                <div class="compare-header">
-                    <h2><i class="fas fa-balance-scale" style="color:#3D5A80;"></i> Multi-Dataset Noise Comparison</h2>
-                    <p>Upload 2–6 monitoring datasets to compare acoustic environments side-by-side. Supports one-by-one or bulk upload.</p>
+                <div class="page-intro">
+                    <h2>Compare locations</h2>
+                    <p>Two to six records, one per location, evaluated with the same method and shown side by side.</p>
                 </div>
 
-                <!-- Drop zone -->
                 <div class="compare-drop-zone" id="compareDropzone">
-                    <i class="fas fa-layer-group" style="font-size:2.2rem; color:#3D5A80; margin-bottom:10px;"></i>
-                    <h3>Drop 2 or more files here, or click to browse</h3>
-                    <p>CSV, XLSX, XLS, WLG &nbsp;·&nbsp; Add files one-by-one or all at once</p>
-                    <input type="file" id="compareFileInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.wlg" multiple style="display:none;">
+                    <h3>Drop two or more files here, or click to select</h3>
+                    <p>CSV, XLSX, XLS, Parquet or WLG. Each file is treated as one location.</p>
+                    <input type="file" id="compareFileInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.wlg" multiple hidden>
                 </div>
 
-                <!-- Staged file list -->
                 <div class="compare-file-list" id="compareFileList" style="display:none;">
                     <div class="compare-file-list-header">
-                        <span><i class="fas fa-layer-group"></i> Files to Compare
-                            <span class="staged-count-badge" id="compareFileBadge">0</span>
-                        </span>
-                        <button class="btn-add-more" onclick="document.getElementById('compareFileInput').click()">
-                            <i class="fas fa-plus"></i> Add More
-                        </button>
+                        <span>Locations <span class="staged-count-badge" id="compareFileBadge">0</span></span>
+                        <button class="btn-add-more" onclick="document.getElementById('compareFileInput').click()">Add files</button>
                     </div>
                     <ul class="staged-file-list" id="compareFileListItems"></ul>
                     <div class="compare-file-list-footer">
-                        <button class="btn btn-secondary btn-sm" onclick="clearCompareFiles()">
-                            <i class="fas fa-trash"></i> Clear All
-                        </button>
-                        <button class="btn btn-primary" id="compareAnalyzeBtn" onclick="runComparison()">
-                            <i class="fas fa-balance-scale"></i> Compare Files
-                        </button>
+                        <button class="btn btn-secondary btn-sm" onclick="clearCompareFiles()">Clear</button>
+                        <button class="btn btn-primary" id="compareAnalyzeBtn" onclick="runComparison()">Compare</button>
                     </div>
                 </div>
 
-                <!-- Loading -->
                 <div id="compareLoading" class="loading-container" style="display:none;">
                     <div class="loading-spinner"></div>
-                    <h2>Analyzing and comparing datasets…</h2>
-                    <p>Computing acoustic metrics and generating visualizations</p>
+                    <h2>Comparing records</h2>
+                    <p>Each record is analysed independently with the same method.</p>
                 </div>
 
-                <!-- Results -->
                 <div id="compareResults" style="display:none;">
-
-                    <!-- Plain-language verdict / ranking -->
                     <div class="compare-verdict" id="compareVerdict" style="display:none;"></div>
 
-                    <!-- Per-location status cards -->
-                    <div class="compare-results-card">
-                        <h3><i class="fas fa-location-dot" style="color:#3D5A80;"></i> Each location vs the WHO guidelines</h3>
-                        <p class="compare-results-note">Sorted loudest to quietest. Each location's overall day-and-night level (Lden) and night-time level (Lnight), with whether it is within the WHO health guidelines (53 dB day-night · 45 dB night).</p>
+                    <section class="panel compare-results-card">
+                        <h3 class="panel-title">Lden and Lnight by location</h3>
+                        <p class="compare-results-note">Sorted from highest to lowest Lden. Compared with the WHO 2018 road-traffic guideline values (Lden 53 dB(A), Lnight 45 dB(A)).</p>
                         <div id="compareStatusCards" class="compare-status-grid"></div>
-                    </div>
+                    </section>
 
-                    <!-- Daily pattern -->
-                    <div class="compare-results-card">
-                        <h3><i class="fas fa-chart-line" style="color:#3D5A80;"></i> Daily pattern — when is each location loudest?</h3>
-                        <p class="compare-results-note">Average level (LAeq) for each hour of the day, combined across all monitored days, so you can see when each location is loudest and how the locations differ hour by hour. The dashed lines mark 53 and 45 dB for reference only: those are the WHO Lden and Lnight guideline values, which apply to whole-period penalty-weighted averages rather than to individual hours. The guideline verdict for each location is in the cards above.</p>
+                    <section class="panel compare-results-card">
+                        <h3 class="panel-title">Hourly LAeq by hour of day</h3>
+                        <p class="compare-results-note">Energy-average level for each clock hour, pooled across all days of each record. The 53 and 45 dB(A) lines are reference values; the guidelines apply to Lden and Lnight, not to individual hours.</p>
                         <div id="compareDiurnalChart" class="compare-chart-box"></div>
-                    </div>
+                    </section>
 
-                    <!-- Side-by-side summary table -->
-                    <div class="compare-results-card">
-                        <h3><i class="fas fa-table" style="color:#3D5A80;"></i> Side-by-side summary</h3>
-                        <p class="compare-results-note">WHO 2018 guidelines: Lden ≤ 53 dB(A) · Lnight ≤ 45 dB(A).</p>
+                    <section class="panel compare-results-card">
+                        <h3 class="panel-title">Summary table</h3>
                         <div class="compare-table-scroll" id="compareMetricsTable"></div>
-                    </div>
+                    </section>
 
-                    <!-- Download -->
                     <div class="compare-download-bar">
-                        <button class="btn btn-primary" onclick="downloadCompareReport()" id="compareReportBtn">
-                            <i class="fas fa-file-pdf"></i> Download Comparison Report (PDF)
-                        </button>
-                        <button class="btn btn-secondary" onclick="clearCompareFiles()">
-                            <i class="fas fa-redo"></i> New Comparison
-                        </button>
+                        <button class="btn btn-primary" onclick="downloadCompareReport()" id="compareReportBtn">Comparison report (PDF)</button>
+                        <button class="btn btn-secondary" onclick="clearCompareFiles()">New comparison</button>
                     </div>
                 </div>
 
-                <div class="action-buttons" style="margin-top:24px;">
-                    <button class="btn btn-tertiary" onclick="showSection('upload-section')">
-                        <i class="fas fa-arrow-left"></i> Back to Analysis
-                    </button>
+                <div class="action-buttons">
+                    <button class="btn btn-tertiary" onclick="showSection('upload-section')">Back to single-record analysis</button>
                 </div>
             </div>
         </section>
-    </div>
+    </main>
 
-    <!-- Footer -->
     <footer class="footer">
-        <div class="footer-credit">
-            <span class="footer-credit-name">Chandra Prakash Choudhary</span>
-            <span class="footer-credit-sep">·</span>
-            <span class="footer-credit-role">Graduate Student, Johns Hopkins University</span>
-        </div>
-        <div style="margin-top:6px; font-size:13px; color:#94a3b8;">
-            Principal Investigator: <strong style="color:#cbd5e1;">Dr. Ana María Rule</strong>
-            <span style="color:#64748b;"> · </span>
-            <span style="color:#94a3b8;">Associate Professor, Johns Hopkins University</span>
-        </div>
-        <p style="margin-top:8px;"><strong>WHO 2018 Environmental Noise Guidelines</strong> | Health-Based Assessment Platform</p>
-        <p>For professional acoustic assessment, consult a certified acoustic engineer.</p>
-
-        <!-- Disclaimer Section -->
-        <div class="disclaimer-section">
-            <h3>Methodological Limitations &amp; Disclaimer</h3>
-            <div class="disclaimer-grid">
-                <div class="disclaimer-item">
-                    <span class="disclaimer-label">Source Attribution</span>
-                    <p>Acoustic sensors measure total environmental energy and cannot definitively identify specific noise sources. Source-specific compliance requires cross-referencing with external databases (e.g., ADS-B flight tracking).</p>
-                </div>
-                <div class="disclaimer-item">
-                    <span class="disclaimer-label">Health vs. Legal Limits</span>
-                    <p>This platform evaluates data against WHO 2018 biological health guidelines and local regulatory limits (e.g., Maryland COMAR). Passing local zoning limits does not guarantee absence of adverse health impacts.</p>
-                </div>
-                <div class="disclaimer-item">
-                    <span class="disclaimer-label">Equipment Calibration</span>
-                    <p>Accuracy of these metrics depends on proper sensor deployment, windshielding, and recent acoustic calibration of the monitoring hardware.</p>
-                </div>
-                <div class="disclaimer-item">
-                    <span class="disclaimer-label">Not Medical Advice</span>
-                    <p>This data is for environmental and epidemiological research only. It does not constitute a clinical medical diagnosis or formal legal counsel.</p>
-                </div>
+        <div class="footer-inner">
+            <div class="footer-credit">
+                <p><span class="footer-credit-name">Chandra Prakash Choudhary</span>, Graduate Student, Johns Hopkins University</p>
+                <p>Principal Investigator: <span class="footer-credit-name">Dr. Ana María Rule</span>, Associate Professor, Johns Hopkins University</p>
+            </div>
+            <div class="disclaimer-section">
+                <h3>Limitations</h3>
+                <dl class="disclaimer-grid">
+                    <div class="disclaimer-item">
+                        <dt class="disclaimer-label">Source attribution</dt>
+                        <dd>A sound level meter records total sound level and cannot identify the source. Source-specific guideline values (aircraft, railway) are shown for reference only.</dd>
+                    </div>
+                    <div class="disclaimer-item">
+                        <dt class="disclaimer-label">Health guidelines and legal limits</dt>
+                        <dd>WHO 2018 values are health-based guidelines; COMAR 26.02.03 values are regulatory limits. Meeting a regulatory limit does not imply meeting the health-based guideline.</dd>
+                    </div>
+                    <div class="disclaimer-item">
+                        <dt class="disclaimer-label">Instrument</dt>
+                        <dd>Results depend on microphone placement, windscreen use and calibration of the monitoring hardware.</dd>
+                    </div>
+                    <div class="disclaimer-item">
+                        <dt class="disclaimer-label">Intended use</dt>
+                        <dd>Environmental and epidemiological research. Not a clinical assessment or legal determination.</dd>
+                    </div>
+                </dl>
             </div>
         </div>
     </footer>

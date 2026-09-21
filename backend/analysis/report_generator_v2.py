@@ -6,6 +6,7 @@ import math
 import os
 import re
 import json
+import logging
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -30,6 +31,8 @@ from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
 from xml.sax.saxutils import escape
+
+logger = logging.getLogger(__name__)
 
 # ── De-identification ────────────────────────────────────────────────────────
 # Reports from this platform are distributed to residents and regulators, so
@@ -234,6 +237,34 @@ def deidentify_label(value: str, fallback: str) -> tuple[str, bool]:
     Study codes pass through unchanged; anything else is replaced by ``fallback``.
     """
     return (str(value).strip(), False) if is_safe_label(value) else (fallback, True)
+
+
+class ChartExportUnavailable(RuntimeError):
+    """The server cannot rasterise Plotly figures, so a report would have no figures."""
+
+
+_CHART_EXPORT_OK = False
+
+
+def ensure_chart_export() -> None:
+    """Render a one-point figure; raise ``ChartExportUnavailable`` if that fails.
+
+    Called before any report is built. Each chart's own failure path degrades
+    to a placeholder, so without this check a broken export engine (e.g. a
+    Plotly/Kaleido version mismatch) ships a report with no figures and no error.
+    """
+    global _CHART_EXPORT_OK
+    if _CHART_EXPORT_OK:
+        return
+    try:
+        go.Figure(go.Scatter(x=[0], y=[0])).to_image(format='png', width=40, height=40)
+    except Exception as e:
+        logger.exception("Chart export engine unavailable")
+        raise ChartExportUnavailable(
+            "Figures cannot be rendered on this server, so the report was not generated. "
+            f"Chart export failed: {str(e).strip().splitlines()[0][:200]}"
+        ) from e
+    _CHART_EXPORT_OK = True
 
 
 class ReportGeneratorV2:
@@ -477,34 +508,15 @@ class ReportGeneratorV2:
             )
 
         # ── 2. Noise level paragraph ─────────────────────────────────────────
-        # Level labels and analogies from ISO 226 reference levels and
-        # Berglund et al. (1999) / WHO 2018 explanatory notes.
-        if laeq_v < 40:
-            level_label   = "very quiet"
-            level_analogy = "comparable to a rural area at night or a library reading room"
-        elif laeq_v < 50:
-            level_label   = "quiet"
-            level_analogy = "comparable to a calm residential street at night or soft rainfall"
-        elif laeq_v < 55:
-            level_label   = "moderate"
-            level_analogy = "comparable to a typical residential neighbourhood during the day"
-        elif laeq_v < 65:
-            level_label   = "elevated"
-            level_analogy = "comparable to a busy urban street or a bustling café"
-        elif laeq_v < 75:
-            level_label   = "high"
-            level_analogy = "comparable to heavy road traffic or a passing freight train"
-        else:
-            level_label   = "very high"
-            level_analogy = "comparable to a construction zone or an expressway at close range"
-
+        # Measured values only. Descriptive bands ("elevated") and everyday
+        # analogies ("a busy café") are editorial and are not part of any
+        # cited standard, so they are not stated.
         # Label the averaging period honestly: this is the energy average over the
         # WHOLE record, which is rarely 24 hours.
         period_label = (f"{n_days}-day" if n_days and n_days != 1 else
                         ("24-hour" if n_days == 1 else "whole-record"))
         level_sentence = (
-            f"The {period_label} energy-average level (LAeq) was {_f(laeq_v)} dB(A), "
-            f"placing the acoustic environment in the {level_label} range, {level_analogy}."
+            f"The {period_label} energy-average level (LAeq) was {_f(laeq_v)} dB(A)."
         )
 
         # Day / night breakdown — written as separate sentences, no em-hyphens
@@ -522,22 +534,10 @@ class ReportGeneratorV2:
                 # measured pattern only.
                 base = (f" Daytime levels (07:00–22:00) averaged {_f(dv)} dB(A) and nighttime "
                         f"levels (22:00–07:00) averaged {_f(nv)} dB(A).")
-                if diff > 5:
-                    day_night_sentence = base + (
-                        f" Daytime exceeded nighttime by {_f(abs(diff))} dB, indicating a "
-                        f"pronounced diurnal pattern."
-                    )
-                elif diff < -3:
-                    day_night_sentence = base + (
-                        f" Nighttime exceeded daytime by {_f(abs(diff))} dB, an inverted diurnal "
-                        f"pattern. Identifying the contributing source requires observations "
-                        f"beyond sound level data alone."
-                    )
+                if diff >= 0:
+                    day_night_sentence = base + f" Daytime exceeded nighttime by {_f(diff)} dB."
                 else:
-                    day_night_sentence = base + (
-                        f" The two differ by {_f(abs(diff))} dB, indicating a broadly steady "
-                        f"level across the day-night cycle."
-                    )
+                    day_night_sentence = base + f" Nighttime exceeded daytime by {_f(-diff)} dB."
         except Exception:
             pass
 
@@ -584,34 +584,14 @@ class ReportGeneratorV2:
 
         # ── 3. Variability paragraph ─────────────────────────────────────────
         para3 = ""
-        try:
-            l10_v = _v(l10)
-            l90_v = _v(l90)
-            if l10_v is not None and l90_v is not None:
-                spread = l10_v - l90_v
-                # Describe the measured spread; do not name sources the meter
-                # cannot identify (no "passing vehicles", no "heavy machinery").
-                if spread > 20:
-                    para3 = (
-                        f"The noise environment was highly variable. The level exceeded 10% of the "
-                        f"time (L10 = {_f(l10_v)} dB(A)) was {_f(spread)} dB above the residual "
-                        f"background level (L90 = {_f(l90_v)} dB(A)), indicating frequent loud "
-                        f"transient events above a much quieter baseline."
-                    )
-                elif spread > 12:
-                    para3 = (
-                        f"The noise environment showed moderate variability "
-                        f"(L10 = {_f(l10_v)} dB(A), L90 = {_f(l90_v)} dB(A), spread = {_f(spread)} dB), "
-                        f"indicating intermittent events above a steady residual background level."
-                    )
-                else:
-                    para3 = (
-                        f"The noise environment was relatively stable, with an L10-to-L90 spread "
-                        f"of only {_f(spread)} dB (L10 = {_f(l10_v)} dB(A), L90 = {_f(l90_v)} dB(A)), "
-                        f"indicating a largely steady level with few loud transient events."
-                    )
-        except Exception:
-            pass
+        l10_v = _v(l10)
+        l90_v = _v(l90)
+        if l10_v is not None and l90_v is not None:
+            para3 = (
+                f"The level exceeded 10% of the time (L10) was {_f(l10_v)} dB(A) and the level "
+                f"exceeded 90% of the time (L90) was {_f(l90_v)} dB(A), a spread of "
+                f"{_f(l10_v - l90_v)} dB."
+            )
 
         # ── 4. WHO compliance bullet points ─────────────────────────────────
         WHO_LDEN_LIMIT   = 53.0   # WHO 2018, Table 1 (road traffic, Lden)
@@ -620,10 +600,6 @@ class ReportGeneratorV2:
         # Guidelines for Europe (2009), which WHO 2018 carries forward.
         WHO_LOAEL_NIGHT  = 40.0
 
-        # Ordered severity so the worst finding wins, rather than the last one.
-        _RANK = {"LOW": 0, "MODERATE": 1, "MODERATE-HIGH": 2, "HIGH": 3, "SERIOUS": 4}
-
-        concern_level = "LOW"
         bullets = []
 
         lden_v = _v(lden)
@@ -635,15 +611,6 @@ class ReportGeneratorV2:
                     f"Exceeds the WHO 2018 road-traffic guideline of {WHO_LDEN_LIMIT} dB(A) "
                     f"by {_f(excess)} dB."
                 )
-                # Graduated by how far the guideline is exceeded. Previously every
-                # tier here was rewritten to HIGH further down, so a 0.1 dB and a
-                # 15 dB exceedance produced an identical verdict.
-                if excess >= 10:
-                    concern_level = "SERIOUS"
-                elif excess >= 5:
-                    concern_level = "HIGH"
-                else:
-                    concern_level = "MODERATE-HIGH"
             else:
                 bullets.append(
                     f"24-hour weighted average (Lden): {_f(lden_v)} dB(A). "
@@ -656,22 +623,16 @@ class ReportGeneratorV2:
                 excess = lnight_v - WHO_LNIGHT_LIMIT
                 bullets.append(
                     f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
-                    f"Exceeds the WHO 2018 sleep-protection limit of {WHO_LNIGHT_LIMIT} dB(A) "
+                    f"Exceeds the WHO 2018 road-traffic guideline of {WHO_LNIGHT_LIMIT} dB(A) "
                     f"by {_f(excess)} dB."
                 )
-                night_tier = ("SERIOUS" if excess >= 10 else
-                              "HIGH" if excess >= 5 else "MODERATE-HIGH")
-                if _RANK.get(night_tier, 0) > _RANK.get(concern_level, 0):
-                    concern_level = night_tier
             elif lnight_v > WHO_LOAEL_NIGHT:
                 bullets.append(
                     f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
-                    f"Within the WHO 2018 limit of {WHO_LNIGHT_LIMIT} dB(A) but above the "
+                    f"Within the WHO 2018 road-traffic guideline of {WHO_LNIGHT_LIMIT} dB(A) but above the "
                     f"lowest-observed-adverse-effect level (LOAEL) of {WHO_LOAEL_NIGHT} dB(A), "
                     f"at which initial sleep disturbance effects begin."
                 )
-                if _RANK.get("MODERATE", 0) > _RANK.get(concern_level, 0):
-                    concern_level = "MODERATE"
             else:
                 bullets.append(
                     f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
@@ -691,74 +652,16 @@ class ReportGeneratorV2:
                     "timestamps were unavailable. WHO 2018 guidelines are defined on Lden and "
                     "Lnight, which apply +5 dB (evening) and +10 dB (night) penalties, so they "
                     "cannot be inferred from LAeq alone and no compliance verdict is issued here.")
-            if laeq_v > 65:
-                concern_level = "HIGH"
-                bullets.append(
-                    f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). This is high enough "
-                    f"that a WHO guideline exceedance is likely once Lden/Lnight are available. {note}"
-                )
-            elif laeq_v > WHO_LDEN_LIMIT:
-                concern_level = "MODERATE"
-                bullets.append(
-                    f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). This already exceeds "
-                    f"the {WHO_LDEN_LIMIT} dB(A) Lden guideline value before any evening or night "
-                    f"penalty is applied, so an exceedance is likely. {note}"
-                )
-            else:
-                concern_level = "MODERATE"
-                bullets.append(
-                    f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). {note} "
-                    f"Re-export the file with a full date and time column to obtain a verdict."
-                )
+            bullets.append(f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). {note}")
 
         bullet_lines = "\n".join(f"  • {b}" for b in bullets)
         para4 = f"WHO 2018 Health Guideline Compliance:\n{bullet_lines}"
-
-        # ── 5. Concern-level paragraph ───────────────────────────────────────
-        concern_map = {
-            "LOW": (
-                "The acoustic environment is generally within WHO health-based guidelines. "
-                "No immediate action is indicated, but periodic re-monitoring is advisable."
-            ),
-            "MODERATE": (
-                "Noise levels are within WHO guidelines but above the lowest level at which sleep "
-                "effects are observed. Continued monitoring is recommended, particularly for "
-                "sensitive occupants such as children or elderly residents."
-            ),
-            # A guideline exceedance of less than 5 dB. This tier existed in the
-            # severity ranking but had no text, so it fell through to the
-            # "within WHO guidelines" wording above — directly contradicting the
-            # bullets immediately preceding it, which read "Exceeds ... by 2.0 dB".
-            "MODERATE-HIGH": (
-                "WHO 2018 health-based guidelines are exceeded, by less than 5 dB. Exceedances of "
-                "this size are close to the 1-3 dB combined measurement uncertainty that ISO 1996-2 "
-                "associates with environmental noise measurement, so the margin should not be read "
-                "as precise. Continued monitoring is recommended, and a certified acoustic "
-                "assessment would establish the exceedance more firmly."
-            ),
-            "HIGH": (
-                "WHO 2018 health-based guidelines are exceeded. Based on WHO evidence, prolonged "
-                "exposure at these levels is associated with increased risk of cardiovascular effects "
-                "(hypertension, ischaemic heart disease) and impaired sleep quality. Professional "
-                "acoustic assessment and noise-reduction measures are recommended."
-            ),
-            "SERIOUS": (
-                "Noise levels significantly exceed WHO guidelines. WHO 2018 identifies strong "
-                "cardiovascular and sleep health risks at these levels. Immediate professional "
-                "acoustic assessment is strongly recommended."
-            ),
-        }
-        if concern_level not in concern_map:
-            concern_level = "HIGH" if laeq_v > 55 else "MODERATE"
-
-        para5 = f"Overall Concern Level: {concern_level}. {concern_map[concern_level]}"
 
         # ── Assemble with paragraph separators ──────────────────────────────
         parts = [para1, para2]
         if para3:
             parts.append(para3)
         parts.append(para4)
-        parts.append(para5)
         return "\n\n".join(parts)
 
     def _compute_summaries(self):
@@ -769,19 +672,19 @@ class ReportGeneratorV2:
         ts_col, leq_col, lmax_col, lmin_col = self._resolve_acoustic_columns()
         
         if not leq_col or leq_col not in self.df.columns:
-            print("[Report] No LEQ column found; cannot compute summaries")
+            logger.warning("No LEQ column found; cannot compute summaries")
             return
         
         ts = self._get_timestamp_series(ts_col)
         leq = self._get_numeric_series(leq_col)
         
         if ts.empty or leq.empty:
-            print("[Report] Insufficient timestamp or LEQ data; cannot compute summaries")
+            logger.warning("Insufficient timestamp or LEQ data; cannot compute summaries")
             return
         
         df_data = pd.DataFrame({'ts': ts, 'leq': leq}).dropna()
         if df_data.empty:
-            print("[Report] No valid ts/leq pairs; cannot compute summaries")
+            logger.warning("No valid ts/leq pairs; cannot compute summaries")
             return
         
         # ========== DAILY SUMMARY (COMPUTED) ==========
@@ -825,7 +728,7 @@ class ReportGeneratorV2:
         
         if daily_rows:
             self.daily_summary = pd.DataFrame(daily_rows)
-            print(f"[Report] Computed daily summary: {len(self.daily_summary)} days")
+            logger.info(f"Computed daily summary: {len(self.daily_summary)} days")
         
         # ========== HOURLY SUMMARY (COMPUTED) ==========
         df_data['hour'] = df_data['ts'].dt.hour
@@ -847,7 +750,7 @@ class ReportGeneratorV2:
         if hourly_rows:
             # Sort by hour to ensure 0-23 ordering
             self.hourly_summary = pd.DataFrame(hourly_rows).sort_values('Hour').reset_index(drop=True)
-            print(f"[Report] Computed hourly summary: {len(self.hourly_summary)} hours")
+            logger.info(f"Computed hourly summary: {len(self.hourly_summary)} hours")
     
     # Page geometry, shared by the PDF and Word paths so both documents lay out
     # on the same sheet with the same text block.
@@ -3000,7 +2903,7 @@ class ReportGeneratorV2:
                 gap_report = detect_gaps(self.df, ts_col_dcl) if ts_col_dcl else None
             except Exception as _e:
                 gap_report = None
-                print(f"[Report] Gap detection failed: {_e}")
+                logger.warning(f"Gap detection failed: {_e}")
 
             if gap_report is None or gap_report.continuous:
                 story.append(Paragraph(
@@ -3093,7 +2996,7 @@ class ReportGeneratorV2:
                 environment=self.environment,
             )
         except Exception as _e:
-            print(f"[Report] Compliance evaluation failed: {_e}")
+            logger.warning(f"Compliance evaluation failed: {_e}")
             results = []
 
         if not results:
@@ -3593,7 +3496,7 @@ class ReportGeneratorV2:
             cell4 = img4 or Paragraph(
                 "<i>Insufficient hourly data to generate the diurnal radar chart.</i>", styles['BodyText'])
         except Exception as e:
-            print(f"[Report] Diurnal radar chart failed: {str(e)[:120]}")
+            logger.warning(f"Diurnal radar chart failed: {str(e)[:120]}")
             cell4 = Paragraph("<i>Diurnal radar chart could not be generated.</i>", styles['BodyText'])
 
         cap4 = Paragraph(
@@ -3619,7 +3522,7 @@ class ReportGeneratorV2:
         try:
             fig5 = self._fig_weekly_radar(ts=ts, leq=leq)
         except Exception as _e5:
-            print(f"[Report] Weekly radar chart failed: {str(_e5)[:120]}")
+            logger.warning(f"Weekly radar chart failed: {str(_e5)[:120]}")
             fig5 = None
 
         if fig5 is not None:
@@ -4100,7 +4003,7 @@ class ReportGeneratorV2:
             self._add_source_annotation(fig, y=-0.26)
             return fig
         except Exception as e:
-            print(f"[Report] Box plot failed: {str(e)[:100]}")
+            logger.warning(f"Box plot failed: {str(e)[:100]}")
             return None
 
     def _fig_temporal_heatmap(self, *, ts: pd.Series, leq: pd.Series, title: str | None = None):
@@ -4467,7 +4370,7 @@ class ReportGeneratorV2:
                 img.drawWidth  = (height_inch * inch) / aspect
             return img
         except Exception as e:
-            print(f"[Report] Chart rendering failed: {str(e)[:120]}")
+            logger.warning(f"Chart rendering failed: {str(e)[:120]}")
             return None
 
     def _get_pdf_styles(self):

@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify, send_file
 from flask_cors import CORS
+from flask.json.provider import DefaultJSONProvider
 import os
 import pandas as pd
 import numpy as np
@@ -10,7 +11,7 @@ import re
 from werkzeug.utils import secure_filename
 from analysis.noise_analyzer import NoiseAnalyzer
 from analysis.report_generator import ReportGenerator
-from analysis.report_generator_v2 import ReportGeneratorV2
+from analysis.report_generator_v2 import ReportGeneratorV2, ensure_chart_export, ChartExportUnavailable
 from analysis.iso_epa_standards import StandardsAnalyzer
 from analysis.data_summarizer import DataSummarizer
 from analysis.chart_generator import AdvancedChartGenerator
@@ -81,6 +82,30 @@ app = Flask(__name__,
             template_folder=os.path.join(root_dir, 'frontend', 'templates'),
             static_folder=os.path.join(root_dir, 'frontend', 'static'))
 CORS(app)
+
+
+def _finite_or_none(obj):
+    """Recursively replace NaN/Infinity with None.
+
+    Python's json emits bare ``NaN``, which is not JSON: the browser's parser
+    rejects the whole response, so one missing daily value blanked every chart
+    fed by that endpoint.
+    """
+    if isinstance(obj, (float, np.floating)):
+        return float(obj) if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite_or_none(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite_or_none(v) for v in obj]
+    return obj
+
+
+class _FiniteJSONProvider(DefaultJSONProvider):
+    def dumps(self, obj, **kwargs):
+        return super().dumps(_finite_or_none(obj), **kwargs)
+
+
+app.json = _FiniteJSONProvider(app)
 
 # Configuration
 # Use normalized absolute paths to avoid issues like backend/../uploads in responses.
@@ -1078,6 +1103,65 @@ def _sanitize_for_json(records):
     return cleaned
 
 
+
+def _preview_records(df: pd.DataFrame, n: int = 10) -> list[dict]:
+    """First ``n`` rows for the upload preview, formatted for display.
+
+    Datetimes are written as naive local clock time. Flask's default encoder
+    renders them as RFC 822 strings stamped "GMT", which mislabels logger
+    clock time as UTC. Levels are rounded to 0.1 dB, the display resolution
+    of the instrument.
+    """
+    head = df.head(n).copy()
+    for col in head.columns:
+        if pd.api.types.is_datetime64_any_dtype(head[col]):
+            head[col] = head[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+        elif pd.api.types.is_float_dtype(head[col]):
+            head[col] = head[col].round(1)
+    return head.to_dict(orient='records')
+
+
+def _compliance_matrix_for(analysis_results: dict, environment: str) -> list[dict]:
+    """Evaluate the WHO/COMAR compliance matrix from a ``comprehensive_analysis`` result.
+
+    The one place the matrix inputs are chosen, so the analysis page and the
+    indoor/outdoor refresh cannot disagree.
+    """
+    env = analysis_results.get('environmental_metrics', {})
+    first_col = next(iter(env), None) if env else None
+    env_first = env.get(first_col, {}) if first_col else {}
+    stats = analysis_results.get('statistics', {})
+    stat_first = stats.get(first_col or next(iter(stats), ''), {}) or {}
+
+    # COMAR rows are defined on 07:00-22:00 and 22:00-07:00. Use the Ldn
+    # windows explicitly rather than the generic aliases, so the metric
+    # always matches the averaging period the legal limit specifies.
+    laeq_day = env_first.get('LAeq_day_ldn', env_first.get('LAeq_day'))
+    laeq_night = env_first.get('LAeq_night_ldn', env_first.get('LAeq_night'))
+
+    # LAmax must come from the L-Max stream. Taking max() of the LEQ
+    # column understates the true peak, since LEQ is already averaged
+    # over each logging interval.
+    lamax_val = None
+    lmax_col = next(
+        (c for c in stats if 'lmax' in ''.join(ch for ch in str(c).lower() if ch.isalnum())),
+        None,
+    )
+    if lmax_col:
+        lamax_val = float(stats.get(lmax_col, {}).get('max') or 0) or None
+
+    return evaluate_compliance(
+        lden=env_first.get('Lden'),
+        lnight=env_first.get('Lnight'),
+        ldn=env_first.get('Ldn'),
+        laeq=float(stat_first.get('laeq_db') or stat_first.get('mean') or 0) or None,
+        laeq_day=laeq_day,
+        laeq_night=laeq_night,
+        lamax=lamax_val,
+        environment=environment,
+    )
+
+
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     try:
@@ -1131,7 +1215,7 @@ def upload_file():
             'filepath': filepath,
             'rows': len(df),
             'columns': df.columns.tolist(),
-            'preview': df.head(10).to_dict(orient='records'),
+            'preview': _preview_records(df),
             'start_date': start_date,
             'end_date': end_date,
         })
@@ -1276,40 +1360,7 @@ def analyze_data():
         _set_progress(job_id, 75, 'Evaluating compliance…')
         compliance_matrix: list[dict] = []
         try:
-            env = analysis_results.get('environmental_metrics', {})
-            first_col = next(iter(env), None) if env else None
-            env_first = env.get(first_col, {}) if first_col else {}
-            stats     = analysis_results.get('statistics', {})
-            stat_first = stats.get(first_col or next(iter(stats), ''), {}) or {}
-
-            # COMAR rows are defined on 07:00-22:00 and 22:00-07:00. Use the Ldn
-            # windows explicitly rather than the generic aliases, so the metric
-            # always matches the averaging period the legal limit specifies.
-            laeq_day   = env_first.get('LAeq_day_ldn', env_first.get('LAeq_day'))
-            laeq_night = env_first.get('LAeq_night_ldn', env_first.get('LAeq_night'))
-
-            # LAmax must come from the L-Max stream. Taking max() of the LEQ
-            # column understates the true peak, since LEQ is already averaged
-            # over each logging interval.
-            lamax_val = None
-            _lmax_col = next(
-                (c for c in stats
-                 if 'lmax' in ''.join(ch for ch in str(c).lower() if ch.isalnum())),
-                None
-            )
-            if _lmax_col:
-                lamax_val = float(stats.get(_lmax_col, {}).get('max') or 0) or None
-
-            compliance_matrix = evaluate_compliance(
-                lden        = env_first.get('Lden'),
-                lnight      = env_first.get('Lnight'),
-                ldn         = env_first.get('Ldn'),
-                laeq        = float(stat_first.get('laeq_db') or stat_first.get('mean') or 0) or None,
-                laeq_day    = laeq_day,
-                laeq_night  = laeq_night,
-                lamax       = lamax_val,
-                environment = environment,
-            )
+            compliance_matrix = _compliance_matrix_for(analysis_results, environment)
         except Exception as cm_err:
             logger.warning(f"[ANALYZE] Compliance matrix skipped: {cm_err}")
 
@@ -1592,7 +1643,7 @@ def upload_multi():
             'file_count': len(dfs),
             'rows': len(merged_df),
             'columns': merged_df.columns.tolist(),
-            'preview': merged_df.head(10).to_dict(orient='records'),
+            'preview': _preview_records(merged_df),
             'gap_analysis': gap_data,
             'file_details': file_details,
         })
@@ -1621,25 +1672,10 @@ def compliance_check():
             return jsonify({'error': 'File not found'}), 404
 
         df = _get_cached_df(filepath)
-        analyzer = NoiseAnalyzer(df)
-        analysis = analyzer.comprehensive_analysis()
-
-        env    = analysis.get('environmental_metrics', {})
-        stats  = analysis.get('statistics', {})
-        first  = next(iter(env), None) if env else None
-        env_f  = env.get(first, {}) if first else {}
-        stat_f = stats.get(first or next(iter(stats), ''), {}) or {}
-
-        matrix = evaluate_compliance(
-            lden       = env_f.get('Lden'),
-            lnight     = env_f.get('Lnight'),
-            ldn        = env_f.get('Ldn'),
-            laeq       = float(stat_f.get('laeq_db') or stat_f.get('mean') or 0) or None,
-            laeq_day   = env_f.get('LAeq_day'),
-            laeq_night = env_f.get('LAeq_night') or env_f.get('Lnight'),
-            lamax      = float(stat_f.get('max') or 0) or None,
-            environment = environment,
-        )
+        df, err = _filtered_or_400(df, data.get('filters'), 'COMPLIANCE')
+        if err:
+            return err
+        matrix = _compliance_matrix_for(NoiseAnalyzer(df).comprehensive_analysis(), environment)
 
         return jsonify({'success': True, 'compliance_matrix': matrix})
 
@@ -1746,6 +1782,11 @@ def generate_report():
 
         if not filepath:
             return jsonify({'error': 'No filepath provided'}), 400
+
+        try:
+            ensure_chart_export()
+        except ChartExportUnavailable as e:
+            return jsonify({'error': str(e)}), 503
 
         filepath = _resolve_uploaded_filepath(filepath)
 
@@ -1957,6 +1998,9 @@ def export_data():
         
         # Read data
         df = read_input_file(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT')
+        if err:
+            return err
         
         # Run analysis
         analyzer = NoiseAnalyzer(df)
@@ -2163,6 +2207,9 @@ def export_daily_summary_csv():
             return jsonify({'error': 'File not found', 'filepath': filepath}), 404
 
         df = read_input_file(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT-DAILY')
+        if err:
+            return err
         prepared, time_col = _get_datetime_series(df)
         if prepared is None:
             return jsonify({'error': 'Daily summary requires time-series data (a usable date/time column)'}), 400
@@ -2219,6 +2266,9 @@ def export_hourly_summary_csv():
             return jsonify({'error': 'File not found', 'filepath': filepath}), 404
 
         df = read_input_file(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT-HOURLY')
+        if err:
+            return err
         prepared, time_col = _get_datetime_series(df)
         if prepared is None:
             return jsonify({'error': 'Hourly summary requires time-series data (a usable date/time column)'}), 400
@@ -3013,6 +3063,11 @@ def compare_report():
         datasets = data.get('datasets', [])
         if len(datasets) < 2:
             return jsonify({'error': 'At least 2 datasets required.'}), 400
+
+        try:
+            ensure_chart_export()
+        except ChartExportUnavailable as e:
+            return jsonify({'error': str(e)}), 503
 
         report_filename = f"noise_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
         report_path = os.path.join(ARTIFACTS_REPORTS_DIR, report_filename)

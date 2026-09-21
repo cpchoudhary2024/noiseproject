@@ -186,7 +186,7 @@ class EnvironmentalVisualizationEngine:
 
             title = "24-Hour Noise Pattern (Date × Hour)"
             x_title = "Date"
-            y_title = "Hour of Day"
+            y_title = "Hour of day (start of hour)"
         else:
             # Day x Week heatmap — energy-average (LAeq) per cell, not arithmetic.
             pivot = self.df.pivot_table(
@@ -199,7 +199,6 @@ class EnvironmentalVisualizationEngine:
             x_title = "Week Number"
             y_title = "Date"
         
-        # Color scale: Green (compliant) → Yellow (warning) → Red (critical)
         x_labels = [d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d) for d in pivot.columns]
         if resolution == 'hourly':
             y_labels = [f'{h:02d}:00' for h in pivot.index]
@@ -217,25 +216,24 @@ class EnvironmentalVisualizationEngine:
             z=z_list,
             x=x_labels,
             y=y_for_plot,
-            colorscale=[
-                [0,   'rgba(46, 204, 113, 1)'],
-                [0.4, 'rgba(241, 196, 15, 1)'],
-                [0.7, 'rgba(230, 126, 34, 1)'],
-                [1,   'rgba(192, 57, 43, 1)']
-            ],
-            colorbar=dict(title='Noise (dB)', thickness=18),
+            # Perceptually uniform and colour-blind safe. The earlier green-to-red
+            # scale implied pass/fail bands that no standard defines for an hour.
+            colorscale='Viridis',
+            colorbar=dict(title=dict(text='LAeq<br>(dB(A))'), thickness=14),
             hovertemplate='Hour: %{y}<br>Date: %{x}<br>LAeq: %{z:.1f} dB(A)<extra></extra>',
             xgap=1,
             ygap=1,
         ))
 
         fig.update_layout(
-            title=title,
             xaxis_title=x_title,
             yaxis_title=y_title,
             autosize=True,
-            height=600,
-            margin=dict(l=70, r=30, t=80, b=80),
+            height=560,
+            margin=dict(l=70, r=30, t=20, b=80),
+            font=dict(family='IBM Plex Sans, Arial, sans-serif', size=12, color='#1F2933'),
+            paper_bgcolor='white',
+            plot_bgcolor='white',
         )
 
         if resolution == 'hourly':
@@ -305,24 +303,23 @@ class EnvironmentalVisualizationEngine:
             fig.add_trace(go.Box(
                 x=bx, lowerfence=b_lf, q1=b_q1, median=b_med, q3=b_q3, upperfence=b_uf, mean=b_mean,
                 name='Hourly LEQ',
-                marker=dict(color='#3D5A80'),
-                line=dict(color='#293241', width=1.5),
-                fillcolor='rgba(61, 90, 128, 0.35)',
+                marker=dict(color='#0072B2'),
+                line=dict(color='#0072B2', width=1.2),
+                fillcolor='rgba(0, 114, 178, 0.18)',
                 hovertemplate='Hour %{x}<br>Median: %{median:.1f} dB(A)<extra></extra>',
                 showlegend=False,
             ))
         if out_y:
             fig.add_trace(go.Scatter(
                 x=out_x, y=out_y, mode='markers', name='Outliers',
-                marker=dict(color='rgba(41,50,65,0.55)', size=4, symbol='circle-open'),
+                marker=dict(color='rgba(31,41,51,0.55)', size=4, symbol='circle-open'),
                 hovertemplate='Hour %{x}<br>Outlier: %{y:.1f} dB(A)<extra></extra>',
                 showlegend=False,
             ))
 
         fig.update_layout(
-            title='Diurnal Box-and-Whisker (Hourly LEQ Volatility)',
             xaxis=dict(
-                title='Hour of Day',
+                title='Hour of day (start of hour)',
                 categoryorder='array',
                 categoryarray=hour_labels,
                 tickmode='array',
@@ -331,13 +328,14 @@ class EnvironmentalVisualizationEngine:
                 automargin=True,
             ),
             yaxis=dict(
-                title='LEQ dB(A)',
-                gridcolor='rgba(0,0,0,0.08)',
+                title='Sound level, LEQ (dB(A))',
+                gridcolor='#E5E7EB',
                 zeroline=False,
             ),
             autosize=True,
-            height=520,
-            margin=dict(l=60, r=30, t=70, b=90),
+            height=460,
+            margin=dict(l=64, r=24, t=20, b=64),
+            font=dict(family='IBM Plex Sans, Arial, sans-serif', size=12, color='#1F2933'),
             paper_bgcolor='white',
             plot_bgcolor='white',
         )

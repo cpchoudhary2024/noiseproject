@@ -155,7 +155,6 @@ class NoiseAnalyzer:
             'frequency_distribution': self._frequency_distribution(),
             'trends': self._analyze_trends(),
             'compliance': self._check_compliance(),
-            'interpretations': self._generate_interpretations()
         }
         return results
     
@@ -596,30 +595,3 @@ class NoiseAnalyzer:
             compliance[col] = out
 
         return compliance
-    
-    def _generate_interpretations(self):
-        """Generate human-readable interpretations"""
-        interpretations = []
-        
-        for col in self.noise_columns:
-            data = self.df[col].dropna()
-            mean_level = energetic_mean_db(data)
-            mean_level = float(mean_level) if mean_level is not None else float(data.mean())
-            
-            # Interpret noise levels
-            if mean_level < 30:
-                interpretation = f"{col}: Very quiet environment (peaceful setting)"
-            elif mean_level < 50:
-                interpretation = f"{col}: Quiet (suitable for residential areas)"
-            elif mean_level < 60:
-                interpretation = f"{col}: Moderate (busy residential area)"
-            elif mean_level < 70:
-                interpretation = f"{col}: Noisy (commercial area level)"
-            elif mean_level < 80:
-                interpretation = f"{col}: Very noisy (industrial area level)"
-            else:
-                interpretation = f"{col}: Extremely noisy (potentially harmful)"
-            
-            interpretations.append(interpretation)
-        
-        return interpretations

@@ -16,6 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Unbuffered so application messages reach the platform log as they happen.
+ENV PYTHONUNBUFFERED=1
+
 # Install Python dependencies first (cached layer — only re-runs when requirements change)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
