@@ -10,17 +10,21 @@ import traceback
 import re
 from werkzeug.utils import secure_filename
 from analysis.noise_analyzer import NoiseAnalyzer
-from analysis.report_generator import ReportGenerator
-from analysis.report_generator_v2 import ReportGeneratorV2, ensure_chart_export, ChartExportUnavailable
+from analysis.report_generator_v2 import (ReportGeneratorV2, ensure_chart_export, ChartExportUnavailable,
+                                         _excluded_text)
 from analysis.iso_epa_standards import StandardsAnalyzer
 from analysis.data_summarizer import DataSummarizer
-from analysis.chart_generator import AdvancedChartGenerator
 from analysis.environmental_viz import EnvironmentalVisualizationEngine
-from analysis.environmental_metrics import EnvironmentalMetricsCalculator
 from analysis.wlg_parser import parse_wlg_file, WLGParser
-from analysis.gap_detector import (detect_gaps, gap_report_to_dict, merge_dataframes,
+from analysis.gap_detector import (detect_gaps, gap_report_to_dict, merge_dataframes, describe_logger_clock,
+                                   format_duration,
                                    data_completeness_pct, _modal_interval_seconds)
 from analysis.compliance_matrix import evaluate_compliance
+from analysis.periods import (daily_summary as period_daily_summary,
+                              hourly_summary as period_hourly_summary, COMPLETE_COVERAGE_PCT)
+from analysis.clock import (FOLD_COLUMN, CLOCK_CHOICES, DEFAULT_CLOCK, ClockError, ClockSetting,
+                            apply_clock, mark_repeated_hour, zone_abbreviations, zone_label,
+                            describe_time_basis, ordering_key)
 from analysis.acoustics import energetic_mean_db, compute_ldn_lden, energy_concentration
 from analysis.timestamp_utils import (assess_timestamp_integrity, primary_time_column,
                                       parse_timestamps_robust, resolve_time_column)
@@ -82,6 +86,12 @@ app = Flask(__name__,
             template_folder=os.path.join(root_dir, 'frontend', 'templates'),
             static_folder=os.path.join(root_dir, 'frontend', 'static'))
 CORS(app)
+
+
+def _server_error(exc: Exception):
+    """500 response without internals: the traceback goes to the server log only."""
+    logger.exception("Unhandled error: %s", exc)
+    return jsonify({'error': f'The server could not complete this request ({type(exc).__name__}: {exc}).'}), 500
 
 
 def _finite_or_none(obj):
@@ -272,12 +282,36 @@ class TemporalFilterError(ValueError):
     """
 
 
+def _clock_setting(filters: dict | None) -> ClockSetting:
+    """The logger-clock → report-zone setting carried in ``filters['clock']``."""
+    try:
+        return ClockSetting.from_request((filters or {}).get('clock'))
+    except ClockError as exc:
+        raise TemporalFilterError(str(exc)) from exc
+
+
 def _filters_requested(filters: dict | None) -> bool:
-    """True when the user actually asked for a date bound or an exclusion."""
+    """True when the user asked for a date bound, an exclusion or a clock conversion."""
     if not filters:
         return False
+    clock = (filters.get('clock') or {})
+    converts = bool(clock) and (clock.get('source') or DEFAULT_CLOCK) != (clock.get('target') or DEFAULT_CLOCK)
     return bool(filters.get('bound_start') or filters.get('bound_end')
-                or filters.get('exclusions'))
+                or filters.get('exclusions') or converts)
+
+
+def _parse_bound(raw: str, *, end: bool) -> pd.Timestamp:
+    """Parse a date bound. A bare date as an END bound means the whole of that day.
+
+    The filter form sends full date-times; extending those by a day (the old
+    behaviour) kept almost 24 hours past the end the user entered.
+    """
+    text = str(raw).strip()
+    ts = pd.to_datetime(text)
+    date_only = len(text) <= 10 and 'T' not in text and ':' not in text
+    if end and date_only:
+        return ts + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    return ts
 
 
 def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFrame:
@@ -298,8 +332,11 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
             report covering ten days was produced for someone who had asked for
             four, with nothing anywhere to say so.
     """
+    setting = _clock_setting(filters)
     if df.empty or not _filters_requested(filters):
-        return df
+        out = df.copy(deep=False)
+        out.attrs = {**df.attrs, 'clock': {**setting.to_dict(), 'converted': False}}
+        return out
 
     time_col = resolve_time_column(df)
     if not time_col:
@@ -318,6 +355,19 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
             "'YYYY-MM-DD HH:MM:SS' timestamp column, or run without a date filter."
         )
 
+    # Clock conversion comes first: the date bounds and exclusion windows are
+    # entered in the report clock, the one the user sees.
+    parsed = df.copy()
+    parsed[time_col] = ts
+    try:
+        parsed = apply_clock(parsed, time_col, setting)
+    except ClockError as exc:
+        raise TemporalFilterError(str(exc)) from exc
+    clock_info = parsed.attrs.get('clock', {})
+    df = parsed
+    ts = df[time_col]
+    valid_ts = ts.notna()
+
     # Rows whose timestamp could not be read are DROPPED, not kept. A row with no
     # readable time cannot be shown to fall inside the requested window, and
     # keeping it silently readmits data the user excluded — which is what the
@@ -330,14 +380,12 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
     bound_end   = filters.get('bound_end')
     if bound_start:
         try:
-            keep &= ts >= pd.to_datetime(bound_start)
+            keep &= ts >= _parse_bound(bound_start, end=False)
         except Exception as exc:
             raise TemporalFilterError(f"Start date '{bound_start}' is not a valid date.") from exc
     if bound_end:
         try:
-            # Include the full last day.
-            end_dt = pd.to_datetime(bound_end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-            keep &= ts <= end_dt
+            keep &= ts <= _parse_bound(bound_end, end=True)
         except Exception as exc:
             raise TemporalFilterError(f"End date '{bound_end}' is not a valid date.") from exc
 
@@ -346,7 +394,7 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
         if not (es_raw and ee_raw):
             continue
         try:
-            es, ee = pd.to_datetime(es_raw), pd.to_datetime(ee_raw)
+            es, ee = _parse_bound(es_raw, end=False), _parse_bound(ee_raw, end=True)
         except Exception as exc:
             raise TemporalFilterError(
                 f"Exclusion window '{es_raw}' to '{ee_raw}' is not a valid date range."
@@ -354,6 +402,13 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
         keep &= ~((ts >= es) & (ts <= ee))
 
     clean_df = df[keep].copy()
+    # Excluded windows are recorded so continuity reporting can show them as
+    # the analyst's exclusions rather than as data the logger failed to record.
+    excluded = []
+    for excl in (filters.get('exclusions') or []):
+        if excl.get('start') and excl.get('end'):
+            excluded.append((_parse_bound(excl['start'], end=False), _parse_bound(excl['end'], end=True)))
+    clean_df.attrs = {**df.attrs, 'clock': clock_info, 'exclusions': excluded}
     if clean_df.empty:
         span = ''
         if valid_ts.any():
@@ -652,6 +707,24 @@ def read_parquet_file(filepath):
 
 
 def read_input_file(filepath):
+    """Read a logger file and mark any repeated (daylight-saving) hour.
+
+    The repeated hour can only be identified in the order the logger wrote the
+    rows, so it is marked here, before anything sorts or de-duplicates them.
+    """
+    df = _read_input_file_raw(filepath)
+    time_col = resolve_time_column(df)
+    if time_col and FOLD_COLUMN not in df.columns and len(df) > 1:
+        parsed = df.copy()
+        parsed[time_col] = parse_timestamps_robust(df[time_col])[0]
+        marked = mark_repeated_hour(parsed, time_col)
+        if FOLD_COLUMN in marked.columns:
+            df = df.copy()
+            df[FOLD_COLUMN] = marked[FOLD_COLUMN].to_numpy()
+    return df
+
+
+def _read_input_file_raw(filepath):
     """Read CSV, Excel, or WLG by sniffing the actual file format.
 
     This avoids failures when users upload files with the wrong extension (e.g. a CSV renamed to .xls).
@@ -683,7 +756,7 @@ def read_input_file(filepath):
     
     raise ValueError(
         "Unsupported format, or corrupt file. "
-        "Please upload a valid .csv, .xls, .xlsx, or .wlg (Larson Davis) file."
+        "Please upload a valid .csv, .xls, .xlsx, .parquet or .wlg (Larson Davis) file."
     )
 
 
@@ -1104,6 +1177,11 @@ def _sanitize_for_json(records):
 
 
 
+def _visible_columns(df: pd.DataFrame) -> list[str]:
+    """Columns that belong to the user's data (internal markers excluded)."""
+    return [c for c in df.columns if c != FOLD_COLUMN]
+
+
 def _preview_records(df: pd.DataFrame, n: int = 10) -> list[dict]:
     """First ``n`` rows for the upload preview, formatted for display.
 
@@ -1112,7 +1190,7 @@ def _preview_records(df: pd.DataFrame, n: int = 10) -> list[dict]:
     clock time as UTC. Levels are rounded to 0.1 dB, the display resolution
     of the instrument.
     """
-    head = df.head(n).copy()
+    head = df[_visible_columns(df)].head(n).copy()
     for col in head.columns:
         if pd.api.types.is_datetime64_any_dtype(head[col]):
             head[col] = head[col].dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -1121,7 +1199,23 @@ def _preview_records(df: pd.DataFrame, n: int = 10) -> list[dict]:
     return head.to_dict(orient='records')
 
 
-def _compliance_matrix_for(analysis_results: dict, environment: str) -> list[dict]:
+def _night_lamax(df: pd.DataFrame | None) -> float | None:
+    """Highest L-Max reading between 23:00 and 07:00 (WHO night), or None."""
+    if df is None:
+        return None
+    tcol = resolve_time_column(df)
+    lcol = next((c for c in df.columns
+                 if 'lmax' in ''.join(ch for ch in str(c).lower() if ch.isalnum())), None)
+    if not tcol or not lcol:
+        return None
+    ts = pd.to_datetime(df[tcol], errors='coerce')
+    h = ts.dt.hour
+    v = pd.to_numeric(df[lcol], errors='coerce')[(h >= 23) | (h < 7)].dropna()
+    return float(v.max()) if not v.empty else None
+
+
+def _compliance_matrix_for(analysis_results: dict, environment: str,
+                           df: pd.DataFrame | None = None) -> list[dict]:
     """Evaluate the WHO/COMAR compliance matrix from a ``comprehensive_analysis`` result.
 
     The one place the matrix inputs are chosen, so the analysis page and the
@@ -1158,8 +1252,60 @@ def _compliance_matrix_for(analysis_results: dict, environment: str) -> list[dic
         laeq_day=laeq_day,
         laeq_night=laeq_night,
         lamax=lamax_val,
+        lamax_night=_night_lamax(df),
         environment=environment,
     )
+
+
+def _time_basis(df: pd.DataFrame, ts: pd.Series | None = None) -> str:
+    return describe_time_basis(_clock_zone(df), ts)
+
+
+def escape_xml(text: str) -> str:
+    """Escape user text (location labels) for ReportLab paragraph markup."""
+    from xml.sax.saxutils import escape
+    return escape(str(text))
+
+
+def _clock_zone(df: pd.DataFrame) -> str:
+    return (df.attrs.get('clock') or {}).get('target') or DEFAULT_CLOCK
+
+
+def _clock_payload(df: pd.DataFrame) -> dict:
+    """Clock setting of an analysed record, for the browser and the reports."""
+    info = dict(df.attrs.get('clock') or ClockSetting().to_dict())
+    tcol = resolve_time_column(df)
+    ts = pd.to_datetime(df[tcol], errors='coerce').dropna() if tcol else pd.Series(dtype='datetime64[ns]')
+    info['time_basis'] = _time_basis(df, ts if not ts.empty else None)
+    info['abbreviations'] = (zone_abbreviations(_clock_zone(df), ts.min(), ts.max())
+                             if not ts.empty else '')
+    return info
+
+
+def _period_frames(df: pd.DataFrame):
+    """Daily and hourly period tables from ``analysis.periods`` for the LEQ channel.
+
+    Returns a dict, or a Flask error response tuple when the record has no usable
+    time series.
+    """
+    prepared, time_col = _get_datetime_series(df)
+    if prepared is None:
+        return jsonify({'error': 'Summaries require a usable date/time column.'}), 400
+    leq_col = _pick_primary_leq_column(prepared)
+    if leq_col is None:
+        return jsonify({'error': 'No noise measurement column found.'}), 400
+    tmp = prepared[[time_col, leq_col]].dropna()
+    if tmp.empty:
+        return jsonify({'error': 'No valid time-series rows after parsing date/time.'}), 400
+    ts = tmp[time_col]
+    leq = pd.to_numeric(tmp[leq_col], errors='coerce')
+    zone = (df.attrs.get('clock') or {}).get('target') or DEFAULT_CLOCK
+    interval = _modal_interval_seconds(ts)
+    return {
+        'daily': period_daily_summary(ts, leq, zone, interval),
+        'hourly': period_hourly_summary(ts, leq),
+        'time_basis': _time_basis(df, ts),
+    }
 
 
 @app.route('/api/upload', methods=['POST'])
@@ -1174,7 +1320,7 @@ def upload_file():
             return jsonify({'error': 'No file selected'}), 400
         
         if not allowed_file(file.filename):
-            return jsonify({'error': 'Only CSV, Excel, and WLG (Larson Davis) files are allowed'}), 400
+            return jsonify({'error': 'Only CSV, Excel, Parquet and WLG (Larson Davis) files are allowed'}), 400
         
         # Save file
         filename = secure_filename(datetime.now().strftime("%Y%m%d_%H%M%S_") + file.filename)
@@ -1191,6 +1337,10 @@ def upload_file():
         if df.empty:
             os.remove(filepath)
             return jsonify({'error': 'File is empty'}), 400
+        if _resolve_noise_column(df) is None:
+            os.remove(filepath)
+            return jsonify({'error': ('No sound level column was found in this file. Expected a column of '
+                                      'A-weighted levels such as "LEQ dB -A" or "LAeq".')}), 400
 
         _store_cache_entry(filepath, df=df)
 
@@ -1212,9 +1362,9 @@ def upload_file():
         return jsonify({
             'success': True,
             'filename': filename,
-            'filepath': filepath,
+            'filepath': os.path.basename(filepath),
             'rows': len(df),
-            'columns': df.columns.tolist(),
+            'columns': _visible_columns(df),
             'preview': _preview_records(df),
             'start_date': start_date,
             'end_date': end_date,
@@ -1241,7 +1391,6 @@ def analyze_data():
         if not os.path.exists(filepath):
             return jsonify({
                 'error': 'File not found',
-                'filepath': filepath,
                 'hint': 'Re-upload the file and try again. If the server was restarted, the previous filepath may no longer exist.'
             }), 404
 
@@ -1269,6 +1418,9 @@ def analyze_data():
                 'rows_after': len(df),
                 'range_start': _fts.min().isoformat() if not _fts.empty else None,
                 'range_end': _fts.max().isoformat() if not _fts.empty else None,
+                'date_filtered': bool(filters.get('bound_start') or filters.get('bound_end')
+                                      or filters.get('exclusions')),
+                'clock_converted': bool((df.attrs.get('clock') or {}).get('converted')),
             }
 
         # Check if analysis is already cached (only when no filters applied)
@@ -1299,6 +1451,16 @@ def analyze_data():
             _tcol = resolve_time_column(df)
             if _tcol is not None:
                 timestamp_integrity = assess_timestamp_integrity(df[_tcol]).to_dict()
+            else:
+                # No time column at all: the time-dependent metrics cannot exist,
+                # and nothing may be said about when or how continuously it was measured.
+                timestamp_integrity = {
+                    'status': 'unusable', 'time_metrics_valid': False, 'method': 'no-time-column',
+                    'message': ("This file has no date/time column, so the measurement period, "
+                                "Lden, Lnight, the day/night levels, the hourly and daily values and "
+                                "every chart over time cannot be computed. The overall LAeq and the "
+                                "percentile levels below do not depend on time and are shown."),
+                }
         except Exception as ts_err:
             logger.warning(f"[ANALYZE] Timestamp integrity check skipped: {ts_err}")
 
@@ -1345,6 +1507,8 @@ def analyze_data():
             logger.warning('[ANALYZE] Timestamps unusable (%s) — time-dependent metrics suppressed.',
                            timestamp_integrity.get('method'))
 
+        clock_payload = _clock_payload(df)
+
         # ── Forensic gap analysis ──────────────────────────────────────────────
         _set_progress(job_id, 65, 'Detecting data gaps…')
         gap_data: dict = {}
@@ -1360,7 +1524,7 @@ def analyze_data():
         _set_progress(job_id, 75, 'Evaluating compliance…')
         compliance_matrix: list[dict] = []
         try:
-            compliance_matrix = _compliance_matrix_for(analysis_results, environment)
+            compliance_matrix = _compliance_matrix_for(analysis_results, environment, df)
         except Exception as cm_err:
             logger.warning(f"[ANALYZE] Compliance matrix skipped: {cm_err}")
 
@@ -1453,10 +1617,12 @@ def analyze_data():
             # Elapsed monitoring duration in whole days. Reported alongside
             # key_findings['n_calendar_dates'], which counts calendar dates
             # touched — the two legitimately differ and must not be conflated.
-            n_days_pe = int(round((ts_valid_pe.max() - ts_valid_pe.min()).total_seconds() / 86400)) if not ts_valid_pe.empty else 0
+            n_days_pe = (ts_valid_pe.max() - ts_valid_pe.min()).total_seconds() / 86400 if not ts_valid_pe.empty else 0
             start_pe = ts_valid_pe.min().strftime('%d %b %Y') if not ts_valid_pe.empty else ''
             end_pe   = ts_valid_pe.max().strftime('%d %b %Y') if not ts_valid_pe.empty else ''
-            completeness_pe = data_completeness_pct(ts_valid_pe, actual_count=len(df))
+            # One completeness figure everywhere: the gap inventory's, which accounts
+            # for clock changes, the repeated November hour and excluded windows.
+            completeness_pe = (gap_data or {}).get('completeness_exact') if not ts_valid_pe.empty else None
 
             # True LAmax from the L-Max column, and the measured logging interval,
             # so the narrative names the stream each peak came from.
@@ -1509,6 +1675,10 @@ def analyze_data():
                 lamax = _lamax_pe,
                 logging_interval_s = _interval_pe,
                 energy_dominance = _dominance_pe,
+                time_basis  = clock_payload['time_basis'],
+                clock_change_dates = [pd.Timestamp(c['before']).strftime('%d %b %Y')
+                                      for c in (gap_data or {}).get('clock_changes', [])],
+                excluded    = [_excluded_text(x) for x in (gap_data or {}).get('excluded', [])],
             )
         except Exception as _pe_err:
             logger.warning(f"[ANALYZE] Plain-English summary failed: {_pe_err}")
@@ -1525,11 +1695,12 @@ def analyze_data():
             'filter_summary': filter_summary,
             'ingest_warnings': ingest_warnings,
             'key_findings': key_findings,
-            'filepath': filepath
+            'clock': clock_payload,
+            'filepath': os.path.basename(filepath)
         })
 
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 
 # ── Multi-file upload endpoint ────────────────────────────────────────────────
@@ -1637,19 +1808,19 @@ def upload_multi():
 
         return jsonify({
             'success': True,
-            'filepath': merged_path,
+            'filepath': os.path.basename(merged_path),
             'merged_filename': merged_name,
             'source_files': filenames,
             'file_count': len(dfs),
             'rows': len(merged_df),
-            'columns': merged_df.columns.tolist(),
+            'columns': _visible_columns(merged_df),
             'preview': _preview_records(merged_df),
             'gap_analysis': gap_data,
             'file_details': file_details,
         })
 
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 
 # ── Compliance matrix endpoint ────────────────────────────────────────────────
@@ -1675,99 +1846,13 @@ def compliance_check():
         df, err = _filtered_or_400(df, data.get('filters'), 'COMPLIANCE')
         if err:
             return err
-        matrix = _compliance_matrix_for(NoiseAnalyzer(df).comprehensive_analysis(), environment)
+        matrix = _compliance_matrix_for(NoiseAnalyzer(df).comprehensive_analysis(), environment, df)
 
         return jsonify({'success': True, 'compliance_matrix': matrix})
 
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
-
-@app.route('/api/health-assessment', methods=['POST'])
-def get_health_assessment():
-    """Get comprehensive health-based noise impact assessment using WHO thresholds."""
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
-
-        filepath = _resolve_uploaded_filepath(filepath)
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
-        
-        # Read data (cached)
-        df = _get_cached_df(filepath)
-        
-        # Get health-based assessment
-        standards_analyzer = StandardsAnalyzer(df)
-        health_assessment = standards_analyzer.get_health_based_assessment()
-        
-        return jsonify({
-            'success': True,
-            'health_assessment': health_assessment,
-            'filepath': filepath
-        })
-    
-    except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
-
-@app.route('/api/occupational-assessment', methods=['POST'])
-def get_occupational_assessment():
-    """Get occupational noise exposure assessment against NIOSH and OSHA standards."""
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
-
-        filepath = _resolve_uploaded_filepath(filepath)
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
-        
-        # Read data (cached)
-        df = _get_cached_df(filepath)
-        
-        # Get occupational assessment
-        standards_analyzer = StandardsAnalyzer(df)
-        occupational_assessment = standards_analyzer.get_occupational_assessment()
-        
-        return jsonify({
-            'success': True,
-            'occupational_assessment': occupational_assessment,
-            'filepath': filepath
-        })
-    
-    except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
-
-@app.route('/api/standards-reference', methods=['GET'])
-def get_standards_reference():
-    """Get comprehensive standards reference data (WHO, NIOSH, OSHA, EU, etc.)."""
-    try:
-        from analysis.standards_reference import who_2018_environmental_noise_guideline_levels, occupational_noise_standards
-        from analysis.noise_education import decibel_scale_reference, frequency_weighting_guide, health_effects_by_level, annoyance_by_noise_source
-        
-        reference = {
-            'success': True,
-            'who_2018': who_2018_environmental_noise_guideline_levels(),
-            'occupational_standards': occupational_noise_standards(),
-            'decibel_scale': decibel_scale_reference(),
-            'frequency_weighting': frequency_weighting_guide(),
-            'health_effects': health_effects_by_level(),
-            'annoyance_data': annoyance_by_noise_source(),
-        }
-        
-        return jsonify(reference)
-    
-    except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 @app.route('/api/generate-report', methods=['POST'])
 def generate_report():
@@ -1793,7 +1878,6 @@ def generate_report():
         if not os.path.exists(filepath):
             return jsonify({
                 'error': 'File not found',
-                'filepath': filepath,
                 'hint': 'Re-upload the file and try again. If the server was restarted, the previous filepath may no longer exist.'
             }), 404
 
@@ -1885,14 +1969,9 @@ def generate_report():
             generator = _make_generator()
             report_path = generator.generate_docx_report(report_type, output_dir=out_dir)
             mimetype = DOCX_MIME
-        elif report_format in {'html', 'htm'}:
-            generator = _make_generator()
-            report_path = generator.generate_html_report(report_type, output_dir=app.config['ARTIFACTS_REPORTS_DIR']) if hasattr(generator, 'generate_html_report') else None
-            if report_path is None:
-                generator_old = ReportGenerator(df, filepath, analysis=analysis_cached, standards=standards_cached)
-                report_path = generator_old.generate_html_report(report_type, output_dir=app.config['ARTIFACTS_REPORTS_DIR'])
-            mimetype = 'text/html'
-        else:  # Default to PDF
+        elif report_format != 'pdf':
+            return jsonify({'error': f"Unsupported report format '{report_format}'. Use pdf or docx."}), 400
+        else:
             generator = _make_generator()
             report_path = generator.generate_pdf_report(report_type, output_dir=app.config['ARTIFACTS_REPORTS_DIR'])
             mimetype = 'application/pdf'
@@ -1905,7 +1984,7 @@ def generate_report():
         return send_file(report_path, as_attachment=True, download_name=os.path.basename(report_path), mimetype=mimetype)
     
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 @app.route('/api/get-computed-summaries', methods=['POST'])
 def get_computed_summaries():
@@ -1924,7 +2003,7 @@ def get_computed_summaries():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found. Upload the file again.'}), 404
         
         filters = (data or {}).get('filters')
         cache_entry = _get_cache_entry(filepath) or {}
@@ -1980,7 +2059,7 @@ def get_computed_summaries():
         })
     
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 @app.route('/api/export-data', methods=['POST'])
 def export_data():
@@ -1994,7 +2073,7 @@ def export_data():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found. Upload the file again.'}), 404
         
         # Read data
         df = read_input_file(filepath)
@@ -2002,98 +2081,96 @@ def export_data():
         if err:
             return err
         
-        # Run analysis
-        analyzer = NoiseAnalyzer(df)
-        analysis_results = analyzer.comprehensive_analysis()
-        
-        # Create Excel with multiple sheets
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Raw Data', index=False)
-            
-            # Statistics sheet
-            stats_df = pd.DataFrame(analysis_results['statistics'])
-            stats_df.to_excel(writer, sheet_name='Statistics', index=True)
-            
-            # Compliance sheet
-            compliance_df = pd.DataFrame(analysis_results.get('compliance', []))
-            if not compliance_df.empty:
-                compliance_df.to_excel(writer, sheet_name='Compliance', index=False)
-        
-        output.seek(0)
+        analysis_results = NoiseAnalyzer(df).comprehensive_analysis()
+        frames = _period_frames(df)
+        if isinstance(frames, tuple):
+            return frames
+        output = _results_workbook(df, analysis_results, frames,
+                                   str((data or {}).get('environment') or 'outdoor'))
         return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                        as_attachment=True, download_name='noise_analysis_export.xlsx')
-    
+                         as_attachment=True, download_name='noise_analysis_results.xlsx')
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/export-daily-summary', methods=['POST'])
-def export_daily_summary():
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-        
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
 
-        filepath = _resolve_uploaded_filepath(filepath)
+def _results_workbook(df: pd.DataFrame, analysis: dict, frames: dict, environment: str) -> io.BytesIO:
+    """Results workbook: every computed table, and the record as 1-minute LAeq.
 
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
-        
-        # Read data
-        df = read_input_file(filepath)
-        
-        # Generate daily summary (Excel)
-        summarizer = DataSummarizer(df)
-        excel_output = summarizer.generate_daily_excel()
+    Raw per-reading rows are not included: a record of more than about 12 days at
+    1 s exceeds Excel's 1,048,576-row sheet limit, and the original files already
+    hold them.
+    """
+    stats = analysis.get('statistics', {})
+    pcts = analysis.get('percentiles', {})
+    env = analysis.get('environmental_metrics', {})
+    leq_col = _pick_primary_leq_column(df) or next(iter(stats), None)
+    e = env.get(leq_col, {}) if leq_col else {}
+    tcol = resolve_time_column(df)
+    ts = pd.to_datetime(df[tcol], errors='coerce') if tcol else pd.Series(dtype='datetime64[ns]')
 
-        if excel_output is None:
-            return jsonify({'error': 'Daily summary requires time-series data'}), 400
+    about = pd.DataFrame([
+        ('Time basis', frames['time_basis']),
+        ('Record start', f"{ts.min():%Y-%m-%d %H:%M:%S}" if ts.notna().any() else ''),
+        ('Record end', f"{ts.max():%Y-%m-%d %H:%M:%S}" if ts.notna().any() else ''),
+        ('Readings analysed', len(df)),
+        ('Level channel for period metrics', str(leq_col or '').strip()),
+        ('Microphone placement', environment),
+        ('Generated', datetime.now().strftime('%Y-%m-%d %H:%M')),
+    ], columns=['Item', 'Value'])
 
-        return send_file(
-            excel_output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name='daily_summary.xlsx',
-        )
-    
-    except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+    periods = pd.DataFrame([
+        ('LAeq, whole record', 'All readings', stats.get(leq_col, {}).get('laeq_db')),
+        ('LAeq, day', '07:00-19:00', e.get('LAeq_day_lden')),
+        ('LAeq, evening', '19:00-23:00', e.get('LAeq_evening_lden')),
+        ('Lnight', '23:00-07:00', e.get('Lnight')),
+        ('Lden', 'Day + evening (+5 dB) + night (+10 dB)', e.get('Lden')),
+        ('LAeq, COMAR day', '07:00-22:00', e.get('LAeq_day_ldn')),
+        ('LAeq, COMAR night', '22:00-07:00', e.get('LAeq_night_ldn')),
+        ('Ldn', 'Day + night (+10 dB, 22:00-07:00)', e.get('Ldn')),
+    ], columns=['Metric', 'Averaging period', 'dB(A)'])
 
-@app.route('/api/export-hourly-summary', methods=['POST'])
-def export_hourly_summary():
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-        
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
+    stat_rows = []
+    for col, st in stats.items():
+        p = pcts.get(col, {})
+        stat_rows.append({'Channel': str(col).strip(), 'Energy average dB(A)': st.get('laeq_db'),
+                          'Arithmetic mean dB(A)': st.get('mean_arithmetic_db'), 'SD dB': st.get('std_dev'),
+                          'Min dB(A)': st.get('min'), 'Max dB(A)': st.get('max'),
+                          **{f'{k} dB(A)': p.get(k) for k in ('L5', 'L10', 'L50', 'L90', 'L95')}})
 
-        filepath = _resolve_uploaded_filepath(filepath)
+    minute = pd.DataFrame()
+    if leq_col and ts.notna().any():
+        lv = pd.to_numeric(df[leq_col], errors='coerce')
+        # Group on elapsed time so the two passes of a repeated November hour
+        # stay separate minutes; label each minute with its wall-clock start.
+        fold = df[FOLD_COLUMN] if FOLD_COLUMN in df.columns else pd.Series(0, index=df.index)
+        key = ordering_key(ts, fold)
+        grp = pd.DataFrame({'k': key.dt.floor('min'), 'wall': ts.dt.floor('min'),
+                            'fold': fold, 'v': lv}).dropna()
+        g = grp.groupby('k')
+        minute = pd.DataFrame({
+            'Minute start': g['wall'].first().to_numpy(),
+            'Second pass of repeated hour': g['fold'].max().map({1: 'yes', 0: ''}).to_numpy(),
+            'LAeq,1min dB(A)': g['v'].apply(energetic_mean_db).round(2).to_numpy(),
+            'Readings': g['v'].size().to_numpy(),
+        })
 
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
-        
-        # Read data
-        df = read_input_file(filepath)
-        
-        # Generate hourly summary (Excel)
-        summarizer = DataSummarizer(df)
-        excel_output = summarizer.generate_hourly_excel()
-
-        if excel_output is None:
-            return jsonify({'error': 'Hourly summary requires time-series data'}), 400
-
-        return send_file(
-            excel_output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name='hourly_summary.xlsx',
-        )
-
-    except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        about.to_excel(writer, sheet_name='About', index=False)
+        periods.round(2).to_excel(writer, sheet_name='Period levels', index=False)
+        pd.DataFrame(stat_rows).round(2).to_excel(writer, sheet_name='Statistics', index=False)
+        frames['daily'].round(2).to_excel(writer, sheet_name='Daily', index=False)
+        frames['hourly'].round(2).to_excel(writer, sheet_name='Hourly', index=False)
+        matrix = pd.DataFrame(_compliance_matrix_for(analysis, environment, df))
+        if not matrix.empty:
+            keep = [c for c in ('standard', 'metric', 'measured_db', 'limit_db', 'delta_db', 'status', 'kind', 'source')
+                    if c in matrix.columns]
+            matrix[keep].to_excel(writer, sheet_name='Compliance', index=False)
+        if not minute.empty:
+            minute.to_excel(writer, sheet_name='1-minute LAeq', index=False)
+    output.seek(0)
+    return output
 
 
 def _pick_primary_leq_column(df: pd.DataFrame) -> str | None:
@@ -2204,39 +2281,32 @@ def export_daily_summary_csv():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found. Upload the file again.'}), 404
 
         df = read_input_file(filepath)
         df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT-DAILY')
         if err:
             return err
-        prepared, time_col = _get_datetime_series(df)
-        if prepared is None:
-            return jsonify({'error': 'Daily summary requires time-series data (a usable date/time column)'}), 400
-
-        leq_col = _pick_primary_leq_column(prepared)
-        if leq_col is None:
-            return jsonify({'error': 'No noise measurement column found for daily summary'}), 400
-
-        tmp = prepared[[time_col, leq_col]].dropna()
-        tmp = tmp[tmp[time_col].notna()]
-        if tmp.empty:
-            return jsonify({'error': 'No valid time-series rows after parsing date/time'}), 400
-
-        tmp = tmp.copy()
-        tmp['Date'] = tmp[time_col].dt.strftime('%Y-%m-%d')
-
-        from analysis.acoustics import energetic_mean_db as _emdb
-
-        def _laeq_agg(s):
-            return _emdb(pd.to_numeric(s, errors='coerce').dropna())
-
-        out = tmp.groupby('Date')[leq_col].agg(
-            Average_L_EQ_dB=_laeq_agg,
-            Min_L_EQ_dB='min',
-            Max_L_EQ_dB='max',
-            Std_Dev='std',
-        ).reset_index()
+        frames = _period_frames(df)
+        if isinstance(frames, tuple):
+            return frames
+        daily = frames['daily']
+        out = pd.DataFrame({
+            'Date': pd.to_datetime(daily['Date']).dt.strftime('%Y-%m-%d'),
+            'Time_basis': frames['time_basis'],
+            'Hours_measured': daily['Hours_Measured'].round(3),
+            'Day_coverage_pct': daily['Day_Coverage_pct'].round(2),
+            'Partial_day': np.where(daily['Day_Coverage_pct'] < COMPLETE_COVERAGE_PCT, 'yes', 'no'),
+            'LAeq_00_24_dBA': daily['Average_L_EQ_dB'].round(2),
+            'Min_LEQ_dBA': daily['Min_L_EQ_dB'].round(2),
+            'Max_LEQ_dBA': daily['Max_L_EQ_dB'].round(2),
+            'SD_LEQ_dB': daily['Std_Dev'].round(2),
+            'LAeq_07_22_dBA': daily['Daytime_LAeq'].round(2),
+            'LAeq_night_22_07_from_this_date_dBA': daily['Nighttime_LAeq'].round(2),
+            'Night_coverage_pct': daily['Night_Coverage_pct'].round(2),
+            'Lden_07_to_07_from_this_date_dBA': pd.to_numeric(daily['Daily_Lden'], errors='coerce').round(2),
+            'Lden_period_coverage_pct': daily['Lden_Coverage_pct'].round(2),
+        })
 
         csv_bytes = out.to_csv(index=False).encode('utf-8')
         return send_file(
@@ -2247,7 +2317,7 @@ def export_daily_summary_csv():
         )
 
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 
 @app.route('/api/export-hourly-summary-csv', methods=['POST'])
@@ -2263,41 +2333,24 @@ def export_hourly_summary_csv():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found. Upload the file again.'}), 404
 
         df = read_input_file(filepath)
         df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT-HOURLY')
         if err:
             return err
-        prepared, time_col = _get_datetime_series(df)
-        if prepared is None:
-            return jsonify({'error': 'Hourly summary requires time-series data (a usable date/time column)'}), 400
-
-        leq_col = _pick_primary_leq_column(prepared)
-        if leq_col is None:
-            return jsonify({'error': 'No noise measurement column found for hourly summary'}), 400
-
-        tmp = prepared[[time_col, leq_col]].dropna()
-        tmp = tmp[tmp[time_col].notna()]
-        if tmp.empty:
-            return jsonify({'error': 'No valid time-series rows after parsing date/time'}), 400
-
-        tmp = tmp.copy()
-        tmp['Hour'] = tmp[time_col].dt.hour
-
-        from analysis.acoustics import energetic_mean_db as _emdb
-
-        def _laeq_agg(s):
-            return _emdb(pd.to_numeric(s, errors='coerce').dropna())
-
-        out = tmp.groupby('Hour')[leq_col].agg(
-            Average_L_EQ_dB=_laeq_agg,
-            Min_L_EQ_dB='min',
-            Max_L_EQ_dB='max',
-            Std_Dev='std',
-        ).reset_index()
-        out['Hour'] = out['Hour'].astype(int)
-        out = out.sort_values('Hour')
+        frames = _period_frames(df)
+        if isinstance(frames, tuple):
+            return frames
+        hourly = frames['hourly']
+        out = pd.DataFrame({
+            'Hour_start': hourly['Hour'].astype(int).map(lambda h: f"{h:02d}:00"),
+            'Time_basis': frames['time_basis'],
+            'LAeq_dBA': hourly['Average_L_EQ_dB'].round(2),
+            'Min_LEQ_dBA': hourly['Min_L_EQ_dB'].round(2),
+            'Max_LEQ_dBA': hourly['Max_L_EQ_dB'].round(2),
+            'SD_LEQ_dB': hourly['Std_Dev'].round(2),
+        })
 
         csv_bytes = out.to_csv(index=False).encode('utf-8')
         return send_file(
@@ -2308,154 +2361,11 @@ def export_hourly_summary_csv():
         )
 
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
-@app.route('/api/export-weekly-summary', methods=['POST'])
-def export_weekly_summary():
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-        
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
-
-        filepath = _resolve_uploaded_filepath(filepath)
-
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
-        
-        # Read data
-        df = read_input_file(filepath)
-        
-        # Generate weekly summary
-        summarizer = DataSummarizer(df)
-        excel_output = summarizer.generate_weekly_excel()
-        
-        if excel_output is None:
-            return jsonify({'error': 'Weekly summary requires time-series data'}), 400
-        
-        return send_file(excel_output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                        as_attachment=True, download_name='weekly_summary.xlsx')
-    
-    except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
-@app.route('/api/generate-advanced-charts', methods=['POST'])
-def generate_advanced_charts():
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-        
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
-
-        filepath = _resolve_uploaded_filepath(filepath)
-
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
-        
-        # Read data
-        df = read_input_file(filepath)
-        
-        # Generate advanced charts
-        chart_gen = AdvancedChartGenerator(df)
-        html_content = chart_gen.generate_all_charts_html()
-        
-        # Save to file
-        charts_filepath = os.path.join(app.config['ARTIFACTS_CHARTS_DIR'],
-                          f"charts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
-        with open(charts_filepath, 'w') as f:
-            f.write(html_content)
-
-        # Apply retention after generating charts.
-        _run_retention_cleanup(keep_paths=(filepath, charts_filepath))
-        
-        return send_file(charts_filepath, mimetype='text/html', 
-                        as_attachment=True, download_name='advanced_charts.html')
-    
-    except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
+        return _server_error(e)
 
 # ============================================================================
 # NEW ENDPOINTS: Environmental Visualization & Enhanced Metrics
 # ============================================================================
-
-@app.route('/api/environmental-metrics', methods=['POST'])
-def get_environmental_metrics():
-    """Calculate comprehensive environmental analysis metrics"""
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col')
-        
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
-        
-        filepath = _resolve_uploaded_filepath(filepath)
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found'}), 404
-        
-        # Read data
-        df = _get_cached_df(filepath)
-        
-        noise_col = _resolve_noise_column(df, noise_col)
-        if not noise_col:
-            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
-
-        # Calculate environmental metrics
-        calc = EnvironmentalMetricsCalculator(df, [noise_col])
-        metrics = calc.calculate_all_metrics(noise_col)
-        
-        return jsonify({
-            'success': True,
-            'metrics': metrics
-        })
-    
-    except Exception as e:
-        logger.error(f"[METRICS] Error: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
-
-@app.route('/api/exceedance-analysis', methods=['POST'])
-def get_exceedance_analysis():
-    """Generate exceedance analysis visualization"""
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col')
-        
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
-        
-        filepath = _resolve_uploaded_filepath(filepath)
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found'}), 404
-        
-        df = _get_cached_df(filepath)
-        
-        noise_col = _resolve_noise_column(df, noise_col)
-        if not noise_col:
-            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
-
-        # Generate exceedance chart
-        viz = EnvironmentalVisualizationEngine(df, noise_col)
-        fig = viz.generate_exceedance_analysis(noise_col)
-        
-        # Convert to JSON for browser
-        chart_json = fig.to_json()
-        
-        return jsonify({
-            'success': True,
-            'chart': json.loads(chart_json)
-        })
-    
-    except Exception as e:
-        logger.error(f"[EXCEEDANCE] Error: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
 
 @app.route('/api/temporal-heatmap', methods=['POST'])
 def get_temporal_heatmap():
@@ -2496,7 +2406,7 @@ def get_temporal_heatmap():
     
     except Exception as e:
         logger.error(f"[TEMPORAL_HEATMAP] Error: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 
 @app.route('/api/diurnal-boxplot', methods=['POST'])
@@ -2540,190 +2450,47 @@ def get_diurnal_boxplot():
 
     except Exception as e:
         logger.error(f"[DIURNAL_BOXPLOT] Error: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 
-@app.route('/api/distribution-analysis', methods=['POST'])
-def get_distribution_analysis():
-    """Generate violin plot distribution visualization"""
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col')
-        
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
-        
-        filepath = _resolve_uploaded_filepath(filepath)
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found'}), 404
-        
-        df = _get_cached_df(filepath)
-        
-        # Generate violin plot
-        noise_col = _resolve_noise_column(df, noise_col)
-        if not noise_col:
-            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
-
-        viz = EnvironmentalVisualizationEngine(df, noise_col)
-        fig = viz.generate_violin_distribution(noise_col)
-        
-        chart_json = fig.to_json()
-        
-        return jsonify({
-            'success': True,
-            'chart': json.loads(chart_json)
-        })
-    
-    except Exception as e:
-        logger.error(f"[DISTRIBUTION] Error: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
-
-@app.route('/api/compliance-dashboard', methods=['POST'])
-def get_compliance_dashboard():
-    """Generate compliance dashboard with gauge charts"""
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col')
-        
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
-        
-        filepath = _resolve_uploaded_filepath(filepath)
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found'}), 404
-        
-        df = _get_cached_df(filepath)
-        
-        # Run analysis
-        cache_entry = _get_cache_entry(filepath)
-        if cache_entry and cache_entry.get('analysis'):
-            analysis = cache_entry['analysis']
-        else:
-            analyzer = NoiseAnalyzer(df)
-            analysis = analyzer.comprehensive_analysis()
-        
-        # Generate compliance dashboard
-        noise_col = _resolve_noise_column(df, noise_col)
-        if not noise_col:
-            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
-
-        viz = EnvironmentalVisualizationEngine(df, noise_col)
-        fig = viz.generate_compliance_dashboard(noise_col=noise_col, analysis=analysis)
-        
-        chart_json = fig.to_json()
-        
-        return jsonify({
-            'success': True,
-            'chart': json.loads(chart_json)
-        })
-    
-    except Exception as e:
-        logger.error(f"[COMPLIANCE_DASHBOARD] Error: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
-
-@app.route('/api/anomaly-detection', methods=['POST'])
-def get_anomaly_detection():
-    """Generate anomaly detection visualization"""
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col')
-        threshold = data.get('threshold_std', 2.5)
-        
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
-        
-        filepath = _resolve_uploaded_filepath(filepath)
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found'}), 404
-        
-        df = _get_cached_df(filepath)
-        
-        # Generate anomaly detection
-        noise_col = _resolve_noise_column(df, noise_col)
-        if not noise_col:
-            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
-
-        viz = EnvironmentalVisualizationEngine(df, noise_col)
-        fig = viz.generate_anomaly_detection(noise_col, threshold_std=threshold)
-        
-        chart_json = fig.to_json()
-        
-        return jsonify({
-            'success': True,
-            'chart': json.loads(chart_json)
-        })
-    
-    except Exception as e:
-        logger.error(f"[ANOMALY] Error: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
-
-@app.route('/api/cumulative-distribution', methods=['POST'])
-def get_cumulative_distribution():
-    """Generate cumulative distribution function visualization"""
-    try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
-        noise_col = data.get('noise_col')
-        
-        if not filepath:
-            return jsonify({'error': 'No filepath provided'}), 400
-        
-        filepath = _resolve_uploaded_filepath(filepath)
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found'}), 404
-        
-        df = _get_cached_df(filepath)
-        
-        # Generate CDF
-        noise_col = _resolve_noise_column(df, noise_col)
-        if not noise_col:
-            return jsonify({'error': 'No usable noise column found in this dataset'}), 400
-
-        viz = EnvironmentalVisualizationEngine(df, noise_col)
-        fig = viz.generate_cumulative_distribution(noise_col)
-        
-        chart_json = fig.to_json()
-        
-        return jsonify({
-            'success': True,
-            'chart': json.loads(chart_json)
-        })
-    
-    except Exception as e:
-        logger.error(f"[CDF] Error: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+@app.route('/api/clock-options', methods=['GET'])
+def clock_options():
+    """Time zones offered for the logger clock and the report clock."""
+    return jsonify({'success': True, 'default': DEFAULT_CLOCK,
+                    'options': [{'id': k, 'label': v} for k, v in CLOCK_CHOICES.items()]})
 
 
 @app.route('/api/get-data-date-range', methods=['POST'])
 def get_data_date_range():
-    """Return the min/max timestamp of the uploaded dataset for the filtration UI."""
+    """Extent of the record in the report clock, plus what the data show about the logger clock."""
     try:
-        data = request.json
-        filepath = (data or {}).get('filepath')
+        data = request.json or {}
+        filepath = data.get('filepath')
         if not filepath:
             return jsonify({'error': 'No filepath provided'}), 400
 
         filepath = _resolve_uploaded_filepath(filepath)
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found. Upload the file again.'}), 404
 
-        df = _get_cached_df(filepath)
-        _tc = resolve_time_column(df)
+        raw = _get_cached_df(filepath)
+        _tc = resolve_time_column(raw)
         if not _tc:
             return jsonify({'error': 'No timestamp column found'}), 400
 
-        ts, _ = parse_timestamps_robust(df[_tc])
-        ts = ts.dropna()
+        raw_ts, _ = parse_timestamps_robust(raw[_tc])
+        fold = raw[FOLD_COLUMN] if FOLD_COLUMN in raw.columns else None
+        try:
+            setting = ClockSetting.from_request(data.get('clock'))
+        except ClockError as exc:
+            return jsonify({'error': str(exc)}), 400
+        detected = describe_logger_clock(raw_ts, fold, setting.source if 'Etc/' not in setting.source
+                                         and setting.source != 'UTC' else DEFAULT_CLOCK)
+
+        df, err = _filtered_or_400(raw, {'clock': data.get('clock')} if data.get('clock') else None, 'DATE-RANGE')
+        if err:
+            return err
+        ts = pd.to_datetime(df[resolve_time_column(df)], errors='coerce').dropna()
         if ts.empty:
             return jsonify({'error': 'No valid timestamps in file'}), 400
 
@@ -2732,10 +2499,12 @@ def get_data_date_range():
             'start': ts.min().isoformat(),
             'end':   ts.max().isoformat(),
             'total_rows': len(df),
+            'clock': _clock_payload(df),
+            'detected_clock': detected,
         })
 
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 
 @app.route('/api/validate-filters', methods=['POST'])
@@ -2751,7 +2520,7 @@ def validate_filters():
 
         filepath = _resolve_uploaded_filepath(filepath)
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found. Upload the file again.'}), 404
 
         df = _get_cached_df(filepath)
         total_rows = len(df)
@@ -2772,7 +2541,7 @@ def validate_filters():
         })
 
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 
 def _compute_comparison_metrics(df: pd.DataFrame, original_name: str) -> dict:
@@ -2900,8 +2669,24 @@ def _compute_comparison_metrics(df: pd.DataFrame, original_name: str) -> dict:
             'hi': round(float(within.max()) if within.size else float(arr.max()), 2),
         }
 
+    # Continuity of this record, on the same basis as the single-record analysis.
+    gap = {}
+    try:
+        if ts_col:
+            gap = gap_report_to_dict(detect_gaps(df, ts_col))
+    except Exception as exc:
+        logger.warning("[COMPARE] Gap detection failed for %s: %s", original_name, exc)
+    completeness = gap.get('completeness_exact') if not ts_valid.empty else None
+
     return {
         'name': original_name,
+        'time_basis': _time_basis(df, ts_valid if not ts_valid.empty else None),
+        'abbreviations': (zone_abbreviations(_clock_zone(df), ts_valid.min(), ts_valid.max())
+                          if not ts_valid.empty else ''),
+        'completeness_pct': (math.floor(completeness * 100) / 100) if completeness is not None else None,
+        'n_gaps': int(gap.get('gap_count') or 0),
+        'missing_seconds': float(gap.get('missing_seconds') or 0.0),
+        'n_clock_changes': len(gap.get('clock_changes') or []),
         'n_records': int(len(df)),
         'date_range': date_range,
         'n_weeks': _safe(n_weeks),
@@ -2928,17 +2713,17 @@ def _comparison_summary(datasets: list[dict]) -> dict:
     """Build a plain-language ranking + verdict for a set of compared datasets.
 
     Ranks by Lden (the day-evening-night level the WHO 53 dB guideline applies to),
-    falling back to LAeq when Lden is unavailable. Also expresses the loudest-vs-
-    quietest gap as perceived loudness (2x per +10 dB) and sound energy (10x per
-    +10 dB), and counts how many sites exceed the WHO guidelines.
+    falling back to LAeq when Lden is unavailable for any location, and counts how
+    many sites exceed the WHO guideline values. States measured facts only: no
+    perceived-loudness conversion, which is a rule of thumb rather than a measurement.
     """
     WHO_DEN, WHO_NIGHT = 53.0, 45.0
 
+    # One metric for every location: Lden when all have it, otherwise LAeq.
+    rank_key = 'lden' if datasets and all(d.get('lden') is not None for d in datasets) else 'laeq'
+
     def _rank_value(d):
-        v = d.get('lden')
-        if v is None:
-            v = d.get('laeq')
-        return v
+        return d.get(rank_key)
 
     ranked = [d for d in datasets if _rank_value(d) is not None]
     ranked.sort(key=_rank_value)  # quietest first
@@ -2950,8 +2735,6 @@ def _comparison_summary(datasets: list[dict]) -> dict:
         'quietest': None,
         'loudest': None,
         'gap_db': None,
-        'loudness_factor': None,
-        'energy_factor': None,
         'n_exceed_day': sum(1 for d in datasets if (d.get('lden') is not None and d['lden'] > WHO_DEN)),
         'n_exceed_night': sum(1 for d in datasets if (d.get('lnight') is not None and d['lnight'] > WHO_NIGHT)),
         'n_total': len(datasets),
@@ -2962,35 +2745,27 @@ def _comparison_summary(datasets: list[dict]) -> dict:
         q, l = ranked[0], ranked[-1]
         qv, lv = _rank_value(q), _rank_value(l)
         gap = round(lv - qv, 1)
+        metric = 'Lden' if rank_key == 'lden' else 'LAeq (Lden not available for every location)'
         summary['quietest'] = {'name': q['name'], 'level': round(qv, 1)}
         summary['loudest'] = {'name': l['name'], 'level': round(lv, 1)}
         summary['gap_db'] = gap
-        summary['loudness_factor'] = round(2 ** (gap / 10.0), 1)
-        summary['energy_factor'] = round(10 ** (gap / 10.0), 1)
+        summary['ranked_by'] = metric
 
-        parts = [
-            f"{q['name']} is the quietest location at {round(qv,1)} dB, and "
-            f"{l['name']} is the loudest at {round(lv,1)} dB."
-        ]
-        if gap >= 3:
-            parts.append(
-                f"That {gap} dB difference means {l['name']} sounds about "
-                f"{summary['loudness_factor']}x as loud and carries roughly "
-                f"{summary['energy_factor']}x the sound energy."
-            )
-        nd = summary['n_exceed_day']
-        if nd == 0:
-            parts.append(f"All {summary['n_total']} locations are within the WHO 2018 "
-                         f"day-evening-night guideline (Lden 53 dB).")
-        else:
-            parts.append(f"{nd} of {summary['n_total']} locations exceed the WHO 2018 "
-                         f"day-evening-night guideline (Lden 53 dB).")
-        nn = summary['n_exceed_night']
-        if nn > 0:
-            # 45 dB Lnight is a different metric over a different window, not a
-            # "stricter" version of the 53 dB Lden guideline.
-            parts.append(f"{nn} exceed the separate night-time sleep guideline "
-                         f"(Lnight 45 dB, 23:00-07:00).")
+        order = ', '.join(f"{d['name']} {round(_rank_value(d), 1)} dB(A)" for d in reversed(ranked))
+        parts = [f"Ranked by {metric}, highest first: {order}. "
+                 f"The difference between the highest and lowest is {gap} dB."]
+        nd, nn = summary['n_exceed_day'], summary['n_exceed_night']
+        parts.append(f"{nd} of {summary['n_total']} location{'s' if summary['n_total'] != 1 else ''} "
+                     f"exceed the WHO 2018 road-traffic guideline value of Lden 53 dB(A), and {nn} of "
+                     f"{summary['n_total']} the guideline value of Lnight 45 dB(A).")
+        periods = {d.get('date_range') for d in datasets}
+        if len(periods) > 1:
+            parts.append("The records cover different periods, so a difference between locations may "
+                         "also reflect differences between the periods measured.")
+        incomplete = [d['name'] for d in datasets
+                      if d.get('completeness_pct') is not None and d['completeness_pct'] < 90.0]
+        if incomplete:
+            parts.append(f"Less than 90% of readings are present for: {', '.join(incomplete)}.")
         summary['verdict'] = ' '.join(parts)
 
     return summary
@@ -3014,6 +2789,9 @@ def compare_files():
         except Exception:
             labels = []
 
+        clock = {'source': request.form.get('clock_source') or DEFAULT_CLOCK,
+                 'target': request.form.get('clock_target') or DEFAULT_CLOCK}
+
         datasets = []
         saved_paths = []
         for idx, file in enumerate(files):
@@ -3029,6 +2807,11 @@ def compare_files():
                 df = read_input_file(filepath)
                 if df.empty:
                     return jsonify({'error': f'File is empty: {file.filename}'}), 400
+                # Same clock handling as the single-record analysis: every file is
+                # read on the logger clock and reported on the chosen report clock.
+                df, err = _filtered_or_400(df, {'clock': clock}, 'COMPARE')
+                if err:
+                    return err
                 # A user-supplied label is used as given. Otherwise fall back to a
                 # positional label, never the filename: comparison output is shared
                 # with residents and regulators, and source filenames routinely
@@ -3045,7 +2828,7 @@ def compare_files():
                         'comparison_summary': _comparison_summary(datasets)})
 
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 
 @app.route('/api/compare-report', methods=['POST'])
@@ -3128,7 +2911,7 @@ def compare_report():
                 borderWidth=1, borderPadding=(10, 12, 10, 12))
             story.append(Paragraph("What the comparison shows", styles['h1']))
             story.append(Spacer(1, 0.06 * inch))
-            story.append(Paragraph(summary['verdict'], verdict_style))
+            story.append(Paragraph(escape_xml(summary['verdict']), verdict_style))
             story.append(Spacer(1, 0.2 * inch))
 
 
@@ -3140,18 +2923,30 @@ def compare_report():
             if v is None:
                 return "N/A"
             if v <= limit:
-                return f"<font color='#15803d'>Within ({_db(v)})</font>"
-            return f"<font color='#b91c1c'>Above +{round(v - limit, 1)} ({_db(v)})</font>"
+                return f"{_db(v)} (at or below {limit:g})"
+            return f"<font color='#A61B1B'>{_db(v)} (+{round(v - limit, 1)})</font>"
 
-        headers = ["Location"] + [d['name'][:20] for d in datasets]
+        def _cont(d):
+            cp = d.get('completeness_pct')
+            txt = f"{cp:.2f}%" if cp is not None else "N/A"
+            if d.get('n_gaps'):
+                txt += f"; {d['n_gaps']} interruption(s), {format_duration(d.get('missing_seconds') or 0)}"
+            if d.get('n_clock_changes'):
+                txt += "; daylight-saving change (not missing data)"
+            return txt
+
+        headers = ["Metric"] + [escape_xml(d['name'][:28]) for d in datasets]
         rows = [
             ["Monitoring period"] + [d.get('date_range', 'N/A') for d in datasets],
             ["Duration"] + [d.get('duration_label', 'N/A') for d in datasets],
-            ["Average level (LAeq)"] + [f"{_db(d.get('laeq'))} dB" for d in datasets],
-            ["Day-night (Lden) vs 53"] + [_verdict_cell(d.get('lden'), 53.0) for d in datasets],
-            ["Night (Lnight) vs 45"] + [_verdict_cell(d.get('lnight'), 45.0) for d in datasets],
-            ["Loudest moment (LAmax)"] + [f"{_db(d.get('lmax'))} dB" for d in datasets],
-            ["Quiet background (L90)"] + [f"{_db(d.get('l90'))} dB" for d in datasets],
+            ["Times"] + [escape_xml(d.get('abbreviations') or d.get('time_basis') or 'N/A') for d in datasets],
+            ["Data completeness"] + [_cont(d) for d in datasets],
+            ["LAeq, whole record, dB(A)"] + [_db(d.get('laeq')) for d in datasets],
+            ["Lden, dB(A) (WHO 53)"] + [_verdict_cell(d.get('lden'), 53.0) for d in datasets],
+            ["Lnight, dB(A) (WHO 45)"] + [_verdict_cell(d.get('lnight'), 45.0) for d in datasets],
+            ["LAmax, dB(A)"] + [_db(d.get('lmax')) for d in datasets],
+            ["L10, dB(A)"] + [_db(d.get('l10')) for d in datasets],
+            ["L90, dB(A)"] + [_db(d.get('l90')) for d in datasets],
         ]
         n_cols = len(headers)
         metric_col_w = 1.9 * inch
@@ -3179,24 +2974,26 @@ def compare_report():
         story.append(Spacer(1, 0.22 * inch))
 
         # ---- Daily pattern (diurnal) ----
-        story.append(Paragraph("Daily pattern — when is each location loudest?", styles['h1']))
+        story.append(Paragraph("Hourly LAeq by hour of day", styles['h1']))
         story.append(Paragraph(
-            "Average noise for each hour of the day, combined across all monitored days. Use it to see "
-            "when each location is quietest and loudest. Dotted lines mark the WHO day (53 dB) and "
-            "night (45 dB) guidelines.", styles['BodyText']))
+            "Energy-average level (LAeq) for each clock hour, pooled across all days of each record. "
+            "The dashed lines at 53 and 45 dB(A) are the WHO 2018 road-traffic Lden and Lnight guideline "
+            "values, drawn for reference only: those guidelines apply to Lden and Lnight, not to single "
+            "hours.", styles['BodyText']))
         story.append(Spacer(1, 0.1 * inch))
         hours = list(range(24))
-        colors_list = ['#1e3a5f', '#e74c3c', '#16a34a', '#f39c12', '#9b59b6', '#0ea5e9']
+        colors_list = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#E69F00', '#56B4E9']  # Okabe–Ito
         diurnal_fig = go.Figure()
         for i, ds in enumerate(datasets):
             y = [v if v is not None else None for v in ds.get('diurnal', [None] * 24)]
             diurnal_fig.add_trace(go.Scatter(
                 x=hours, y=y, mode='lines+markers', name=ds['name'][:24],
-                line=dict(color=colors_list[i % len(colors_list)], width=2.5), connectgaps=False))
-        diurnal_fig.add_hline(y=45, line_dash='dash', line_color='#d97706')
-        diurnal_fig.add_hline(y=53, line_dash='dot', line_color='#c0392b')
+                line=dict(color=colors_list[i % len(colors_list)], width=2), connectgaps=False))
+        diurnal_fig.add_hline(y=45, line_dash='dash', line_color='#6B7280', line_width=1)
+        diurnal_fig.add_hline(y=53, line_dash='dash', line_color='#6B7280', line_width=1)
+        _abbr = '/'.join(sorted({a for d in datasets for a in str(d.get('abbreviations') or '').split('/') if a})) or 'local time'
         diurnal_fig.update_layout(
-            xaxis_title='Hour of day', yaxis_title='Average noise dB(A)',
+            xaxis_title=f'Hour of day (start of hour, {_abbr})', yaxis_title='Sound level, LAeq (dB(A))',
             xaxis=dict(tickmode='array', tickvals=list(range(0, 24, 2)),
                        ticktext=[f'{h:02d}:00' for h in range(0, 24, 2)], gridcolor='rgba(0,0,0,0.06)'),
             yaxis=dict(gridcolor='rgba(0,0,0,0.06)'),
@@ -3206,13 +3003,16 @@ def compare_report():
         story.append(Spacer(1, 0.2 * inch))
 
         # ---- Methodology & disclaimer ----
-        story.append(Paragraph("How to read this report", styles['h1']))
+        story.append(Paragraph("Method", styles['h1']))
         story.append(Paragraph(
-            "Noise is measured in A-weighted decibels (dB), matched to human hearing, and averaged using "
-            "energy averaging (LAeq) — the standard method. <b>Lden</b> is the day-evening-night level "
-            "(evening and night count for more, reflecting greater impact); <b>Lnight</b> is the night-only "
-            "level. Every +10 dB sounds about twice as loud and carries ten times the sound energy. "
-            "Guideline values are from the WHO Environmental Noise Guidelines (2018).",
+            "Levels are A-weighted, in dB(A). LAeq is the energy average of the LEQ readings. "
+            "<b>Lden</b> is the 24-hour level with +5 dB added to evening (19:00–23:00) and +10 dB to night "
+            "(23:00–07:00) readings; <b>Lnight</b> is the energy average over 23:00–07:00 (EU Directive "
+            "2002/49/EC, Annex I). L10 and L90 are the levels exceeded for 10% and 90% of readings. "
+            "Guideline values: WHO Environmental Noise Guidelines for the European Region (2018), road "
+            "traffic. Every record is analysed with the same method as the single-record report; data "
+            "completeness is the share of expected readings present, with daylight-saving clock changes "
+            "not counted as missing.",
             styles['BodyText']))
         story.append(Spacer(1, 0.08 * inch))
         story.append(Paragraph(
@@ -3234,7 +3034,7 @@ def compare_report():
             canvas.setFillColorRGB(0.5, 0.5, 0.5)
             canvas.drawCentredString(
                 doc.width / 2 + doc.leftMargin, 0.13 * inch,
-                "Developed by Chandra Prakash Choudhary | Graduate Student, Johns Hopkins University"
+                "Developed by Chandra Prakash Choudhary | PI: Dr. Ana María Rule, Associate Professor — Johns Hopkins University"
             )
             canvas.setStrokeColorRGB(0.239, 0.353, 0.502)
             canvas.setLineWidth(1.5)
@@ -3247,7 +3047,7 @@ def compare_report():
         return send_file(report_path, as_attachment=True, download_name=report_filename, mimetype='application/pdf')
 
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        return _server_error(e)
 
 
 @app.route('/api/progress/<job_id>', methods=['GET'])

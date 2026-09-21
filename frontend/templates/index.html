@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Noise Analysis Platform</title>
+    <link rel="icon" href="data:,">
     <!-- Pinned. "plotly-latest" is an alias frozen at v1.58.5 (July 2021) and is
          never updated again, so the browser was rendering with a five-year-old
          library while the server generated PDF figures with Plotly 6.x. -->
@@ -43,10 +44,12 @@
                     Maryland COMAR 26.02.03. Files are processed on the server and are not retained after the session.</p>
                 </div>
 
+                <div class="upload-layout">
                 <div class="upload-card">
                     <div class="upload-zone" id="dropzone">
                         <h3>Drop logger files here, or click to select</h3>
                         <p>CSV, XLSX, XLS, Parquet or WLG. Select several files to merge consecutive deployments into one record.</p>
+                        <span class="btn btn-primary upload-button">Select files</span>
                         <p class="upload-hint">Tested with NSRT_W mk4 exports. For records over about 500,000 rows, Parquet uploads at roughly half the size of XLSX with identical results.</p>
                         <input type="file" id="fileInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.wlg" multiple hidden>
                     </div>
@@ -66,6 +69,23 @@
                     </div>
 
                     <div id="error-message" class="alert alert-error" style="display: none;"></div>
+                </div>
+
+                <aside class="panel method-panel">
+                    <h3 class="panel-title">Method</h3>
+                    <ol class="method-steps">
+                        <li><strong>Upload</strong>One logger export, or several consecutive deployments to merge.</li>
+                        <li><strong>Analysis period</strong>Optionally restrict dates or exclude invalid windows.</li>
+                        <li><strong>Results</strong>Period levels, compliance matrix, figures, PDF/Word report and data exports.</li>
+                    </ol>
+                    <dl class="metric-defs">
+                        <dt>LAeq</dt><dd>Energy-average A-weighted level over a period</dd>
+                        <dt>Lden</dt><dd>24 h level, +5 dB evening and +10 dB night</dd>
+                        <dt>Lnight</dt><dd>LAeq over 23:00–07:00</dd>
+                        <dt>Ldn</dt><dd>24 h level, +10 dB over 22:00–07:00</dd>
+                        <dt>L10, L90</dt><dd>Levels exceeded 10% and 90% of the time</dd>
+                    </dl>
+                </aside>
                 </div>
             </div>
         </section>
@@ -114,6 +134,22 @@
                     <div class="filter-info-bar" id="filterInfoBar" style="display:none;">
                         <span id="filterInfoText"></span>
                         <span class="filter-info-rows" id="filterInfoRows"></span>
+                    </div>
+
+                    <div class="filter-group">
+                        <h3 class="filter-group-title">Time zone</h3>
+                        <p class="filter-desc">Every period (day, evening, night, hourly and daily values) is taken on the report clock. Readings are converted from the logger clock through UTC using the official daylight-saving dates.</p>
+                        <div class="filter-date-row">
+                            <div class="filter-field">
+                                <label for="clock-source">Logger clock was set to</label>
+                                <select id="clock-source" class="filter-input" onchange="onClockChange()"></select>
+                            </div>
+                            <div class="filter-field">
+                                <label for="clock-target">Report results in</label>
+                                <select id="clock-target" class="filter-input" onchange="onClockChange()"></select>
+                            </div>
+                        </div>
+                        <p class="clock-evidence" id="clockEvidence"></p>
                     </div>
 
                     <div class="filter-group">
@@ -183,10 +219,14 @@
                         </div>
                         <span class="device-id-hint" id="envHint">Outdoor: WHO indoor bedroom values are not evaluated.</span>
                     </div>
+                    <div class="device-env-inner">
+                        <span class="device-id-label">Times</span>
+                        <span class="time-basis" id="timeBasisText"></span>
+                    </div>
                 </div>
 
                 <div id="filterActiveBanner" class="notice notice-info" style="display:none;">
-                    <strong>Filtered record.</strong>
+                    <strong>Analysis settings applied.</strong>
                     <span id="filterActiveText"></span>
                 </div>
 
@@ -290,8 +330,7 @@
                             </div>
                             <div id="timeSeriesChart" class="chart-box" style="min-height: 420px;"></div>
                             <figcaption class="chart-explainer">
-                                Energy-average level (LAeq) for each calendar day, and for the night-time readings of that
-                                day (22:00–07:00). The 53 and 45 dB(A) lines are reference values only: the WHO guidelines
+                                Energy-average level (LAeq) for each calendar day (00:00–24:00), and for the night beginning on the evening of that date (22:00 to 07:00 the next morning). Hollow markers are days or nights with less than 99.5% of the period measured; hover for coverage. The 53 and 45 dB(A) lines are reference values only: the WHO guidelines
                                 they correspond to are evaluated on Lden and Lnight in the Compliance matrix.
                             </figcaption>
                         </figure>
@@ -369,6 +408,20 @@
                     <p>Two to six records, one per location, evaluated with the same method and shown side by side.</p>
                 </div>
 
+                <div class="panel compare-clock">
+                    <div class="filter-date-row">
+                        <div class="filter-field">
+                            <label for="cmp-clock-source">Logger clocks were set to</label>
+                            <select id="cmp-clock-source" class="filter-input"></select>
+                        </div>
+                        <div class="filter-field">
+                            <label for="cmp-clock-target">Report results in</label>
+                            <select id="cmp-clock-target" class="filter-input"></select>
+                        </div>
+                    </div>
+                    <p class="section-note">Applied to every location, as in single-record analysis. Readings are converted through UTC using the official daylight-saving dates.</p>
+                </div>
+
                 <div class="compare-drop-zone" id="compareDropzone">
                     <h3>Drop two or more files here, or click to select</h3>
                     <p>CSV, XLSX, XLS, Parquet or WLG. Each file is treated as one location.</p>
@@ -386,6 +439,8 @@
                         <button class="btn btn-primary" id="compareAnalyzeBtn" onclick="runComparison()">Compare</button>
                     </div>
                 </div>
+
+                <div id="compareError" class="alert alert-error" role="alert" style="display:none;"></div>
 
                 <div id="compareLoading" class="loading-container" style="display:none;">
                     <div class="loading-spinner"></div>

@@ -5,22 +5,32 @@ Forensic Gap Detector for environmental noise datasets.
 Calculates the modal logging interval, then flags every consecutive pair of
 rows whose time delta exceeds 2× that interval as a data gap.
 
-Gap categories (as per MODULE 6 spec):
-  Minor  — gap < 15 minutes  → "Probable Device Restart / Calibration"
-  Major  — gap ≥ 15 minutes  → "Probable Power Supply Failure / System Crash"
+Gap categories: Minor (< 15 minutes without readings) and Major (≥ 15 minutes).
+The cause of a gap is not stated: the record shows only that readings are absent.
+
+Daylight-saving clock changes are not gaps. Loggers that follow local wall-clock
+time jump from 01:59:59 to 03:00:00 when daylight saving begins; no reading is
+lost, so the jump is reported separately and excluded from missing time and
+completeness.
 """
 from __future__ import annotations
 
 import logging
 import math
+import os
 import pandas as pd
 from dataclasses import dataclass, field
 
 from analysis.timestamp_utils import parse_timestamps_robust
+from analysis.clock import FOLD_COLUMN, ordering_key
 
 logger = logging.getLogger(__name__)
 
 MINOR_GAP_THRESHOLD_MIN: float = 15.0   # minutes below which a gap is "Minor"
+
+# Time zone of the logger clocks, used only to recognise daylight-saving jumps.
+# The study loggers are in Maryland (US Eastern) and follow wall-clock time.
+LOGGER_TIMEZONE: str = os.environ.get('LOGGER_TIMEZONE', 'America/New_York')
 
 
 def _warn_if_dropped(before: int, after: int, where: str) -> None:
@@ -54,8 +64,21 @@ class DataGap:
 
 
 @dataclass
+class ClockChange:
+    before: pd.Timestamp   # last reading before the jump (wall clock)
+    after: pd.Timestamp    # first reading after the jump (wall clock)
+    shift_seconds: float   # wall-clock advance beyond real elapsed time (3600 for DST)
+    position: int = -1     # position of ``after`` in the series searched
+    elapsed_seconds: float = 0.0  # real time between the two readings
+
+
+@dataclass
 class GapReport:
     gaps: list[DataGap] = field(default_factory=list)
+    clock_changes: list[ClockChange] = field(default_factory=list)
+    excluded: list = field(default_factory=list)   # (before, after, step_seconds)
+    expected_rows: int = 0                          # readings expected over the measured span
+    completeness_exact: float = 100.0               # unrounded; display via floor_pct
     total_rows: int = 0
     actual_span_seconds: float = 0.0
     missing_seconds: float = 0.0
@@ -78,7 +101,102 @@ def _modal_interval_seconds(ts: pd.Series) -> float:
     return float(mode.iloc[0]) if not mode.empty else float(positives.median())
 
 
-def data_completeness_pct(ts: pd.Series, actual_count: int | None = None) -> float | None:
+def _is_nonexistent_local(t: pd.Timestamp, tz: str) -> bool:
+    """True when ``t`` falls in the hour skipped when daylight saving begins."""
+    try:
+        return pd.isna(pd.Timestamp(t).tz_localize(tz, nonexistent='NaT', ambiguous=False))
+    except Exception:
+        return False
+
+
+def find_clock_changes(ts: pd.Series, interval_sec: float | None = None,
+                       tz: str = LOGGER_TIMEZONE) -> list[ClockChange]:
+    """Forward clock jumps caused by daylight saving, in a wall-clock series.
+
+    For every step longer than two logging intervals, the real elapsed time is
+    taken through UTC in zone ``tz``. When the wall clock advanced more than the
+    real time did, the difference (one hour for daylight saving) is a clock
+    change, not missing data. Any real outage in the same step is kept in
+    ``elapsed_seconds`` so it is still reported as a gap.
+
+    Parameters
+    ----------
+    ts : pd.Series
+        Naive wall-clock timestamps in elapsed-time order (wall time itself,
+        except that a repeated November hour steps backwards).
+    interval_sec : float, optional
+        Logging interval (s); the modal interval when omitted.
+    tz : str
+        IANA zone of the timestamps.
+    """
+    ts = pd.to_datetime(ts, errors='coerce').dropna().reset_index(drop=True)
+    if len(ts) < 2:
+        return []
+    interval = interval_sec or _modal_interval_seconds(ts)
+    deltas = ts.diff().dt.total_seconds()
+    cand = deltas[deltas > max(2.0 * interval, 2.0)]
+    if cand.empty:
+        return []
+    before = ts.iloc[cand.index - 1].reset_index(drop=True)
+    after = ts.iloc[cand.index].reset_index(drop=True)
+    try:
+        b_utc = before.dt.tz_localize(tz, ambiguous=False, nonexistent='shift_forward')
+        a_utc = after.dt.tz_localize(tz, ambiguous=False, nonexistent='shift_forward')
+    except Exception:
+        return []
+    elapsed = (a_utc - b_utc).dt.total_seconds().to_numpy()
+    out = []
+    for k, (idx, d) in enumerate(cand.items()):
+        shift = float(d - elapsed[k])
+        if shift >= 3600.0 - interval:
+            out.append(ClockChange(before=before.iloc[k], after=after.iloc[k], shift_seconds=shift,
+                                   position=int(idx), elapsed_seconds=float(elapsed[k])))
+    return out
+
+
+def _dst_transitions(start: pd.Timestamp, end: pd.Timestamp, tz: str) -> list[pd.Timestamp]:
+    """Local wall times at which ``tz`` changes UTC offset within [start, end]."""
+    probes = pd.date_range(start.floor('h'), end.ceil('h'), freq='h')
+    if len(probes) < 2:
+        return []
+    offsets = probes.tz_localize(tz, nonexistent='shift_forward', ambiguous=False).map(lambda t: t.utcoffset())
+    return [probes[i] for i in range(1, len(probes)) if offsets[i] != offsets[i - 1]]
+
+
+def describe_logger_clock(ts: pd.Series, fold: pd.Series | None = None,
+                          tz: str = LOGGER_TIMEZONE) -> dict:
+    """What the record itself shows about the logger clock.
+
+    ``follows_dst`` is True when the record jumps or repeats an hour exactly at a
+    daylight-saving change of ``tz``, False when it spans such a change without
+    doing so, and None when it does not span one (the data cannot tell).
+    """
+    ts = pd.to_datetime(ts, errors='coerce').dropna()
+    if len(ts) < 2:
+        return {'follows_dst': None, 'evidence': ''}
+    key = ordering_key(ts, fold.loc[ts.index] if fold is not None else None).sort_values(kind='mergesort')
+    wall = ts.loc[key.index].reset_index(drop=True)
+    jumps = find_clock_changes(wall, None, tz)
+    repeated = bool(fold is not None and fold.any())
+    if jumps or repeated:
+        parts = [f"the clock jumps from {c.before:%H:%M:%S} to {c.after:%H:%M:%S} on {c.before:%d %b %Y}"
+                 for c in jumps]
+        if repeated:
+            first = ts[fold.loc[ts.index].astype(bool)].min()
+            parts.append(f"01:00–01:59 is recorded twice on {first:%d %b %Y}")
+        return {'follows_dst': True,
+                'evidence': 'In this record ' + '; '.join(parts) + ', so the logger clock follows daylight saving time.'}
+    changes = _dst_transitions(ts.min(), ts.max(), tz)
+    if changes:
+        return {'follows_dst': False,
+                'evidence': (f"This record spans the daylight-saving change on {changes[0]:%d %b %Y} "
+                             f"without a clock jump, so the logger clock does not follow daylight saving time.")}
+    return {'follows_dst': None,
+            'evidence': 'This record does not span a daylight-saving change, so the data cannot show whether the logger clock follows it.'}
+
+
+def data_completeness_pct(ts: pd.Series, actual_count: int | None = None,
+                          fold: pd.Series | None = None, tz: str | None = None) -> float | None:
     """Interval-aware data completeness (%) — robust to non-1 Hz logging.
 
     ``expected = span / modal_interval + 1``, so a logger sampling every 2 s
@@ -98,43 +216,68 @@ def data_completeness_pct(ts: pd.Series, actual_count: int | None = None) -> flo
     float | None
         Completeness percentage capped at 100, or None when undeterminable.
     """
-    ts = pd.to_datetime(ts, errors='coerce').dropna().sort_values()
-    if len(ts) < 2:
+    ts = pd.to_datetime(ts, errors='coerce')
+    key_all = ordering_key(ts, fold)
+    order = key_all.dropna().sort_values(kind='mergesort').index
+    key = key_all.loc[order]
+    if len(key) < 2:
         return None
-    interval = _modal_interval_seconds(ts)
-    span = (ts.iloc[-1] - ts.iloc[0]).total_seconds()
+    interval = _modal_interval_seconds(key)
+    span = (key.iloc[-1] - key.iloc[0]).total_seconds()
     if span <= 0 or interval <= 0:
         return None
+    wall = ts.loc[order].reset_index(drop=True)
+    span -= sum(c.shift_seconds for c in find_clock_changes(wall, interval, tz or LOGGER_TIMEZONE))
     expected = span / interval + 1.0
     actual = float(actual_count) if actual_count is not None else float(len(ts))
-    return round(min(100.0, 100.0 * actual / max(1.0, expected)), 1)
+    # Unrounded: rounding here turned 99.99% into "100.0" and the summary then
+    # declared a record with real gaps "complete". Callers floor for display.
+    return min(100.0, 100.0 * actual / max(1.0, expected))
 
 
-def _fmt_duration(seconds: float) -> str:
-    """Human-readable duration string."""
-    if seconds < 60:
-        return f"{int(seconds)} second{'s' if seconds != 1 else ''}"
-    if seconds < 3600:
-        m = round(seconds / 60)
-        return f"{m} minute{'s' if m != 1 else ''}"
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    return f"{h} hour{'s' if h != 1 else ''}" + (f" {m} min" if m else "")
+def format_duration(seconds: float) -> str:
+    """Exact duration, e.g. '1 min 31 s', '2 h 5 min', '45 s'."""
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h} h {m} min" if m else f"{h} h"
+    if m:
+        return f"{m} min {sec} s" if sec else f"{m} min"
+    return f"{sec} s"
+
+
+def floor_pct(value: float | None, decimals: int = 1) -> float | None:
+    """Floor a percentage for display so missing data never rounds up to 100%."""
+    if value is None:
+        return None
+    f = 10 ** decimals
+    return math.floor(float(value) * f) / f
 
 
 # ---------------------------------------------------------------------------
 # Core detection
 # ---------------------------------------------------------------------------
 
-def detect_gaps(df: pd.DataFrame, time_col: str) -> GapReport:
+def detect_gaps(df: pd.DataFrame, time_col: str, tz: str | None = None) -> GapReport:
     """
-    Analyse a (sorted, deduplicated) dataframe for temporal gaps.
-    Returns a GapReport with all gaps and uptime statistics.
+    Analyse a dataframe for temporal gaps.
+    Returns a GapReport with all gaps, clock changes and uptime statistics.
+
+    ``tz`` is the zone the timestamps are expressed in; by default the report
+    clock recorded in ``df.attrs['clock']``.
     """
     report = GapReport()
+    tz = tz or (df.attrs.get('clock') or {}).get('target') or LOGGER_TIMEZONE
 
-    ts = parse_timestamps_robust(df[time_col])[0].dropna()
-    ts = ts.sort_values().reset_index(drop=True)
+    # Sort on the repeated-hour-aware key so deltas are real elapsed time even
+    # across the hour the clock repeats when daylight saving ends.
+    fold = df[FOLD_COLUMN] if FOLD_COLUMN in df.columns else None
+    wall_all = parse_timestamps_robust(df[time_col])[0]
+    key_all = ordering_key(wall_all, fold)
+    order = key_all.dropna().sort_values(kind='mergesort').index
+    ts = key_all.loc[order].reset_index(drop=True)      # elapsed-time order
+    wall = wall_all.loc[order].reset_index(drop=True)   # wall-clock labels
 
     report.total_rows = len(ts)
     if len(ts) < 2:
@@ -153,6 +296,27 @@ def detect_gaps(df: pd.DataFrame, time_col: str) -> GapReport:
     # Vectorised gap detection — avoids a Python loop over potentially millions of rows.
     deltas = ts.diff().dt.total_seconds()          # NaN at position 0
     gap_mask = deltas > gap_threshold_sec
+
+    # Daylight-saving jumps are clock changes, not missing readings.
+    report.clock_changes = find_clock_changes(wall, interval_sec, tz)
+    if report.clock_changes:
+        # Measure these steps in real elapsed time: the clock change is removed,
+        # any genuine outage in the same step remains a gap.
+        for c in report.clock_changes:
+            deltas.iloc[c.position] = c.elapsed_seconds
+        gap_mask = deltas > gap_threshold_sec
+        span_sec -= sum(c.shift_seconds for c in report.clock_changes)
+    # Steps that fall inside a window the analyst excluded are exclusions, not
+    # data loss: they are listed separately and left out of missing time and
+    # completeness (the excluded time is removed from the expected span).
+    report.excluded = []
+    for es, ee in (df.attrs.get('exclusions') or []):
+        tol = pd.Timedelta(seconds=interval_sec)
+        inside = gap_mask & (wall.shift(1) >= es - tol) & (wall <= ee + tol) & (wall.shift(1) < ee) & (wall > es)
+        for idx in inside[inside].index:
+            gap_mask.iloc[idx] = False
+            report.excluded.append((pd.Timestamp(es), pd.Timestamp(ee), float(deltas.iloc[idx])))
+            span_sec -= max(0.0, float(deltas.iloc[idx]) - interval_sec)
     gap_indices = gap_mask[gap_mask].index.tolist()
 
     missing_total: float = float(
@@ -162,17 +326,13 @@ def detect_gaps(df: pd.DataFrame, time_col: str) -> GapReport:
     gaps: list[DataGap] = []
     for idx in gap_indices:
         delta_sec = float(deltas.iloc[idx])
-        dur_min = delta_sec / 60.0
-        if dur_min < MINOR_GAP_THRESHOLD_MIN:
-            category = "Minor"
-            reason = "Probable Device Restart / Calibration"
-        else:
-            category = "Major"
-            reason = "Probable Power Supply Failure / System Crash"
+        dur_min = (delta_sec - interval_sec) / 60.0
+        category = "Minor" if dur_min < MINOR_GAP_THRESHOLD_MIN else "Major"
+        reason = ""
 
         gaps.append(DataGap(
-            gap_start=ts.iloc[idx - 1],
-            gap_end=ts.iloc[idx],
+            gap_start=wall.iloc[idx - 1],
+            gap_end=wall.iloc[idx],
             duration_seconds=delta_sec,
             category=category,
             reason=reason,
@@ -183,8 +343,10 @@ def detect_gaps(df: pd.DataFrame, time_col: str) -> GapReport:
     report.continuous = len(gaps) == 0
 
     # Uptime = fraction of the expected row-count that is actually present
-    expected_rows = max(int(span_sec / interval_sec) + 1, report.total_rows)
-    report.uptime_pct = round(min(100.0, (report.total_rows / expected_rows) * 100.0), 1)
+    expected_rows = max(int(round(span_sec / interval_sec)) + 1, report.total_rows)
+    report.expected_rows = expected_rows
+    report.completeness_exact = min(100.0, (report.total_rows / expected_rows) * 100.0)
+    report.uptime_pct = floor_pct(report.completeness_exact, 2)
 
     return report
 
@@ -193,24 +355,45 @@ def gap_report_to_dict(report: GapReport) -> dict:
     """Serialise GapReport to a JSON-safe dict for the API response."""
     gaps_list = []
     for g in report.gaps:
+        # Time without readings = interval between the readings either side,
+        # less one logging interval (the next reading was due one interval on).
+        missing = max(0.0, g.duration_seconds - report.logging_interval_seconds)
         label = (
-            f"Gap Detected: {g.gap_start.strftime('%Y-%m-%d %H:%M:%S')} to "
-            f"{g.gap_end.strftime('%H:%M:%S')} "
-            f"({_fmt_duration(g.duration_seconds)}) — {g.reason}."
+            f"No readings between {g.gap_start.strftime('%Y-%m-%d %H:%M:%S')} and "
+            f"{g.gap_end.strftime('%Y-%m-%d %H:%M:%S')} ({format_duration(missing)})."
         )
         gaps_list.append({
             "start":            g.gap_start.strftime('%Y-%m-%d %H:%M:%S'),
             "end":              g.gap_end.strftime('%Y-%m-%d %H:%M:%S'),
             "duration_seconds": round(g.duration_seconds, 1),
-            "duration_human":   _fmt_duration(g.duration_seconds),
+            "missing_seconds":  round(missing, 1),
+            "duration_human":   format_duration(missing),
             "category":         g.category,
             "reason":           g.reason,
             "label":            label,
         })
 
+    clock_list = [{
+        "before": c.before.strftime('%Y-%m-%d %H:%M:%S'),
+        "after":  c.after.strftime('%Y-%m-%d %H:%M:%S'),
+        "label":  (f"Daylight saving time began between {c.before.strftime('%Y-%m-%d %H:%M:%S')} and "
+                   f"{c.after.strftime('%H:%M:%S')}: clocks moved forward one hour. The skipped hour "
+                   f"is not counted as missing data."),
+    } for c in report.clock_changes]
+
+    excluded_list = [{
+        "start": a.strftime('%Y-%m-%d %H:%M:%S'),
+        "end": b.strftime('%Y-%m-%d %H:%M:%S'),
+        "label": (f"Excluded by the analyst: {a.strftime('%Y-%m-%d %H:%M:%S')} to "
+                  f"{b.strftime('%Y-%m-%d %H:%M:%S')}, as entered "
+                  f"({format_duration(max(0.0, d - report.logging_interval_seconds))} of readings removed)."),
+    } for a, b, d in report.excluded]
+
     return {
         "continuous":               report.continuous,
         "gaps":                     gaps_list,
+        "clock_changes":            clock_list,
+        "excluded":                 excluded_list,
         "gap_count":                len(report.gaps),
         "minor_gap_count":          sum(1 for g in report.gaps if g.category == "Minor"),
         "major_gap_count":          sum(1 for g in report.gaps if g.category == "Major"),
@@ -218,6 +401,8 @@ def gap_report_to_dict(report: GapReport) -> dict:
         "actual_span_seconds":      round(report.actual_span_seconds, 1),
         "missing_seconds":          round(report.missing_seconds, 1),
         "uptime_pct":               report.uptime_pct,
+        "completeness_exact":       report.completeness_exact,
+        "expected_rows":            report.expected_rows,
         "logging_interval_seconds": round(report.logging_interval_seconds, 2),
     }
 
@@ -287,6 +472,19 @@ def _canonicalize(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _sort_dedupe(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
+    """Chronological sort and removal of rows recorded twice (overlapping files).
+
+    A row is a duplicate only when both its timestamp and its daylight-saving
+    pass match another row, so the second pass of a repeated hour is kept.
+    """
+    fold = df[FOLD_COLUMN] if FOLD_COLUMN in df.columns else None
+    key = ordering_key(df[time_col], fold)
+    df = df.loc[key.sort_values(kind='mergesort').index]
+    subset = [time_col] + ([FOLD_COLUMN] if fold is not None else [])
+    return df.drop_duplicates(subset=subset).reset_index(drop=True)
+
+
 def merge_dataframes(dfs: list[pd.DataFrame]) -> tuple[pd.DataFrame, str | None]:
     """
     Merge multiple dataframes into one master dataframe:
@@ -309,7 +507,7 @@ def merge_dataframes(dfs: list[pd.DataFrame]) -> tuple[pd.DataFrame, str | None]
             df[time_col] = parse_timestamps_robust(df[time_col])[0]
             df = df.dropna(subset=[time_col])
             _before = len(df)
-            df = df.sort_values(time_col).drop_duplicates(subset=[time_col]).reset_index(drop=True)
+            df = _sort_dedupe(df, time_col)
             _warn_if_dropped(_before, len(df), "single-file")
             return df, time_col
         return dfs[0].copy(), None
@@ -327,8 +525,10 @@ def merge_dataframes(dfs: list[pd.DataFrame]) -> tuple[pd.DataFrame, str | None]
     if time_col:
         merged[time_col] = parse_timestamps_robust(merged[time_col])[0]
         merged = merged.dropna(subset=[time_col])
+        if FOLD_COLUMN in merged.columns:
+            merged[FOLD_COLUMN] = merged[FOLD_COLUMN].fillna(0).astype('int8')
         _before = len(merged)
-        merged = merged.sort_values(time_col).drop_duplicates(subset=[time_col]).reset_index(drop=True)
+        merged = _sort_dedupe(merged, time_col)
         _warn_if_dropped(_before, len(merged), "merge")
 
     # Rename canonical columns back to original names so downstream code can find them

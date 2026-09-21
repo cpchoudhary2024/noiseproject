@@ -17,9 +17,15 @@ from analysis.chart_generator import AdvancedChartGenerator
 from analysis.acoustics import (compute_ldn_lden, energetic_mean_db,
                                 exceedance_levels_db, energy_concentration,
                                 time_above_level_by_period, time_above_level_in_window,
-                                nightly_lnight, LDEN_DEFAULT)
-from analysis.gap_detector import detect_gaps, gap_report_to_dict, data_completeness_pct, _modal_interval_seconds
+                                LDEN_DEFAULT)
+from analysis.gap_detector import (detect_gaps, gap_report_to_dict, data_completeness_pct,
+                                   _modal_interval_seconds, find_clock_changes, floor_pct,
+                                   format_duration)
 from analysis.docx_from_story import render_story_to_docx, PageTrackingDocTemplate
+from analysis.periods import (daily_summary, hourly_summary, nightly_values, WHO_NIGHT, COMAR_NIGHT,
+                              COMPLETE_COVERAGE_PCT)
+from analysis.clock import (DEFAULT_CLOCK, FOLD_COLUMN, describe_time_basis, ordering_key,
+                            zone_abbreviations)
 from analysis.compliance_matrix import (evaluate_compliance,
                                         MD_RESIDENTIAL_DAY, MD_RESIDENTIAL_NIGHT,
                                         WHO_ROAD_LDEN, WHO_ROAD_LNIGHT)
@@ -231,6 +237,22 @@ class TimeSeriesBinning(NamedTuple):
     window_label: str = ''
 
 
+def _days_text(days: float) -> str:
+    """'7 days', '3.5 days', '1 day' — one decimal unless the span is whole days."""
+    d = float(days)
+    if abs(d - round(d)) < 0.05:
+        n = int(round(d))
+        return f"{n} day{'s' if n != 1 else ''}"
+    return f"{d:.1f} days"
+
+
+def _excluded_text(x: dict) -> str:
+    """'13 May 2026 09:59:59 to 11:30:01' for an excluded-window entry."""
+    a, b = pd.Timestamp(x['start']), pd.Timestamp(x['end'])
+    return f"{a:%d %b %Y %H:%M:%S} to {b:%d %b %Y %H:%M:%S}" if a.date() != b.date() else \
+        f"{a:%d %b %Y %H:%M:%S} to {b:%H:%M:%S}"
+
+
 def deidentify_label(value: str, fallback: str) -> tuple[str, bool]:
     """Return ``(label, was_redacted)`` for a user-supplied identifier.
 
@@ -324,7 +346,9 @@ class ReportGeneratorV2:
         else:
             self.device_id = raw_device_id
             self.source_files = raw_sources
-        self.merge_gap_report = merge_gap_report  # pre-computed gap dict from the merge step
+        # Accepted for request compatibility only: continuity is always recomputed
+        # from the analysed (filtered, clock-converted) record, see _gap_info().
+        self.merge_gap_report = merge_gap_report
         self.custom_section_heading = str(custom_section_heading or '').strip()
         self.custom_section_body = str(custom_section_body or '').strip()
         self.environment = str(environment or 'outdoor').strip().lower()
@@ -377,7 +401,7 @@ class ReportGeneratorV2:
         end_date: str = '',
         duration_label: str = '',
         data_completeness_pct: float | None = None,
-        n_days: int = 0,
+        n_days: float = 0,
         n_gaps: int = 0,
         total_gap_hours: float | None = None,
         environment: str = 'outdoor',
@@ -386,6 +410,9 @@ class ReportGeneratorV2:
         lamax: float | None = None,
         logging_interval_s: float | None = None,
         energy_dominance: dict | None = None,
+        time_basis: str = '',
+        clock_change_dates: list[str] | None = None,
+        excluded: list[str] | None = None,
     ) -> str:
         """
         Returns a structured multi-paragraph plain-English summary.
@@ -455,42 +482,50 @@ class ReportGeneratorV2:
         elif duration_label:
             date_ctx = f" over {duration_label}"
 
-        day_word = (f"{n_days} day{'s' if n_days != 1 else ''}" if n_days > 0
+        day_word = (_days_text(n_days) if n_days and n_days > 0
                     else duration_label or "the measurement period")
 
-        # Completeness must never round UP to "100%". A record that is 99.6%
-        # complete contains a real outage (1 hour, in one dataset here); printing
-        # "100%" erases it and, combined with the word "continuous", asserts an
-        # unbroken record that does not exist.
+        # One statement about continuity, never two that disagree: either the
+        # record has no gaps, or its completeness and interruptions are stated.
+        # Completeness is floored so missing readings never display as 100%.
         completeness_note = ""
         is_continuous = True
+        missing_s = float(total_gap_hours or 0.0) * 3600.0
+        cp = None
         if data_completeness_pct is not None:
             try:
-                cp = float(data_completeness_pct)
-                # Floor to 1 dp so 99.96 -> "99.9%", never "100%".
-                cp_shown = math.floor(cp * 10.0) / 10.0
-                if cp_shown >= 100.0:
-                    completeness_note = " The record is complete, with no detected gaps."
-                else:
-                    is_continuous = False
-                    severity = ("Averages may under- or over-estimate true exposure"
-                                if cp_shown < 90.0 else
-                                "The affected periods are excluded from all averages")
-                    completeness_note = (
-                        f" Data completeness was {cp_shown:.1f}%, so the record contains gaps. "
-                        f"{severity}."
-                    )
-            except Exception:
-                pass
-
+                cp = math.floor(float(data_completeness_pct) * 100.0) / 100.0
+            except (TypeError, ValueError):
+                cp = None
         if n_gaps:
             is_continuous = False
             _ng = int(n_gaps)
-            gap_detail = (f" {_ng} interruption was detected" if _ng == 1
-                          else f" {_ng} interruptions were detected")
-            if total_gap_hours:
-                gap_detail += f", totalling {float(total_gap_hours):.1f} hours"
-            completeness_note += gap_detail + "."
+            completeness_note = (
+                f" {_ng} interruption{'s' if _ng != 1 else ''} with no readings "
+                f"{'was' if _ng == 1 else 'were'} detected, totalling {format_duration(missing_s)}"
+                + (f"; data completeness was {cp:.2f}%." if cp is not None else ".")
+            )
+            if cp is not None and cp < 90.0:
+                completeness_note += " Averages may under- or over-estimate exposure over the whole period."
+        elif cp is not None and cp < 100.0:
+            is_continuous = False
+            completeness_note = f" Data completeness was {cp:.2f}%."
+        elif cp is not None:
+            completeness_note = " The record has no gaps."
+
+        if excluded:
+            is_continuous = False
+            completeness_note += (
+                f" {len(excluded)} window{'s' if len(excluded) != 1 else ''} excluded by the analyst "
+                f"({'; '.join(excluded)}) {'is' if len(excluded) == 1 else 'are'} not part of the analysis."
+            )
+        for d in (clock_change_dates or []):
+            completeness_note += (
+                f" Daylight saving time began on {d}: clocks moved forward one hour, and the "
+                f"skipped hour is not counted as missing data."
+            )
+        if time_basis:
+            completeness_note += f" All times are {time_basis}."
 
         # "continuous" is a factual claim about the record, not a figure of
         # speech — only make it when the data actually support it.
@@ -513,8 +548,11 @@ class ReportGeneratorV2:
         # cited standard, so they are not stated.
         # Label the averaging period honestly: this is the energy average over the
         # WHOLE record, which is rarely 24 hours.
-        period_label = (f"{n_days}-day" if n_days and n_days != 1 else
-                        ("24-hour" if n_days == 1 else "whole-record"))
+        if n_days and n_days > 0:
+            _dt = _days_text(n_days)
+            period_label = "24-hour" if _dt == "1 day" else _dt.replace(" days", "-day")
+        else:
+            period_label = "whole-record"
         level_sentence = (
             f"The {period_label} energy-average level (LAeq) was {_f(laeq_v)} dB(A)."
         )
@@ -687,71 +725,95 @@ class ReportGeneratorV2:
             logger.warning("No valid ts/leq pairs; cannot compute summaries")
             return
         
-        # ========== DAILY SUMMARY (COMPUTED) ==========
-        df_data['date'] = df_data['ts'].dt.date
-        
-        daily_rows = []
-        for date, group in df_data.groupby('date'):
-            leq_vals = group['leq']
-            
-            laeq_24h = energetic_mean_db(leq_vals)
-            
-            # Day (07:00-22:00) and Night (22:00-07:00) subdivisions
-            h = group['ts'].dt.hour
-            is_day = (h >= 7) & (h < 22)
-            is_night = ~is_day
-            
-            laeq_day = energetic_mean_db(leq_vals[is_day]) if is_day.any() else None
-            laeq_night = energetic_mean_db(leq_vals[is_night]) if is_night.any() else None
-            
-            # Lden for the day (with penalties).
-            #
-            # The WHOLE calendar day, not the daytime slice. Lden is defined over
-            # 24 hours as day + evening + night, and compute_ldn_lden correctly
-            # refuses to return a value when a constituent period has no data —
-            # so passing only 07:00-22:00 left the night component empty and
-            # produced None for every single day. The Lden column of the daily
-            # matrix has been blank ever since.
-            _lden_out = compute_ldn_lden(group['ts'], leq_vals)
-            lden_day = _lden_out.get('Lden') if _lden_out else None
-            
-            daily_rows.append({
-                'Date': pd.Timestamp(date),
-                'Average_L_EQ_dB': laeq_24h,
-                'Min_L_EQ_dB': leq_vals.min(),
-                'Max_L_EQ_dB': leq_vals.max(),
-                'Std_Dev': leq_vals.std(),
-                'Daytime_LAeq': laeq_day,
-                'Nighttime_LAeq': laeq_night,
-                'Daily_Lden': lden_day,
-            })
-        
-        if daily_rows:
-            self.daily_summary = pd.DataFrame(daily_rows)
-            logger.info(f"Computed daily summary: {len(self.daily_summary)} days")
-        
-        # ========== HOURLY SUMMARY (COMPUTED) ==========
-        df_data['hour'] = df_data['ts'].dt.hour
-        
-        hourly_rows = []
-        for hour, group in df_data.groupby('hour'):
-            leq_vals = group['leq']
-            
-            laeq_hourly = energetic_mean_db(leq_vals)
-            
-            hourly_rows.append({
-                'Hour': hour,
-                'Average_L_EQ_dB': laeq_hourly,
-                'Min_L_EQ_dB': leq_vals.min(),
-                'Max_L_EQ_dB': leq_vals.max(),
-                'Std_Dev': leq_vals.std(),
-            })
-        
-        if hourly_rows:
-            # Sort by hour to ensure 0-23 ordering
-            self.hourly_summary = pd.DataFrame(hourly_rows).sort_values('Hour').reset_index(drop=True)
-            logger.info(f"Computed hourly summary: {len(self.hourly_summary)} hours")
-    
+        # Every per-period value comes from analysis.periods, the single place the
+        # day, night and 24-hour windows are defined; each period takes readings
+        # from its own hours only and carries its coverage.
+        tz = self.clock_zone
+        interval = _modal_interval_seconds(df_data['ts'])
+        daily = daily_summary(df_data['ts'], df_data['leq'], tz, interval)
+        if not daily.empty:
+            self.daily_summary = daily
+            logger.info(f"Computed daily summary: {len(daily)} days")
+        hourly = hourly_summary(df_data['ts'], df_data['leq'])
+        if not hourly.empty:
+            self.hourly_summary = hourly
+            logger.info(f"Computed hourly summary: {len(hourly)} hours")
+
+    # A night or 24-hour period enters a count or a range only when at least half
+    # of it was measured; the stub periods at each end of a record are not
+    # comparable with the complete ones between them.
+    MIN_PERIOD_COVERAGE_PCT = 50.0
+
+    def _per_night(self, ts: pd.Series, leq: pd.Series, window: tuple[int, int]) -> pd.Series:
+        """Energy average of each night in ``window``, keyed by the evening it began."""
+        data = pd.DataFrame({'ts': pd.to_datetime(ts, errors='coerce'),
+                             'leq': pd.to_numeric(leq, errors='coerce')}).dropna()
+        if data.empty:
+            return pd.Series(dtype=float)
+        nv = nightly_values(data['ts'], data['leq'], window, self.clock_zone,
+                            _modal_interval_seconds(data['ts']))
+        nv = nv[nv['coverage_pct'] >= self.MIN_PERIOD_COVERAGE_PCT]
+        return nv['laeq'].dropna()
+
+    def _per_day_lden(self) -> pd.Series:
+        """Lden of each 07:00-start 24-hour period with enough coverage."""
+        ds = self.daily_summary
+        if ds is None or 'Daily_Lden' not in ds.columns:
+            return pd.Series(dtype=float)
+        cov = pd.to_numeric(ds.get('Lden_Coverage_pct'), errors='coerce')
+        keep = cov >= self.MIN_PERIOD_COVERAGE_PCT if cov is not None else True
+        return pd.to_numeric(ds.loc[keep, 'Daily_Lden'], errors='coerce').dropna()
+
+    def _gap_info(self) -> dict:
+        """Gap and clock-change inventory of the analysed record (computed once).
+
+        Always computed from ``self.df`` — the filtered, clock-converted record the
+        report describes — never taken from the browser's pre-filter merge report.
+        """
+        if getattr(self, '_gap_info_cache', None) is None:
+            ts_col = self._resolve_acoustic_columns()[0]
+            try:
+                self._gap_info_cache = (gap_report_to_dict(detect_gaps(self.df, ts_col, self.clock_zone))
+                                        if ts_col else {})
+            except Exception as exc:
+                logger.warning(f"Gap detection failed: {exc}")
+                self._gap_info_cache = {}
+        return self._gap_info_cache
+
+    def _add_time_basis_note(self, story, styles):
+        """Section 9 note: the clock used and how each period is bounded."""
+        story.append(Paragraph("<b>Time Basis and Periods</b>", styles['h2']))
+        story.append(Paragraph(
+            f"All times in this report are {escape(self.time_basis(self._get_timestamp_series(self._resolve_acoustic_columns()[0])))}. "
+            "Each period takes readings from its own hours only: a calendar day runs 00:00 to 24:00; "
+            "the COMAR day 07:00 to 22:00; a night (22:00 to 07:00 for COMAR, 23:00 to 07:00 for "
+            "Lnight) is labelled with the evening on which it begins; and a daily Lden covers the "
+            "24 hours from 07:00, its night being the one that follows (EU Directive 2002/49/EC, "
+            "Annex I). When daylight saving time begins, the clock moves from 01:59 to 03:00 and that "
+            "day has 23 hours; when it ends, 01:00 to 01:59 occurs twice and both passes are kept, in "
+            "order. Neither change is treated as missing or duplicate data, and period coverage is "
+            "measured against each period's real length.",
+            styles['BodyText']
+        ))
+        story.append(Spacer(1, 0.12 * inch))
+
+    def _completeness_pct(self, ts_valid: pd.Series) -> float | None:
+        """Completeness from the gap inventory (one figure across site and reports)."""
+        return self._gap_info().get('completeness_exact') if not ts_valid.empty else None
+
+    def time_basis(self, ts: pd.Series | None = None) -> str:
+        return describe_time_basis(self.clock_zone, ts)
+
+    def zone_abbreviation(self, ts: pd.Series) -> str:
+        """Zone abbreviation(s) in force over the record, for axis titles (e.g. 'EDT')."""
+        t = pd.to_datetime(ts, errors='coerce').dropna()
+        return zone_abbreviations(self.clock_zone, t.min(), t.max()) if not t.empty else self.clock_zone
+
+    @property
+    def clock_zone(self) -> str:
+        """IANA zone the record's timestamps are expressed in (the report clock)."""
+        return (self.df.attrs.get('clock') or {}).get('target') or DEFAULT_CLOCK
+
     # Page geometry, shared by the PDF and Word paths so both documents lay out
     # on the same sheet with the same text block.
     TECHNICAL_PAGE = dict(width_in=11.0, height_in=8.5,
@@ -1193,16 +1255,15 @@ class ReportGeneratorV2:
             ts, leq, threshold_db=WHO_ROAD_LNIGHT,
             start_hour=LDEN_DEFAULT.night_start, end_hour=LDEN_DEFAULT.night_end)
 
-        nights = nightly_lnight(ts, leq)
+        nights = self._per_night(ts, leq, WHO_NIGHT)
         if not nights.empty:
             out['nights_total'] = int(len(nights))
             out['nights_over'] = int((nights > WHO_ROAD_LNIGHT).sum())
 
-        if self.daily_summary is not None and 'Daily_Lden' in self.daily_summary.columns:
-            lden_days = pd.to_numeric(self.daily_summary['Daily_Lden'], errors='coerce').dropna()
-            if not lden_days.empty:
-                out['days_total'] = int(len(lden_days))
-                out['days_over'] = int((lden_days > WHO_ROAD_LDEN).sum())
+        lden_days = self._per_day_lden()
+        if not lden_days.empty:
+            out['days_total'] = int(len(lden_days))
+            out['days_over'] = int((lden_days > WHO_ROAD_LDEN).sum())
         return out
 
     @classmethod
@@ -1677,7 +1738,7 @@ class ReportGeneratorV2:
 
         start_str = ts_valid.min().strftime('%d %b %Y') if not ts_valid.empty else 'N/A'
         end_str = ts_valid.max().strftime('%d %b %Y') if not ts_valid.empty else 'N/A'
-        completeness = data_completeness_pct(ts_valid, actual_count=len(self.df))
+        completeness = self._completeness_pct(ts_valid)
 
         laeq_v = energetic_mean_db(leq) if not leq_clean.empty else None
         env = (compute_ldn_lden(ts, leq) or {}) if not leq_clean.empty else {}
@@ -1701,10 +1762,9 @@ class ReportGeneratorV2:
         # is never split at midnight into two half-nights.
         day_series = (pd.to_numeric(self.daily_summary.get('Daytime_LAeq'), errors='coerce').dropna()
                       if self.daily_summary is not None else pd.Series(dtype=float))
-        night_comar_series = nightly_lnight(ts, leq, night_start=22, night_end=7)
-        lden_series = (pd.to_numeric(self.daily_summary.get('Daily_Lden'), errors='coerce').dropna()
-                       if self.daily_summary is not None else pd.Series(dtype=float))
-        lnight_series = nightly_lnight(ts, leq)
+        night_comar_series = self._per_night(ts, leq, COMAR_NIGHT)
+        lden_series = self._per_day_lden()
+        lnight_series = self._per_night(ts, leq, WHO_NIGHT)
         # Days that actually contain readings, not merely the calendar span. With
         # an exclusion window applied the two differ, and the span alone would
         # overstate coverage.
@@ -1809,7 +1869,7 @@ class ReportGeneratorV2:
             completeness_str = "Not available"
         else:
             cp = math.floor(float(completeness) * 10.0) / 10.0
-            completeness_str = f"{min(cp, 100.0):.1f}% of expected readings present"
+            completeness_str = f"{floor_pct(min(cp, 100.0), 2):.2f}% of expected readings present"
 
         base_style = self._get_pdf_styles()['BodyText']
         body = ParagraphStyle('ResidentCell', parent=base_style, fontSize=8.5, leading=10.5,
@@ -1859,7 +1919,8 @@ class ReportGeneratorV2:
         summary = _build(
             ['Table 2. Summary of measurements', 'Measured at this home'],
             [
-                ("Monitoring period", f"{start_str} to {end_str}, {days_with_data} days with data"),
+                ("Monitoring period", f"{start_str} to {end_str}, {days_with_data} days with data "
+                                      f"(times in {self.zone_abbreviation(ts_valid)})"),
                 ("Data completeness", completeness_str),
                 ("LAeq, whole period", _laeq_with_spread()),
                 ("Spread of levels, L90 to L10", _climate_spread()),
@@ -2079,6 +2140,11 @@ class ReportGeneratorV2:
 
         self._add_provenance_section(story, styles)
 
+        # Time basis: every period boundary below depends on it. Omitted when the
+        # record has no usable timestamps, since no period could be formed.
+        if not getattr(self, 'timestamps_synthetic', False):
+            self._add_time_basis_note(story, styles)
+
         # Averaging period — the most commonly overlooked limitation.
         story.append(Paragraph("<b>Averaging Period</b>", styles['h2']))
         story.append(Paragraph(
@@ -2170,6 +2236,12 @@ class ReportGeneratorV2:
         """Format dB value with unit. NO FUSION."""
         s = cls._fmt_float(value, 2)
         return "N/A" if s == "N/A" else f"{s} dB(A)"
+
+    @staticmethod
+    def _table_header_style() -> ParagraphStyle:
+        """White, bold, centred header text for the dark table header rows."""
+        return ParagraphStyle('TableHeader', fontName='Helvetica', fontSize=8.5, leading=10.5,
+                              textColor=colors.white, alignment=TA_CENTER)
 
     @classmethod
     def _fmt_db_plain(cls, value) -> str:
@@ -2368,6 +2440,7 @@ class ReportGeneratorV2:
                 f"<b>Samples Analysed:</b> {len(self.df):,}", styles['BodyText']))
         else:
             story.append(Paragraph(f"<b>Measurement Date Range:</b> {escape(date_range)}", styles['BodyText']))
+            story.append(Paragraph(f"<b>Time basis:</b> {escape(self.time_basis(ts_valid))}", styles['BodyText']))
             story.append(Paragraph(f"<b>Total Duration:</b> {escape(duration)}", styles['BodyText']))
         story.append(Spacer(1, 0.12 * inch))
 
@@ -2384,10 +2457,11 @@ class ReportGeneratorV2:
         try:
             _tsv = ts.dropna()
             if len(_tsv) > 1:
-                _n_days = int(round((_tsv.max() - _tsv.min()).total_seconds() / 86400.0))
+                _n_days = (_tsv.max() - _tsv.min()).total_seconds() / 86400.0
         except Exception:
             pass
-        _perlbl = (f"{_n_days}-Day" if _n_days and _n_days > 1 else "24-Hour" if _n_days == 1 else "Whole-Record")
+        _dtxt = _days_text(_n_days) if _n_days else ''
+        _perlbl = ("24-Hour" if _dtxt == "1 day" else _dtxt.replace(" days", "-Day") if _dtxt else "Whole-Record")
         story.append(Paragraph(f"<b>{_perlbl} Energy Average (LAeq):</b> {escape(laeq_str)}", styles['BodyText']))
         story.append(Spacer(1, 0.1 * inch))
 
@@ -2408,17 +2482,12 @@ class ReportGeneratorV2:
                     f"which evaluates Lden and Lnight, the metrics those guidelines are defined on."
                 )
             else:
-                if laeq_v < 55:
-                    loading = "low"
-                elif laeq_v < 65:
-                    loading = "moderate"
-                elif laeq_v < 75:
-                    loading = "high"
-                else:
-                    loading = "very high"
+                # Measured value only: descriptive bands such as "high for a
+                # residential environment" are not defined by any cited standard.
                 interp = (
                     f"The equivalent continuous sound level (LAeq) over the measurement period was "
-                    f"{laeq_str} dB(A), a {loading} level for a residential environment."
+                    f"{laeq_str} dB(A). Section 3 compares the record with the WHO 2018 guideline "
+                    f"values and the Maryland COMAR limits."
                 )
         else:
             interp = "The environment exhibits an average continuous noise level that could not be computed due to missing/invalid LEQ values."
@@ -2441,9 +2510,10 @@ class ReportGeneratorV2:
         ts_valid = ts.dropna()
         start_str = ts_valid.min().strftime('%d %b %Y') if not ts_valid.empty else ''
         end_str   = ts_valid.max().strftime('%d %b %Y') if not ts_valid.empty else ''
-        n_days_v  = int(round((ts_valid.max() - ts_valid.min()).total_seconds() / 86400)) if not ts_valid.empty else 0
+        n_days_v  = (ts_valid.max() - ts_valid.min()).total_seconds() / 86400 if not ts_valid.empty else 0
 
-        completeness = data_completeness_pct(ts_valid, actual_count=len(self.df))
+        completeness = self._completeness_pct(ts_valid)
+        gi = self._gap_info()
 
         summary_text = ReportGeneratorV2.generate_plain_english_summary(
             laeq=laeq_v,
@@ -2470,19 +2540,17 @@ class ReportGeneratorV2:
             lamax=self._lamax_value(self._resolve_acoustic_columns()[2]),
             logging_interval_s=self._logging_interval_s(ts),
             energy_dominance=energy_concentration(leq.dropna()),
+            n_gaps=int(gi.get('gap_count') or 0),
+            total_gap_hours=float(gi.get('missing_seconds') or 0.0) / 3600.0,
+            time_basis=self.time_basis(ts_valid),
+            clock_change_dates=[pd.Timestamp(c['before']).strftime('%d %b %Y')
+                                for c in gi.get('clock_changes', [])],
+            excluded=[_excluded_text(x) for x in gi.get('excluded', [])],
         )
 
-        # Determine box colour by concern level
-        _sl = summary_text.lower()
-        if 'concern level: high' in _sl or 'concern level: serious' in _sl:
-            _box_bg, _box_border = '#FEF2F2', '#991b1b'
-            _level_label, _level_fg = 'HIGH', '#991b1b'
-        elif 'concern level: moderate' in _sl:
-            _box_bg, _box_border = '#FFFBEB', '#92400e'
-            _level_label, _level_fg = 'MODERATE', '#92400e'
-        else:
-            _box_bg, _box_border = '#EFF6FF', '#3D5A80'
-            _level_label, _level_fg = 'LOW', '#166534'
+        # One neutral box: the summary states values and guideline comparisons,
+        # not a verdict, so it is not colour-coded.
+        _box_bg, _box_border = '#EFF6FF', '#3D5A80'
 
         # Inner style — NO border, no background (the Table provides the single outer box)
         _inner_style = ParagraphStyle(
@@ -2503,7 +2571,7 @@ class ReportGeneratorV2:
         # heads.
 
         # Parse summary text into sections
-        body_parts, who_part, concern_part = [], None, None
+        body_parts, who_part = [], None
         for para_block in summary_text.split('\n\n'):
             lines = para_block.split('\n')
             header_lines = [l for l in lines if not l.strip().startswith('•')]
@@ -2512,8 +2580,6 @@ class ReportGeneratorV2:
             first = header_joined.strip()
             if first.startswith('WHO '):
                 who_part = (header_joined, bullet_lines)
-            elif first.startswith('Overall Concern'):
-                concern_part = header_joined
             else:
                 if header_joined or bullet_lines:
                     body_parts.append((header_joined, bullet_lines))
@@ -2538,22 +2604,6 @@ class ReportGeneratorV2:
         inner_content = [
             Paragraph("Non-Technical Summary: Noise Exposure &amp; Health Assessment", _heading_style)
         ]
-
-        # 1. Concern level — prominent coloured line
-        if concern_part:
-            explanation = concern_part
-            for pfx in (f'Overall Concern Level: {_level_label}. ',
-                        f'Overall Concern Level: {_level_label.capitalize()}. ',
-                        'Overall Concern Level: '):
-                if explanation.startswith(pfx):
-                    explanation = explanation[len(pfx):]
-                    break
-            inner_content.append(Paragraph(
-                f'<font color="{_level_fg}"><b>CONCERN LEVEL: {_level_label}</b></font>'
-                f'  {escape(explanation)}',
-                _plain_style,
-            ))
-            inner_content.append(Spacer(1, 4))
 
         # 2. Body paragraphs (dataset overview, noise level, variability)
         for (hdr, bullets) in body_parts:
@@ -2628,7 +2678,8 @@ class ReportGeneratorV2:
 
     @staticmethod
     def _compute_top_noise_events(ts: pd.Series, leq: pd.Series, top_n: int = 10,
-                                  min_separation_minutes: float = 5.0) -> list[dict]:
+                                  min_separation_minutes: float = 5.0,
+                                  fold: pd.Series | None = None) -> list[dict]:
         """Detect discrete loud noise events and return the top N by peak level.
 
         An event is a **contiguous** run of readings at or above the 90th-percentile
@@ -2644,13 +2695,16 @@ class ReportGeneratorV2:
         """
         ts  = ts.dropna()
         leq = pd.to_numeric(leq, errors='coerce').reindex(ts.index)
-        df_tmp = pd.DataFrame({'ts': ts.values, 'leq': leq.values}).dropna()
-        df_tmp = df_tmp.sort_values('ts').reset_index(drop=True)
+        # Elapsed-time order: a repeated November hour sorts as two hours.
+        key = ordering_key(ts, fold.reindex(ts.index) if fold is not None else None)
+        df_tmp = pd.DataFrame({'ts': ts.values, 'key': key.values, 'leq': leq.values}).dropna()
+        df_tmp = df_tmp.sort_values('key', kind='mergesort').reset_index(drop=True)
         if len(df_tmp) < 2:
             return []
 
         threshold = float(np.percentile(df_tmp['leq'], 90))
-        times  = df_tmp['ts'].to_numpy()
+        wall   = df_tmp['ts'].to_numpy()
+        times  = df_tmp['key'].to_numpy()
         levels = df_tmp['leq'].to_numpy()
         above  = levels >= threshold
         if not above.any():
@@ -2676,13 +2730,17 @@ class ReportGeneratorV2:
                 j += 1
             seg_lv = levels[i:j + 1]
             seg_ts = times[i:j + 1]
+            seg_wall = wall[i:j + 1]
             k = int(np.argmax(seg_lv))
             events.append({
-                'start':      seg_ts[0],
-                'end':        seg_ts[-1],
-                'peak_time':  seg_ts[k],
+                'start':      seg_wall[0],
+                'end':        seg_wall[-1],
+                'peak_time':  seg_wall[k],
+                'peak_key':   seg_ts[k],
                 'peak':       float(seg_lv[k]),
-                'duration_s': float((seg_ts[-1] - seg_ts[0]) / np.timedelta64(1, 's')),
+                # Each reading stands for one logging interval, so a run of N
+                # readings lasts N intervals (first-to-last would be one short).
+                'duration_s': float((seg_ts[-1] - seg_ts[0]) / np.timedelta64(1, 's')) + interval_s,
             })
             i = j + 1
 
@@ -2692,22 +2750,11 @@ class ReportGeneratorV2:
         sep = np.timedelta64(int(min_separation_minutes * 60), 's')
         selected: list[dict] = []
         for e in events:
-            if all(abs(e['peak_time'] - s['peak_time']) > sep for s in selected):
+            if all(abs(e['peak_key'] - s['peak_key']) > sep for s in selected):
                 selected.append(e)
             if len(selected) >= top_n:
                 break
         return selected
-
-    @staticmethod
-    def _fmt_duration(seconds: float) -> str:
-        seconds = int(round(seconds))
-        if seconds < 60:
-            return f"{seconds}s" if seconds > 0 else "<1s"
-        m, s = divmod(seconds, 60)
-        h, m = divmod(m, 60)
-        if h > 0:
-            return f"{h}h {m:02d}m"
-        return f"{m}m {s:02d}s"
 
     def _add_top_noise_events(self, story, styles, *, ts: pd.Series, leq_col: str | None):
         from reportlab.platypus import Table, TableStyle
@@ -2717,28 +2764,28 @@ class ReportGeneratorV2:
         if ts.dropna().empty or leq.dropna().empty:
             return
 
-        events = self._compute_top_noise_events(ts, leq)
+        fold = self.df[FOLD_COLUMN] if FOLD_COLUMN in self.df.columns else None
+        events = self._compute_top_noise_events(ts, leq, fold=fold)
         if not events:
             return
 
-        story.append(Spacer(1, 0.1 * inch))
-        story.append(Paragraph("<b>Top Peak Noise Events</b>", styles['h2']))
-        story.append(Paragraph(
-            "The table below lists the loudest discrete noise events detected during the "
-            "monitoring period. Each event is a contiguous period at or above the 90th-percentile "
-            "(L10) threshold; <b>Peak Time</b> is the exact moment the peak level occurred (so it can be "
-            "located directly in the raw data), and <b>Duration</b> is how long levels stayed "
-            "continuously above the threshold. Listed events are at least 5 minutes apart.",
+        interval = self._logging_interval_s(ts) or 1.0
+        interval_label = f"{interval:.0f} s" if interval >= 1 else f"{interval:.2f} s"
+        block = [Spacer(1, 0.1 * inch), Paragraph("<b>Top Peak Noise Events</b>", styles['h2']),
+                 Paragraph(
+            "The loudest discrete events in the record. Each event is a contiguous run of LEQ "
+            f"readings at or above the 90th-percentile level (L10); <b>Peak LEQ</b> is the highest "
+            f"{interval_label} LEQ reading in the event and <b>Peak Time</b> the moment it was recorded "
+            f"({escape(self.time_basis(ts))}). <b>Duration</b> is the number of readings in the event "
+            "times the logging interval. Listed events are at least 5 minutes apart.",
             styles['BodyText']
-        ))
-        story.append(Spacer(1, 0.06 * inch))
+        ), Spacer(1, 0.06 * inch)]
 
-        header = ['#', 'Date', 'Day', 'Peak Time', 'Peak Level', 'Duration']
+        header = ['#', 'Date', 'Day', 'Peak Time', f'Peak LEQ ({interval_label})', 'Duration']
         rows   = [header]
         for i, ev in enumerate(events, 1):
             dt_peak   = pd.Timestamp(ev['peak_time'])
-            dur_s     = ev['duration_s']
-            dur_str   = self._fmt_duration(dur_s) if dur_s >= 60 else 'Brief (<1 min)'
+            dur_str   = format_duration(ev['duration_s'])
             rows.append([
                 str(i),
                 dt_peak.strftime('%d %b %Y'),
@@ -2762,7 +2809,9 @@ class ReportGeneratorV2:
             ('TOPPADDING',  (0, 0), (-1, -1), 4),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
         ]))
-        story.append(tbl)
+        # Heading, explanation and the whole table move together, so the table
+        # header is never left on one page with its rows on the next.
+        story.append(KeepTogether(block + [tbl]))
         story.append(Spacer(1, 0.15 * inch))
 
     # ── Top noise events for HTML report ──────────────────────────────────────
@@ -2772,14 +2821,15 @@ class ReportGeneratorV2:
         leq = self._get_numeric_series(leq_col)
         if ts.dropna().empty or leq.dropna().empty:
             return ''
-        events = self._compute_top_noise_events(ts, leq)
+        fold = self.df[FOLD_COLUMN] if FOLD_COLUMN in self.df.columns else None
+        events = self._compute_top_noise_events(ts, leq, fold=fold)
         if not events:
             return ''
 
         rows_html = ''
         for i, ev in enumerate(events, 1):
             dt  = pd.Timestamp(ev['peak_time'])
-            dur = self._fmt_duration(ev['duration_s']) if ev['duration_s'] >= 60 else 'Brief (&lt;1 min)'
+            dur = format_duration(ev['duration_s'])
             bg  = '#fff' if i % 2 == 0 else '#f8fafc'
             rows_html += (
                 f"<tr style='background:{bg}'>"
@@ -2825,105 +2875,71 @@ class ReportGeneratorV2:
 
         start = ts_valid.min()
         end = ts_valid.max()
-        expected_seconds = max(0.0, (end - start).total_seconds())
-        # Detect the actual logging interval instead of assuming 1 Hz, so a
-        # logger sampling every 2 s / every minute is not falsely flagged as
-        # having lost data.
         interval_s = _modal_interval_seconds(ts_valid)
         interval_s = interval_s if interval_s and interval_s > 0 else 1.0
-        expected_samples = int(expected_seconds / interval_s) + 1
+        gi = self._gap_info()
+        # Expected samples over the real elapsed time: a daylight-saving jump
+        # advances the clock without losing readings, and a repeated hour adds one.
+        completeness = self._completeness_pct(ts_valid)
         actual_samples = len(self.df)
-        uptime_pct = min(100.0, (100.0 * actual_samples / max(1, expected_samples)))
+        expected_samples = int(gi.get('expected_rows') or actual_samples)
+        uptime_pct = floor_pct(completeness, 2) if completeness is not None else None
         interval_label = (f"{interval_s:.0f} s" if interval_s >= 1 else f"{interval_s:.3f} s")
+        body = styles['BodyText']
 
         if getattr(self, 'timestamps_synthetic', False):
             story.append(Paragraph(
                 "<b>Measurement Span:</b> Not available — timestamps unreadable. Sample counts "
                 "below are exact; completeness cannot be assessed without knowing the intended "
-                "recording period.", styles['BodyText']))
+                "recording period.", body))
         else:
-            story.append(Paragraph(f"<b>Measurement Span:</b> {escape(start.strftime('%Y-%m-%d %H:%M:%S'))} to {escape(end.strftime('%Y-%m-%d %H:%M:%S'))}", styles['BodyText']))
-            story.append(Paragraph(f"<b>Detected Logging Interval:</b> {escape(interval_label)}", styles['BodyText']))
-        story.append(Paragraph(f"<b>Expected Samples:</b> {expected_samples:,}", styles['BodyText']))
-        story.append(Paragraph(f"<b>Actual Samples in Dataset:</b> {actual_samples:,}", styles['BodyText']))
-        story.append(Paragraph(f"<b>Uptime (Data Completeness):</b> {self._fmt_float(uptime_pct, 1)}%", styles['BodyText']))
+            story.append(Paragraph(f"<b>Measurement Span:</b> {escape(start.strftime('%Y-%m-%d %H:%M:%S'))} to {escape(end.strftime('%Y-%m-%d %H:%M:%S'))}", body))
+            story.append(Paragraph(f"<b>Time basis:</b> {escape(self.time_basis(ts_valid))}", body))
+            clock = self.df.attrs.get('clock') or {}
+            if clock.get('converted'):
+                story.append(Paragraph(
+                    f"<b>Clock conversion:</b> logger timestamps were recorded in "
+                    f"{escape(clock.get('source_label', ''))} and converted to "
+                    f"{escape(clock.get('target_label', ''))} through UTC before any result was "
+                    f"calculated; every period boundary in this report is on the converted clock.", body))
+            story.append(Paragraph(f"<b>Detected Logging Interval:</b> {escape(interval_label)}", body))
+        story.append(Paragraph(f"<b>Expected Samples:</b> {expected_samples:,}", body))
+        story.append(Paragraph(f"<b>Actual Samples in Dataset:</b> {actual_samples:,}", body))
+        if uptime_pct is not None:
+            story.append(Paragraph(f"<b>Data Completeness:</b> {uptime_pct:.2f}%", body))
         story.append(Spacer(1, 0.1 * inch))
-
-        if uptime_pct < 90.0:
+        if uptime_pct is not None and uptime_pct < 90.0:
             story.append(Paragraph(
-                f"<b style='color:red'>⚠ WARNING: High data loss detected ({100 - uptime_pct:.1f}% missing). Global averages may be skewed.</b>",
-                styles['BodyText']
-            ))
-        else:
-            story.append(Paragraph("✓ Data completeness is acceptable (≥90%).", styles['BodyText']))
-
+                f"<b>Completeness below 90%</b> ({100 - uptime_pct:.2f}% of the expected readings are "
+                f"missing). Whole-period averages may not represent the unmeasured time.", body))
         story.append(Spacer(1, 0.12 * inch))
 
         # ── Data Continuity Log ────────────────────────────────────────────────
-        story.append(Paragraph("Data Continuity Log", styles['h2']))
+        # Heading, status and every entry stay on one page (up to a long list).
+        log = [Paragraph("Data Continuity Log", styles['h2'])]
+        if self.source_files:
+            log.append(Paragraph(
+                f"This record merges {len(self.source_files)} file(s). Continuity was checked across "
+                f"every file boundary as well as within each file.", body))
+            log.append(Spacer(1, 0.08 * inch))
 
-        # If a pre-computed gap report from the merge step is available, use it directly.
-        # Otherwise, run gap detection fresh on the current dataframe.
-        if self.merge_gap_report:
-            gd = self.merge_gap_report
-            has_gaps = gd.get('gap_count', 0) > 0
-
-            if self.source_files:
-                merge_note = (
-                    f"This dataset is a <b>merged batch</b> of {len(self.source_files)} file(s). "
-                    f"Gap analysis was performed across all file boundaries to detect any data loss "
-                    f"introduced at merge points or within individual files."
-                )
-                story.append(Paragraph(merge_note, styles['BodyText']))
-                story.append(Spacer(1, 0.08 * inch))
-
-            if not has_gaps:
-                story.append(Paragraph(
-                    "✓ Continuous temporal alignment verified across all merged files. No gaps detected.",
-                    styles['BodyText']
-                ))
-            else:
-                missing_min = self._fmt_float(gd.get('missing_seconds', 0) / 60.0, 1)
-                summary_line = (
-                    f"⚠ DATA LOSS DETECTED — {gd['gap_count']} gap(s) across merged dataset. "
-                    f"Minor (device restart/calibration): {gd.get('minor_gap_count', 0)}. "
-                    f"Major (power failure/system crash): {gd.get('major_gap_count', 0)}. "
-                    f"Total missing data: {missing_min} minutes. "
-                    f"Uptime: {gd.get('uptime_pct', 100)}%."
-                )
-                story.append(Paragraph(escape(summary_line), styles['BodyText']))
-                story.append(Spacer(1, 0.06 * inch))
-                for g in (gd.get('gaps') or []):
-                    badge = g.get('category', '').upper()
-                    label = g.get('label', '')
-                    story.append(Paragraph(f"• [{badge}] {escape(label)}", styles['BodyText']))
+        gaps = gi.get('gaps') or []
+        if not gaps:
+            log.append(Paragraph("No interruptions: a reading is present at every logging interval.", body))
         else:
-            ts_col_dcl, _, _, _ = self._resolve_acoustic_columns()
-            try:
-                gap_report = detect_gaps(self.df, ts_col_dcl) if ts_col_dcl else None
-            except Exception as _e:
-                gap_report = None
-                logger.warning(f"Gap detection failed: {_e}")
-
-            if gap_report is None or gap_report.continuous:
-                story.append(Paragraph(
-                    "✓ Continuous temporal alignment verified. No gaps detected.",
-                    styles['BodyText']
-                ))
-            else:
-                gd = gap_report_to_dict(gap_report)
-                summary_line = (
-                    f"⚠ DATA LOSS DETECTED — Uptime: {gd['uptime_pct']}% — "
-                    f"{gd['gap_count']} disruption(s) ({gd['minor_gap_count']} Minor, {gd['major_gap_count']} Major). "
-                    f"Missing data: {self._fmt_float(gd['missing_seconds'] / 60.0, 1)} minutes total."
-                )
-                story.append(Paragraph(escape(summary_line), styles['BodyText']))
-                story.append(Spacer(1, 0.06 * inch))
-                for g in gd['gaps']:
-                    badge = g['category'].upper()
-                    label = g['label']
-                    story.append(Paragraph(f"• [{badge}] {escape(label)}", styles['BodyText']))
-
+            n_minor = int(gi.get('minor_gap_count') or 0)
+            n_major = int(gi.get('major_gap_count') or 0)
+            log.append(Paragraph(
+                f"{len(gaps)} interruption{'s' if len(gaps) != 1 else ''} with no readings "
+                f"({n_minor} shorter than 15 minutes, {n_major} of 15 minutes or longer), totalling "
+                f"{format_duration(float(gi.get('missing_seconds') or 0.0))}.", body))
+            log.append(Spacer(1, 0.06 * inch))
+            log.extend(Paragraph(f"• {escape(g.get('label', ''))}", body) for g in gaps)
+        log.extend(Paragraph(f"• {escape(c.get('label', ''))}", body) for c in gi.get('clock_changes') or [])
+        log.extend(Paragraph(f"• {escape(x.get('label', ''))}", body) for x in gi.get('excluded') or [])
+        story.append(KeepTogether(log) if len(log) <= 25 else log[0])
+        if len(log) > 25:
+            story.extend(log[1:])
         story.append(Spacer(1, 0.12 * inch))
 
     # ============================================================
@@ -2983,6 +2999,10 @@ class ReportGeneratorV2:
         _, _, lmax_col, _ = self._resolve_acoustic_columns()
         lmax_series = self._get_numeric_series(lmax_col)
         lamax = float(lmax_series.max()) if not lmax_series.dropna().empty else None
+        # The WHO bedroom single-event value applies at night: night readings only.
+        _night = (h >= 23) | (h < 7)
+        _lmax_night = lmax_series[_night.reindex(lmax_series.index, fill_value=False)].dropna()
+        lamax_night = float(_lmax_night.max()) if not _lmax_night.empty else None
 
         try:
             results = evaluate_compliance(
@@ -2993,6 +3013,7 @@ class ReportGeneratorV2:
                 laeq_day=laeq_day,
                 laeq_night=laeq_night,
                 lamax=lamax,
+                lamax_night=lamax_night,
                 environment=self.environment,
             )
         except Exception as _e:
@@ -3128,6 +3149,10 @@ class ReportGeneratorV2:
             "attributed noise exclusively to a single source, but the sound level meter measures total combined "
             "acoustic energy and cannot confirm the source. They therefore report how the measured level sits "
             "relative to the reference, not a pass/fail verdict. "
+            + ("With an indoor microphone, the WHO 1999 bedroom rows compare the night-time LAeq "
+               "(23:00–07:00) with 30 dB(A), and show the night-time LAmax against 45 dB for reference "
+               "only: that guideline concerns how often 45 dB is exceeded in a night, which a single "
+               "maximum cannot decide. " if self.environment == 'indoor' else "") +
             "Additionally, WHO 2018 intends Lden/Lnight to represent long-term annual average exposure; a "
             "measurement period of days or weeks is indicative only. "
             "This information is provided to prevent misinterpretation of the compliance results.",
@@ -3226,25 +3251,40 @@ class ReportGeneratorV2:
             story.append(Spacer(1, 0.12 * inch))
             return
 
-        # Build table with strict column boundaries
-        data = [["Date", "24-Hr LAeq (dB(A))", "Daytime 07-22 (dB(A))", "Nighttime 22-07 (dB(A))", "Daily Lden (dB(A))"]]
+        # Every column is bounded to its own period (analysis.periods). A value
+        # from a period less than 99.5% measured carries an asterisk.
+        story.append(Paragraph(
+            f"Times are {escape(self.time_basis(self._get_timestamp_series(self._resolve_acoustic_columns()[0])))}. "
+            "LAeq is the energy average of the LEQ readings in each period. The night column is the "
+            "night that begins on the evening of the date shown; the Lden column covers the 24 hours "
+            "from 07:00 on that date. * less than 99.5% of the period was measured (coverage in brackets).",
+            styles['BodyText']))
+        story.append(Spacer(1, 0.06 * inch))
+        header = ["Date", "LAeq 00:00–24:00", "LAeq 07:00–22:00",
+                  "LAeq night 22:00–07:00", "Lden 07:00–07:00"]
+        data = [[Paragraph(f"<b>{h}</b><br/>dB(A)", self._table_header_style()) for h in header]]
 
-        for idx, row in self.daily_summary.iterrows():
-            date_str = row.get('Date', 'N/A')
-            if isinstance(date_str, str):
-                try:
-                    date_str = pd.to_datetime(date_str).strftime('%Y-%m-%d')
-                except:
-                    pass
-            
-            laeq_24 = self._fmt_db_plain(row.get('Average_L_EQ_dB'))
-            laeq_day = self._fmt_db_plain(row.get('Daytime_LAeq', 'N/A'))  # May not be in CSV
-            laeq_night = self._fmt_db_plain(row.get('Nighttime_LAeq', 'N/A'))
-            lden = self._fmt_db_plain(row.get('Daily_Lden', 'N/A'))
+        def cell(value, coverage) -> str:
+            text = self._fmt_db_plain(value)
+            try:
+                cov = float(coverage)
+            except (TypeError, ValueError):
+                return text
+            if text not in ('N/A', '') and np.isfinite(cov) and cov < COMPLETE_COVERAGE_PCT:
+                return f"{text}* ({math.floor(cov)}%)"
+            return text
 
-            data.append([str(date_str), laeq_24, str(laeq_day), str(laeq_night), str(lden)])
+        for _, row in self.daily_summary.iterrows():
+            date_str = pd.Timestamp(row.get('Date')).strftime('%Y-%m-%d (%a)')
+            data.append([
+                date_str,
+                cell(row.get('Average_L_EQ_dB'), row.get('Day_Coverage_pct')),
+                cell(row.get('Daytime_LAeq'), row.get('Daytime_Coverage_pct')),
+                cell(row.get('Nighttime_LAeq'), row.get('Night_Coverage_pct')),
+                cell(row.get('Daily_Lden'), row.get('Lden_Coverage_pct')),
+            ])
 
-        table = Table(data, colWidths=[1.4*inch, 1.6*inch, 1.8*inch, 1.8*inch, 1.8*inch])
+        table = Table(data, colWidths=[1.6*inch, 1.7*inch, 1.7*inch, 2.0*inch, 1.7*inch], repeatRows=1)
         table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3D5A80')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
@@ -3782,7 +3822,7 @@ class ReportGeneratorV2:
         )
         fig.update_layout(
             xaxis=dict(
-                title='Time',
+                title=f'Time ({self.zone_abbreviation(ts)})',
                 tickformat=tickformat,
                 showgrid=True,
                 gridcolor='rgba(0,0,0,0.08)',
@@ -3969,7 +4009,7 @@ class ReportGeneratorV2:
             chart2_title = title or 'Chart 2: Diurnal Box-and-Whisker (Hourly LEQ Volatility)'
             fig.update_layout(
                 xaxis=dict(
-                    title='Hour of Day',
+                    title=f'Hour of day ({self.zone_abbreviation(ts)})',
                     categoryorder='array',
                     categoryarray=[f'{h:02d}:00' for h in range(24)],
                     tickmode='array',
@@ -4058,7 +4098,7 @@ class ReportGeneratorV2:
         )
 
         fig.update_layout(
-            xaxis_title='Date', yaxis_title='Hour of Day',
+            xaxis_title='Date', yaxis_title=f'Hour of day ({self.zone_abbreviation(ts)})',
             margin=dict(l=80, r=20, t=85, b=85), height=520,
             plot_bgcolor='white',
             paper_bgcolor='white',

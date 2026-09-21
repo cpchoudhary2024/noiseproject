@@ -288,10 +288,9 @@ function _doMultiUpload(files) {
                 renderBatchFilesPanel();
                 showSection('preview-section');
                 const gapCount = data.gap_analysis?.gap_count || 0;
-                const uptime   = data.gap_analysis?.uptime_pct ?? 100;
                 setStatus('idle',
-                    `${data.file_count} files merged — ${data.rows.toLocaleString()} records · uptime ${uptime}%` +
-                    (gapCount ? ` · ${gapCount} gap(s)` : '')
+                    `${data.file_count} files merged — ${data.rows.toLocaleString()} readings` +
+                    (gapCount ? ` · ${gapCount} interruption${gapCount === 1 ? '' : 's'}` : ' · no interruptions')
                 );
             } else {
                 showError(data.error || 'Multi-file merge failed');
@@ -344,10 +343,9 @@ function handleAddMoreFiles(e) {
                 renderBatchFilesPanel();
                 showSection('preview-section');
                 const gapCount = data.gap_analysis?.gap_count || 0;
-                const uptime   = data.gap_analysis?.uptime_pct ?? 100;
                 setStatus('idle',
-                    `Batch updated — ${data.rows.toLocaleString()} total records across ${data.file_count} file(s)` +
-                    (gapCount ? ` · ${gapCount} gap(s) detected` : ` · uptime ${uptime}%`)
+                    `${data.file_count} file${data.file_count === 1 ? '' : 's'} — ${data.rows.toLocaleString()} readings` +
+                    (gapCount ? ` · ${gapCount} interruption${gapCount === 1 ? '' : 's'}` : ' · no interruptions')
                 );
             } else {
                 showError(data.error || 'Failed to add files to batch');
@@ -476,6 +474,8 @@ function runAnalysis() {
             window.filterSummary = data.filter_summary || null;
             window.keyFindings = data.key_findings || {};
             window.complianceMatrix = data.compliance_matrix || [];
+            window.clockInfo = data.clock || null;
+            window.gapAnalysis = data.gap_analysis || null;
             // Display plain-English summary if returned by server
             displayPlainEnglishSummary(data.plain_english_summary || '');
             try {
@@ -518,50 +518,84 @@ function runAnalysis() {
 function showFilterPanel() {
     if (!uploadedFilepath) { showError('No file uploaded'); return; }
 
-    // Reset filter state (null-guard every element — section may not yet be in DOM on first call)
-    currentFilters = { exclusions: [], bound_start: null, bound_end: null };
-    const startEl   = document.getElementById('filter-bound-start');
-    const endEl     = document.getElementById('filter-bound-end');
-    const listEl    = document.getElementById('exclusionList');
+    currentFilters = { exclusions: [], bound_start: null, bound_end: null, clock: null };
+    const listEl = document.getElementById('exclusionList');
     const previewBar = document.getElementById('filterPreviewBar');
-    if (startEl)    startEl.value = startEl.dataset.extent = '';
-    if (endEl)      endEl.value   = endEl.dataset.extent   = '';
-    if (listEl)     listEl.innerHTML    = '';
+    if (listEl) listEl.innerHTML = '';
     if (previewBar) previewBar.style.display = 'none';
-
     showSection('filter-section');
+    loadClockOptions().then(() => refreshDataExtent());
+}
 
-    // Fetch and display the dataset date range
+// Clock choices come from the server, the single list both sides validate against.
+let clockOptions = null;
+async function loadClockOptions() {
+    if (clockOptions) return;
+    try {
+        const r = await fetch('/api/clock-options');
+        clockOptions = await r.json();
+    } catch (err) {
+        clockOptions = { default: 'America/New_York', options: [{ id: 'America/New_York', label: 'US Eastern, with daylight saving (EST/EDT)' }] };
+    }
+    for (const id of ['clock-source', 'clock-target', 'cmp-clock-source', 'cmp-clock-target']) {
+        const sel = document.getElementById(id);
+        if (!sel) continue;
+        sel.innerHTML = clockOptions.options.map(o =>
+            `<option value="${escapeHtml(o.id)}">${escapeHtml(o.label)}</option>`).join('');
+        sel.value = clockOptions.default;
+    }
+}
+
+function _selectedClock() {
+    const src = document.getElementById('clock-source')?.value;
+    const tgt = document.getElementById('clock-target')?.value;
+    return src && tgt ? { source: src, target: tgt } : null;
+}
+
+function onClockChange() {
+    // Bounds were shown on the previous report clock; re-derive them.
+    refreshDataExtent();
+}
+
+// Naive ISO timestamps are shown as written: parsing them with Date would apply
+// the viewer's own time zone and shift times inside a daylight-saving change.
+const isoToInput = iso => String(iso || '').slice(0, 19);
+const isoToText = iso => String(iso || '').slice(0, 19).replace('T', ' ');
+
+function refreshDataExtent() {
+    const clock = _selectedClock();
     fetch('/api/get-data-date-range', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filepath: uploadedFilepath }),
+        body: JSON.stringify({ filepath: uploadedFilepath, clock }),
     })
     .then(r => r.json())
     .then(data => {
         const bar  = document.getElementById('filterInfoBar');
         const text = document.getElementById('filterInfoText');
         const rows = document.getElementById('filterInfoRows');
-        if (!bar || !text || !rows) return;
-        if (data.success) {
-            const fmt = iso => new Date(iso).toLocaleString();
-            text.textContent = `Dataset spans: ${fmt(data.start)} → ${fmt(data.end)}`;
-            rows.textContent = `${data.total_rows.toLocaleString()} rows`;
-            bar.style.display = 'flex';
-
-            // Pre-fill bounds with actual data extents (user can narrow them)
-            const toLocalDT = iso => {
-                const d = new Date(iso);
-                const pad = n => String(n).padStart(2, '0');
-                return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-            };
-            const sEl = document.getElementById('filter-bound-start');
-            const eEl = document.getElementById('filter-bound-end');
-            // Remember the pre-filled extents: a bound left at the dataset's own
-            // edge restricts nothing and must not be sent as a filter.
-            if (sEl) sEl.value = sEl.dataset.extent = toLocalDT(data.start);
-            if (eEl) eEl.value = eEl.dataset.extent = toLocalDT(data.end);
+        const ev   = document.getElementById('clockEvidence');
+        if (!data.success) {
+            if (ev) ev.textContent = data.error || 'The time zone setting could not be applied.';
+            return;
         }
+        if (bar && text && rows) {
+            text.textContent = `Record spans ${isoToText(data.start)} to ${isoToText(data.end)} (${data.clock?.abbreviations || ''})`;
+            rows.textContent = `${Number(data.total_rows).toLocaleString()} readings`;
+            bar.style.display = 'flex';
+        }
+        if (ev) {
+            const d = data.detected_clock || {};
+            const mismatch = (d.follows_dst === true && clock && /^(UTC|Etc\/)/.test(clock.source))
+                || (d.follows_dst === false && clock && !/^(UTC|Etc\/|America\/Phoenix)/.test(clock.source));
+            ev.textContent = (d.evidence || '') + (mismatch ? ' Check the logger clock setting above: it does not match this.' : '');
+            ev.classList.toggle('warn', !!mismatch);
+        }
+        // A bound left at the record's own edge restricts nothing and is not sent.
+        const sEl = document.getElementById('filter-bound-start');
+        const eEl = document.getElementById('filter-bound-end');
+        if (sEl) sEl.value = sEl.dataset.extent = isoToInput(data.start);
+        if (eEl) eEl.value = eEl.dataset.extent = isoToInput(data.end);
     })
     .catch(err => console.warn('Date range fetch failed:', err));
 }
@@ -590,7 +624,7 @@ function addExclusionRow() {
 }
 
 function _collectFilters() {
-    const filters = { exclusions: [], bound_start: null, bound_end: null };
+    const filters = { exclusions: [], bound_start: null, bound_end: null, clock: _selectedClock() };
     const startEl = document.getElementById('filter-bound-start');
     const endEl   = document.getElementById('filter-bound-end');
     const s = startEl ? startEl.value : '';
@@ -636,7 +670,9 @@ async function previewFilters() {
 // The filters to send with a request, or null when none were set.
 function _activeFilters() {
     const f = currentFilters;
-    return (f && (f.exclusions.length || f.bound_start || f.bound_end)) ? f : null;
+    if (!f) return null;
+    const converts = f.clock && f.clock.source !== f.clock.target;
+    return (f.exclusions.length || f.bound_start || f.bound_end || converts) ? f : null;
 }
 
 function applyFiltersAndAnalyze() {
@@ -645,12 +681,19 @@ function applyFiltersAndAnalyze() {
 }
 
 function skipFilters() {
-    currentFilters = { exclusions: [], bound_start: null, bound_end: null };
+    // "Use all data" still honours the time zone setting.
+    currentFilters = { exclusions: [], bound_start: null, bound_end: null, clock: _selectedClock() };
     runAnalysis();
 }
 
+// null, undefined and '' mean "no value"; Number() would turn them into 0,
+// which then plots and prints as a real 0 dB.
+function toNumber(v) {
+    return (v === null || v === undefined || v === '') ? NaN : Number(v);
+}
+
 function safeToFixed(value, decimals = 2, fallback = 'N/A') {
-    const num = Number(value);
+    const num = toNumber(value);
     if (!Number.isFinite(num)) return fallback;
     return num.toFixed(decimals);
 }
@@ -667,8 +710,8 @@ function renderMetricsPanel() {
 
     const kf = window.keyFindings || {};
     const timeValid = !(window.timestampIntegrity && window.timestampIntegrity.time_metrics_valid === false);
-    const num = v => Number.isFinite(Number(v));
-    const fmt = v => num(v) ? Number(v).toFixed(1) : '—';
+    const num = v => Number.isFinite(toNumber(v));
+    const fmt = v => num(v) ? toNumber(v).toFixed(1) : '—';
     const hh = h => `${String(h).padStart(2, '0')}:00–${String((Number(h) + 1) % 24).padStart(2, '0')}:00`;
 
     // [label, value, unit, qualifier]. Guideline values are stated as numbers
@@ -710,57 +753,40 @@ function renderGapAnalysis(gapData) {
     const section = document.getElementById('gapLogSection');
     const content = document.getElementById('gapLogContent');
     if (!section || !content) return;
-
-    if (!gapData) {
-        section.style.display = 'none';
-        return;
-    }
-
+    if (!gapData) { section.style.display = 'none'; return; }
     section.style.display = 'block';
 
-    const uptime     = Number(gapData.uptime_pct ?? 100).toFixed(1);
-    const gapCount   = gapData.gap_count || 0;
-    const minorCount = gapData.minor_gap_count || 0;
-    const majorCount = gapData.major_gap_count || 0;
-    const missingMin = ((gapData.missing_seconds || 0) / 60).toFixed(1);
-    const isContinuous = gapData.continuous !== false && gapCount === 0;
+    // Floored, never rounded up: missing readings must not display as 100%.
+    const pct = Math.floor(Number(gapData.uptime_pct ?? 100) * 100) / 100;
+    const gaps = gapData.gaps || [];
+    const changes = gapData.clock_changes || [];
+    const missing = formatSeconds(gapData.missing_seconds || 0);
 
-    let html = '';
+    let html = gaps.length
+        ? `<div class="gap-log-status disrupted">${gaps.length} interruption${gaps.length === 1 ? '' : 's'} with no readings
+            (${gapData.minor_gap_count || 0} shorter than 15 min, ${gapData.major_gap_count || 0} of 15 min or longer), totalling ${missing}.</div>`
+        : `<div class="gap-log-status continuous">No interruptions: a reading is present at every logging interval.</div>`;
 
-    // Status banner
-    if (isContinuous) {
-        html += `<div class="gap-log-status continuous">
-            <span>Continuous temporal alignment verified. No gaps detected.</span>
-        </div>`;
-    } else {
-        html += `<div class="gap-log-status disrupted">
-            <span><strong>${gapCount} disruption(s) detected</strong> — ${minorCount} Minor, ${majorCount} Major.
-            Total missing data: ${missingMin} min.</span>
-        </div>`;
-    }
-
-    // Uptime progress bar
-    const fillWidth = Math.min(100, Math.max(0, Number(uptime)));
     html += `<div class="gap-uptime-bar">
-        <div class="gap-uptime-track">
-            <div class="gap-uptime-fill" style="width:${fillWidth}%;"></div>
-        </div>
-        <span class="gap-uptime-label">Uptime: ${uptime}%</span>
+        <div class="gap-uptime-track"><div class="gap-uptime-fill" style="width:${Math.min(100, Math.max(0, pct))}%;"></div></div>
+        <span class="gap-uptime-label">Data completeness ${pct.toFixed(2)}%</span>
     </div>`;
 
-    // Gaps list
-    if (gapData.gaps && gapData.gaps.length > 0) {
+    if (gaps.length || changes.length || (gapData.excluded || []).length) {
         html += `<ul class="gap-items-list">`;
-        gapData.gaps.forEach(g => {
+        gaps.forEach(g => {
             const cls = g.category === 'Minor' ? 'minor' : 'major';
-            html += `<li class="gap-item ${cls}">
-                <span class="gap-badge ${cls}">${escapeHtml(g.category)}</span>
-                <span>${escapeHtml(g.label)}</span>
-            </li>`;
+            html += `<li class="gap-item ${cls}"><span class="gap-badge ${cls}">${g.category === 'Minor' ? '&lt; 15 min' : '≥ 15 min'}</span>
+                <span>${escapeHtml(g.label)}</span></li>`;
+        });
+        changes.forEach(c => {
+            html += `<li class="gap-item clock"><span class="gap-badge clock">Clock</span><span>${escapeHtml(c.label)}</span></li>`;
+        });
+        (gapData.excluded || []).forEach(x => {
+            html += `<li class="gap-item clock"><span class="gap-badge clock">Excluded</span><span>${escapeHtml(x.label)}</span></li>`;
         });
         html += `</ul>`;
     }
-
     content.innerHTML = html;
 }
 
@@ -823,7 +849,7 @@ function renderComplianceMatrix(matrixRows) {
     const categories = {
         who_env:    { label: 'WHO 2018 — Environmental (Road Traffic, Aircraft & Railway)', rows: [] },
         who_indoor: { label: 'WHO 1999 / 2018 — Indoor (Bedroom)', rows: [] },
-        maryland:   { label: 'Maryland COMAR 26.02.03 — Legal Limits &amp; State Goals', rows: [] },
+        maryland:   { label: 'Maryland COMAR 26.02.03 — Legal Limits and State Goals', rows: [] },
     };
 
     matrixRows.forEach(r => {
@@ -853,7 +879,7 @@ function renderComplianceMatrix(matrixRows) {
         cat.rows.forEach(r => {
             const indicative = r.kind === 'indicative';
             const pass   = r.status === 'PASS';
-            const delta  = Number(r.delta_db);
+            const delta  = toNumber(r.delta_db);
             const deltaStr = Number.isFinite(delta)
                 ? (delta >= 0 ? `+${delta.toFixed(1)}` : delta.toFixed(1))
                 : '—';
@@ -866,6 +892,11 @@ function renderComplianceMatrix(matrixRows) {
                 pillCls  = 'indicative';
                 pillIcon = 'ⓘ';
                 pillText = 'Indicative';
+            } else if (/goal/i.test(r.standard || '')) {
+                // COMAR Table 1 values are goals, not limits: no pass/fail verdict.
+                pillCls  = pass ? 'pass' : 'fail';
+                pillIcon = '';
+                pillText = pass ? 'At or below goal' : 'Above goal';
             } else {
                 pillCls  = pass ? 'pass' : 'fail';
                 pillIcon = pass ? '✓' : '✕';
@@ -883,7 +914,7 @@ function renderComplianceMatrix(matrixRows) {
                 <td class="cm-metric">${escapeHtml(r.metric)}</td>
                 <td class="cm-measured">${safeToFixed(r.measured_db, 1)} dB(A)</td>
                 <td class="cm-limit">${safeToFixed(r.limit_db, 1)} dB(A)${indicative ? ' <span class="cm-ref-tag">ref</span>' : ''}</td>
-                <td><span class="status-pill ${pillCls}">${pillIcon} ${pillText}</span></td>
+                <td><span class="status-pill ${pillCls}">${pillIcon ? pillIcon + ' ' : ''}${pillText}</span></td>
                 <td class="cm-delta ${deltaCls}">${deltaStr}</td>
             </tr>`;
         });
@@ -891,14 +922,14 @@ function renderComplianceMatrix(matrixRows) {
 
     html += `</tbody></table>
     <div class="cm-caveats">
-        <p><strong>Indicative reference rows (aircraft, railway):</strong> the sound level meter measures
-        total combined acoustic energy and cannot confirm the source, so these source-specific WHO guidelines
-        are shown as reference comparisons only — not pass/fail verdicts.</p>
+        <p><strong>Indicative rows:</strong> aircraft and railway guidelines are source-specific and the meter
+        cannot identify the source; the indoor bedroom LAmax guideline concerns how often 45 dB is exceeded
+        in a night, which a single maximum cannot decide. These rows are reference comparisons, not pass/fail verdicts.</p>
         <p><strong>Measurement window:</strong> WHO 2018 intends Lden/Lnight as long-term <em>annual average</em>
         exposure. A monitoring period of days or weeks is indicative of conditions during that window only.</p>
-        <p class="table-note">Delta = Measured − Limit. Negative = below limit (compliant). Positive = exceedance.
-        A legal PASS under Maryland COMAR does not imply absence of health risk — WHO limits are stricter.
-        Hover the ⓘ icon for clinical basis.</p>
+        <p class="table-note">Delta = measured − limit; a positive delta is an exceedance. The Maryland residential
+        goal (COMAR 26.02.03.02, Table 1) is a target, not an enforceable limit. Hover ⓘ for each metric's
+        definition and source.</p>
     </div>`;
 
     container.innerHTML = html;
@@ -910,22 +941,37 @@ function renderFilterBanner() {
     if (!bar || !txt) return;
     const f = window.filterSummary;
     if (!f || !f.applied) { bar.style.display = 'none'; return; }
-    const fmt = (iso) => {
-        if (!iso) return '\u2014';
-        const d = new Date(iso);
-        return Number.isNaN(d.getTime()) ? '\u2014'
-            : d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
-    };
-    const pct = f.rows_before ? Math.round(1000 * f.rows_after / f.rows_before) / 10 : 0;
-    txt.textContent = ' Everything below \u2014 and every report you download \u2014 covers '
-        + fmt(f.range_start) + ' to ' + fmt(f.range_end) + ' only: '
-        + Number(f.rows_after).toLocaleString() + ' of '
-        + Number(f.rows_before).toLocaleString() + ' readings (' + pct + '%).';
+    const parts = [];
+    if (f.clock_converted && window.clockInfo) {
+        parts.push(`Times converted from ${window.clockInfo.source_label} to ${window.clockInfo.target_label}.`);
+    }
+    if (f.date_filtered) {
+        const pct = f.rows_before ? Math.floor(1000 * f.rows_after / f.rows_before) / 10 : 0;
+        parts.push(`Every result, chart, report and export covers ${isoToText(f.range_start)} to `
+            + `${isoToText(f.range_end)} only: ${Number(f.rows_after).toLocaleString()} of `
+            + `${Number(f.rows_before).toLocaleString()} readings (${pct}%).`);
+    }
+    if (!parts.length) { bar.style.display = 'none'; return; }
+    txt.textContent = ' ' + parts.join(' ');
     bar.style.display = 'block';
+}
+
+function formatSeconds(seconds) {
+    const t = Math.round(Number(seconds) || 0);
+    const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = t % 60;
+    if (h) return m ? `${h} h ${m} min` : `${h} h`;
+    if (m) return sec ? `${m} min ${sec} s` : `${m} min`;
+    return `${sec} s`;
+}
+
+function renderTimeBasis() {
+    const el = document.getElementById('timeBasisText');
+    if (el) el.textContent = window.clockInfo?.time_basis || '';
 }
 
 function displayResults() {
     renderFilterBanner();
+    renderTimeBasis();
     if (!currentAnalysis) return;
 
     const analysis = currentAnalysis;
@@ -935,8 +981,9 @@ function displayResults() {
     const timeValid = applyTimestampIntegrity();
 
     // MODULE 6: Data Continuity Log — prefer gap from multi-file merge, fall back to analyze response
-    const gapData = window.mergeGapReport || analysis.gap_analysis || null;
-    renderGapAnalysis(gapData);
+    // The analysis endpoint's inventory describes the record actually analysed
+    // (after any date filter and clock conversion); the merge-time report does not.
+    renderGapAnalysis(window.gapAnalysis || null);
 
     renderMetricsPanel();
 
@@ -1068,7 +1115,7 @@ function displayExecutiveSummary(statistics) {
     const col   = getPrimaryNoiseColumn();
     const stats = statistics[col] || {};
     const env   = (currentAnalysis?.environmental_metrics || {})[col] || {};
-    const fmt   = v => Number.isFinite(Number(v)) ? Number(v).toFixed(1) : '—';
+    const fmt   = v => Number.isFinite(toNumber(v)) ? toNumber(v).toFixed(1) : '—';
 
     const rows = [
         ['LAeq, whole record',  'All readings',                                   stats.laeq_db],
@@ -1107,10 +1154,10 @@ function displayStatistics(statistics, percentiles) {
         container.innerHTML = '<p class="empty-note">No statistics available.</p>';
         return;
     }
-    const fmt = v => Number.isFinite(Number(v)) ? Number(v).toFixed(1) : '—';
+    const fmt = v => Number.isFinite(toNumber(v)) ? toNumber(v).toFixed(1) : '—';
     const pct = (c, k) => ((percentiles || {})[c] || {})[k];
     const spread = c => {
-        const hi = Number(pct(c, 'L10')), lo = Number(pct(c, 'L90'));
+        const hi = toNumber(pct(c, 'L10')), lo = toNumber(pct(c, 'L90'));
         return Number.isFinite(hi) && Number.isFinite(lo) ? hi - lo : NaN;
     };
 
@@ -1209,7 +1256,7 @@ function displayCharts() {
 
     // Sort by date and extract per-day values
     const sorted = [...dailyRecords]
-        .filter(r => r.Date && Number.isFinite(Number(r.Average_L_EQ_dB)))
+        .filter(r => r.Date && Number.isFinite(toNumber(r.Average_L_EQ_dB)))
         .sort((a, b) => new Date(a.Date) - new Date(b.Date));
 
     if (!sorted.length) {
@@ -1218,9 +1265,9 @@ function displayCharts() {
     }
 
     const dates       = sorted.map(r => String(r.Date).substring(0, 10));
-    const laeqDaily   = sorted.map(r => Number(r.Average_L_EQ_dB));
+    const laeqDaily   = sorted.map(r => toNumber(r.Average_L_EQ_dB));
     const nightlyLaeq = sorted.map(r => {
-        const v = Number(r.Nighttime_LAeq);
+        const v = toNumber(r.Nighttime_LAeq);
         return Number.isFinite(v) ? v : null;
     });
     const hasNightData = nightlyLaeq.some(v => v !== null);
@@ -1233,26 +1280,35 @@ function displayCharts() {
     const tYMax = Math.ceil(Math.max(...allVals) + 4);
     const tYMin = Math.floor(Math.min(...allVals) - 4);
 
+    // Partial periods (the first and last day of a record, or days with gaps)
+    // are drawn hollow and their coverage is given on hover.
+    const COMPLETE = 99.5;
+    const dayCov = sorted.map(r => toNumber(r.Day_Coverage_pct));
+    const nightCov = sorted.map(r => toNumber(r.Night_Coverage_pct));
+    const symbols = (cov, filled) => cov.map(c => (Number.isFinite(c) && c < COMPLETE) ? `${filled}-open` : filled);
+    const covText = cov => cov.map(c => Number.isFinite(c) ? `${Math.floor(c * 10) / 10}% of the period measured` : '');
     const trendData = [
         {
             x: dates, y: laeqDaily,
-            name: 'LAeq, whole day',
+            name: 'LAeq, calendar day (00:00–24:00)',
             type: 'scatter', mode: lineMode,
             line: { color: CHART_COLORS.primary, width: 2 },
-            marker: { size: 6, color: CHART_COLORS.primary, symbol: 'circle' },
+            marker: { size: 7, color: CHART_COLORS.primary, symbol: symbols(dayCov, 'circle'), line: { width: 1.5, color: CHART_COLORS.primary } },
             connectgaps: false,
-            hovertemplate: '%{x}<br>LAeq: %{y:.1f} dB(A)<extra></extra>',
+            customdata: covText(dayCov),
+            hovertemplate: '%{x}<br>LAeq: %{y:.1f} dB(A)<br>%{customdata}<extra></extra>',
         },
     ];
     if (hasNightData) {
         trendData.push({
             x: dates, y: nightlyLaeq,
-            name: 'LAeq, night (22:00–07:00)',
+            name: 'LAeq, night beginning this evening (22:00–07:00)',
             type: 'scatter', mode: lineMode,
             line: { color: CHART_COLORS.secondary, width: 2, dash: 'dot' },
-            marker: { size: 6, color: CHART_COLORS.secondary, symbol: 'square' },
+            marker: { size: 7, color: CHART_COLORS.secondary, symbol: symbols(nightCov, 'square'), line: { width: 1.5, color: CHART_COLORS.secondary } },
             connectgaps: false,
-            hovertemplate: '%{x}<br>Night LAeq: %{y:.1f} dB(A)<extra></extra>',
+            customdata: covText(nightCov),
+            hovertemplate: 'Night beginning %{x}<br>LAeq: %{y:.1f} dB(A)<br>%{customdata}<extra></extra>',
         });
     }
 
@@ -1260,14 +1316,18 @@ function displayCharts() {
     // and Lnight guideline VALUES, which are penalty-weighted long-term averages.
     // They are drawn as neutral references so no day reads as a pass or fail.
     const trendLayout = baseChartLayout({
-        xaxis: { title: { text: 'Date' }, type: 'category', tickangle: dates.length > 10 ? -45 : 0 },
+        xaxis: { title: { text: `Date (${window.clockInfo?.abbreviations || 'local time'})` }, type: 'date', tickformat: '%b %d',
+                 dtick: dates.length > 31 ? undefined : 86400000 * (dates.length > 14 ? 2 : 1) },
         yaxis: { title: { text: 'Sound level, LAeq (dB(A))' }, range: [tYMin, tYMax] },
+        legend: { orientation: 'h', x: 0, xanchor: 'left', y: 1.02, yanchor: 'bottom' },
+        margin: { t: 36, r: 24, b: 56, l: 64 },
         height: 420,
         shapes: referenceLines([53, 45]),
         annotations: referenceLabels([[53, 'WHO Lden guideline value, 53'], [45, 'WHO Lnight guideline value, 45']]),
     });
 
     try {
+        timeChart.innerHTML = '';  // drop any placeholder message before plotting
         Plotly.newPlot(timeChart, trendData, trendLayout, CHART_CONFIG);
     } catch (e) {
         console.error('Daily trend chart failed:', e);
@@ -1325,14 +1385,13 @@ function displayStandards(_standards) {
         ${stdTable(
             ['Setting', 'Metric', 'Limit', 'Applies To'],
             [
-                ['Bedroom — sleep protection', 'LAeq', limitBadge('≤ 30 dB(A)'), 'Night (22:00–07:00)'],
-                ['Bedroom — sleep protection', 'LAmax (fast)', limitBadge('≤ 45 dB(A)'), 'Night (single events)'],
-                ['Living room / residential', 'LAeq', limitBadge('≤ 35 dB(A)'), 'Day / Evening'],
-                ['School classroom', 'LAeq', limitBadge('≤ 35 dB(A)'), 'During class hours'],
-                ['School classroom background', 'LAeq', limitBadge('≤ 35 dB(A)'), 'Unoccupied (HVAC + external)'],
-                ['Hospital — patient ward', 'LAeq', limitBadge('≤ 35 dB(A)'), 'Day'],
-                ['Hospital — patient ward', 'LAeq', limitBadge('≤ 30 dB(A)'), 'Night'],
-                ['Outdoor living / garden areas', 'LAeq', limitBadge('≤ 55 dB(A)'), 'Day / Evening (serious annoyance threshold)'],
+                ['Inside bedrooms — sleep disturbance', 'LAeq', limitBadge('≤ 30 dB(A)'), 'Night-time, 8 h'],
+                ['Inside bedrooms — sleep disturbance', 'LAmax (fast)', limitBadge('≤ 45 dB(A)'), 'Night-time, single events'],
+                ['Dwelling, indoors — speech intelligibility, moderate annoyance', 'LAeq', limitBadge('≤ 35 dB(A)'), 'Daytime and evening, 16 h'],
+                ['School classrooms, indoors', 'LAeq', limitBadge('≤ 35 dB(A)'), 'During class'],
+                ['Hospital ward rooms, indoors', 'LAeq', limitBadge('≤ 30 dB(A)'), 'Daytime and evening, 16 h'],
+                ['Hospital ward rooms, indoors', 'LAeq', limitBadge('≤ 30 dB(A)'), 'Night-time, 8 h'],
+                ['Outdoor living area — serious annoyance', 'LAeq', limitBadge('≤ 55 dB(A)'), 'Daytime and evening, 16 h'],
             ],
         )}
         <p class="ref-source">Source: WHO (1999) Guidelines for Community Noise, Geneva. Edited by Berglund B, Lindvall T, Schwela DH. ISBN 92-4-154553-4.</p>
@@ -1400,7 +1459,8 @@ function displayStandards(_standards) {
             [
                 ['Protect against hearing loss (lifetime exposure)', 'Leq(24h)', limitBadge('≤ 70 dB(A)'), 'All environments'],
                 ['Prevent activity interference & annoyance', 'Ldn (day-night avg)', limitBadge('≤ 55 dB(A)'), 'Outdoor residential'],
-                ['Prevent activity interference & annoyance', 'Leq (24h)', limitBadge('≤ 45 dB(A)'), 'Indoor residential / schools / hospitals'],
+                ['Prevent activity interference & annoyance', 'Ldn', limitBadge('≤ 45 dB(A)'), 'Indoor residential'],
+                ['Prevent activity interference & annoyance', 'Leq (24h)', limitBadge('≤ 45 dB(A)'), 'Indoor areas with human activities, e.g. schools'],
             ],
         )}
         <p class="ref-source">Source: US EPA (1974). Information on Levels of Environmental Noise Requisite to Protect Public Health and Welfare with an Adequate Margin of Safety. EPA/ONAC 550/9-74-004.</p>
@@ -1467,7 +1527,7 @@ function displayStandards(_standards) {
     container.innerHTML = `
         <div class="ref-wrapper">
           <div class="ref-intro">
-            <p class="section-note">Every value below was checked against the primary source document, not a secondary summary. Each limit is shown with the averaging period it is defined over. Start with &ldquo;How to read a noise limit&rdquo; if any of the metrics are unfamiliar.</p>
+            <p class="section-note">The WHO 2018 and Maryland COMAR 26.02.03 values used in the compliance matrix were checked against the primary documents (5 Aug 2026). The WHO 1999, US EPA 1974 and occupational values are listed from the cited documents for reference and are not used in any result. Each limit is shown with the averaging period it is defined over.</p>
           </div>
           ${s0}${s0b}${s1}${s2}${s3}${s4}${s5}
         </div>`;
@@ -1559,8 +1619,8 @@ function displayRollingMedianChart() {
         const sorted = [...hourlySummary].sort((a, b) => Number(a.Hour) - Number(b.Hour));
         const hourValues = sorted.map(h => Number(h.Hour));
         const xLabels = sorted.map(h => `${String(Number(h.Hour)).padStart(2, '0')}:00`);
-        const yLaeq   = sorted.map(h => Number(h.Average_L_EQ_dB));
-        const xTitle  = 'Hour of day (start of hour)';
+        const yLaeq   = sorted.map(h => { const v = toNumber(h.Average_L_EQ_dB); return Number.isFinite(v) ? v : null; });
+        const xTitle  = `Hour of day (start of hour, ${window.clockInfo?.abbreviations || 'local time'})`;
 
         const validY = yLaeq.filter(Number.isFinite);
         if (validY.length === 0) {
@@ -1620,6 +1680,7 @@ function displayRollingMedianChart() {
             shapes, annotations,
         });
 
+        container.innerHTML = '';
         Plotly.newPlot(container, [rawTrace], layout, CHART_CONFIG);
     } catch (e) {
         console.error('Hourly trend chart failed:', e);
@@ -1654,7 +1715,9 @@ async function displayBoxWhiskerChart() {
             throw new Error('Invalid box plot chart data returned by server');
         }
 
-        await Plotly.newPlot(container, chart.data, chart.layout, { responsive: true });
+        container.innerHTML = '';
+        await Plotly.newPlot(container, chart.data, chart.layout, CHART_CONFIG);
+        await Plotly.relayout(container, { 'xaxis.title.text': `Hour of day (start of hour, ${window.clockInfo?.abbreviations || 'local time'})` });
     } catch (e) {
         console.error('Box plot failed:', e);
         container.textContent = 'Box-and-whisker chart failed to render.';
@@ -1689,7 +1752,9 @@ async function displayHeatmapChart() {
             throw new Error('Invalid heatmap chart data returned by server');
         }
 
-        await Plotly.newPlot(container, chart.data, chart.layout, { responsive: true });
+        container.innerHTML = '';
+        await Plotly.newPlot(container, chart.data, chart.layout, CHART_CONFIG);
+        await Plotly.relayout(container, { 'yaxis.title.text': `Hour of day (start of hour, ${window.clockInfo?.abbreviations || 'local time'})` });
     } catch (e) {
         console.error('Heatmap failed:', e);
         container.textContent = 'Heatmap chart failed to render.';
@@ -1730,7 +1795,7 @@ function displayPlainEnglishSummary(text) {
     card.style.display = 'block';
 }
 
-function generateReport(reportType, format = 'html') {
+function generateReport(reportType, format = 'pdf') {
     if (!uploadedFilepath) {
         showError('No file to generate report for');
         return;
@@ -2001,7 +2066,7 @@ function exportData() {
         headers: {
             'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ filepath: uploadedFilepath, filters: _activeFilters() })
+        body: JSON.stringify({ filepath: uploadedFilepath, filters: _activeFilters(), environment: deploymentEnvironment })
     })
     .then(response => {
         if (response.ok) {
@@ -2136,6 +2201,7 @@ let compareDatasets = null;
 function showCompareSection() {
     showSection('compare-section');
     _initCompareDropzone();
+    loadClockOptions();
 }
 
 function _initCompareDropzone() {
@@ -2218,15 +2284,17 @@ function clearCompareFiles() {
     if (loading) loading.style.display = 'none';
 }
 
+function showCompareError(message) {
+    const el = document.getElementById('compareError');
+    if (!el) return;
+    el.textContent = message;
+    el.style.display = message ? 'block' : 'none';
+}
+
 async function runComparison() {
-    if (compareFilesList.length < 2) {
-        alert('Please add at least 2 files to compare.');
-        return;
-    }
-    if (compareFilesList.length > 6) {
-        alert('Maximum 6 files can be compared at once.');
-        return;
-    }
+    showCompareError('');
+    if (compareFilesList.length < 2) { showCompareError('Add at least 2 files to compare.'); return; }
+    if (compareFilesList.length > 6) { showCompareError('At most 6 files can be compared at once.'); return; }
 
     const btn = document.getElementById('compareAnalyzeBtn');
     if (btn) { btn.disabled = true; btn.textContent = 'Comparing…'; }
@@ -2235,9 +2303,12 @@ async function runComparison() {
 
     const formData = new FormData();
     compareFilesList.forEach(f => formData.append('files[]', f));
-    // Custom labels (default = filename without extension) — used as the location names.
-    formData.append('labels', JSON.stringify(
-        compareFilesList.map(f => (f._label || '').trim() || f.name)));
+    // One clock setting for every location, applied exactly as in single-record analysis.
+    formData.append('clock_source', document.getElementById('cmp-clock-source')?.value || '');
+    formData.append('clock_target', document.getElementById('cmp-clock-target')?.value || '');
+    // Labels typed by the user. Blank ones get a neutral "Location N" on the
+    // server: file names can carry a participant's name or address.
+    formData.append('labels', JSON.stringify(compareFilesList.map(f => (f._label || '').trim())));
 
     try {
         const res = await fetch('/api/compare', { method: 'POST', body: formData });
@@ -2251,7 +2322,7 @@ async function runComparison() {
         _renderComparisonResults(compareDatasets);
     } catch (err) {
         document.getElementById('compareLoading').style.display = 'none';
-        alert('Comparison failed: ' + err.message);
+        showCompareError('Comparison failed: ' + err.message);
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = 'Compare'; }
     }
@@ -2274,14 +2345,16 @@ function _renderCompareStatusCards(datasets) {
     const el = document.getElementById('compareStatusCards');
     if (!el) return;
 
-    const ds = [...datasets].sort((a, b) => (b.lden ?? b.laeq ?? 0) - (a.lden ?? a.laeq ?? 0)); // loudest first
+    // One metric for every location (Lden when all have it, else LAeq), highest first.
+    const key = datasets.every(d => d.lden != null) ? 'lden' : 'laeq';
+    const ds = [...datasets].sort((a, b) => (b[key] ?? -Infinity) - (a[key] ?? -Infinity));
 
     const badge = (v, limit) => {
         if (v == null) return `<span class="cmp-badge na">—</span>`;
         if (v <= limit) return `<span class="cmp-badge ok">At or below guideline value</span>`;
         return `<span class="cmp-badge bad">Above by ${(v - limit).toFixed(1)} dB</span>`;
     };
-    const val = v => v != null ? `${Number(v).toFixed(1)}<span class="cmp-unit"> dB</span>` : '—';
+    const val = v => v != null ? `${Number(v).toFixed(1)}<span class="cmp-unit"> dB(A)</span>` : '—';
 
     el.innerHTML = ds.map((d, i) => {
         const exceeds = (d.lden != null && d.lden > 53) || (d.lnight != null && d.lnight > 45);
@@ -2324,18 +2397,27 @@ function _renderCompareMetricsTable(datasets) {
     const metrics = [
         { label: 'Monitoring period',        key: 'date_range',     fmt: v => v || 'N/A', who: null },
         { label: 'Duration',                 key: 'duration_label', fmt: v => v || 'N/A', who: null },
-        { label: 'LAeq, whole record',       key: 'laeq',           fmt: v => v != null ? `${_fmt(v)} dB` : 'N/A', who: null },
-        { label: 'Lden',                     key: 'lden',           fmt: v => v != null ? `${_fmt(v)} dB` : 'N/A', who: { limit: WHO_DAY,   higher_is_bad: true } },
-        { label: 'Lnight',                   key: 'lnight',         fmt: v => v != null ? `${_fmt(v)} dB` : 'N/A', who: { limit: WHO_NIGHT, higher_is_bad: true } },
-        { label: 'LAmax',                    key: 'lmax',           fmt: v => v != null ? `${_fmt(v)} dB` : 'N/A', who: null },
-        { label: 'L90',                      key: 'l90',            fmt: v => v != null ? `${_fmt(v)} dB` : 'N/A', who: null },
+        { label: 'Times',                    key: 'abbreviations',  fmt: v => v || 'N/A', who: null },
+        { label: 'Data completeness',        key: 'completeness_pct', fmt: (v, d) => {
+            if (v == null) return 'N/A';
+            let t = `${Number(v).toFixed(2)}%`;
+            if (d.n_gaps) t += ` · ${d.n_gaps} interruption${d.n_gaps === 1 ? '' : 's'}, ${formatSeconds(d.missing_seconds)}`;
+            if (d.n_clock_changes) t += ' · DST change (not missing)';
+            return t;
+        }, who: null },
+        { label: 'LAeq, whole record',       key: 'laeq',           fmt: v => v != null ? `${_fmt(v)} dB(A)` : 'N/A', who: null },
+        { label: 'Lden',                     key: 'lden',           fmt: v => v != null ? `${_fmt(v)} dB(A)` : 'N/A', who: { limit: WHO_DAY,   higher_is_bad: true } },
+        { label: 'Lnight',                   key: 'lnight',         fmt: v => v != null ? `${_fmt(v)} dB(A)` : 'N/A', who: { limit: WHO_NIGHT, higher_is_bad: true } },
+        { label: 'LAmax',                    key: 'lmax',           fmt: v => v != null ? `${_fmt(v)} dB(A)` : 'N/A', who: null },
+        { label: 'L10',                      key: 'l10',            fmt: v => v != null ? `${_fmt(v)} dB(A)` : 'N/A', who: null },
+        { label: 'L90',                      key: 'l90',            fmt: v => v != null ? `${_fmt(v)} dB(A)` : 'N/A', who: null },
     ];
 
     const headerRow = `<tr><th class="metric-label">Metric</th>${datasets.map(d => `<th>${escapeHtml(d.name)}</th>`).join('')}</tr>`;
     const bodyRows = metrics.map(m => {
         const cells = datasets.map(d => {
             const raw = d[m.key];
-            const display = m.fmt(raw);
+            const display = escapeHtml(m.fmt(raw, d));
             let cls = '';
             if (m.who && raw != null) {
                 cls = Number(raw) > m.who.limit ? 'who-fail' : 'who-pass';
@@ -2363,7 +2445,7 @@ function _renderCompareDiurnalChart(datasets) {
     }));
 
     const layout = baseChartLayout({
-        xaxis: { title: { text: 'Hour of day (start of hour)' }, tickangle: -45 },
+        xaxis: { title: { text: `Hour of day (start of hour, ${[...new Set(datasets.flatMap(d => String(d.abbreviations || '').split('/').filter(Boolean)))].sort().join('/') || 'local time'})` }, tickangle: -45 },
         yaxis: { title: { text: 'Sound level, LAeq (dB(A))' } },
         margin: { t: 16, r: 24, b: 72, l: 64 },
         legend: { orientation: 'h', x: 0, y: -0.28 },
@@ -2377,7 +2459,7 @@ function _renderCompareDiurnalChart(datasets) {
 
 async function downloadCompareReport() {
     if (!compareDatasets || compareDatasets.length < 2) {
-        alert('Run a comparison first before downloading the report.');
+        showCompareError('Run a comparison before downloading the report.');
         return;
     }
     const btn = document.getElementById('compareReportBtn');
@@ -2403,7 +2485,7 @@ async function downloadCompareReport() {
         a.remove();
         URL.revokeObjectURL(url);
     } catch (err) {
-        alert('Report generation failed: ' + err.message);
+        showCompareError('Report generation failed: ' + err.message);
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = 'Comparison report (PDF)'; }
     }

@@ -138,6 +138,9 @@ class StandardRow:
     source_specific: bool = False
     # Indoor guidelines (bedroom) are only valid against an indoor-placed sensor.
     indoor_only: bool = False
+    # Shown as a reference comparison, never PASS/FAIL, because a single measured
+    # value cannot decide the guideline as written.
+    indicative_only: bool = False
 
 
 # Ordered from most health-relevant to regulatory
@@ -150,12 +153,10 @@ MATRIX: list[StandardRow] = [
         limit_db=WHO_ROAD_LDEN,
         source="WHO Environmental Noise Guidelines (2018), Table 1",
         tooltip=(
-            "Lden is a 24-hour average that adds +5 dB to evening (19:00–23:00) "
-            "and +10 dB to nighttime (23:00–07:00) readings before energy-averaging, "
-            "reflecting their greater health impact. "
-            "The 53 dB threshold is the level above which 11% of the population "
-            "reports being 'highly annoyed' and cardiovascular risk begins to rise "
-            "(8% increase per 10 dB above 55 dB Lden)."
+            "Lden: 24-hour energy average with +5 dB added to evening (19:00–23:00) and +10 dB to "
+            "night (23:00–07:00) readings (EU Directive 2002/49/EC, Annex I). "
+            "WHO Environmental Noise Guidelines for the European Region (2018): "
+            "road traffic 53 dB Lden, strong recommendation."
         ),
         category="who_env",
     ),
@@ -165,11 +166,9 @@ MATRIX: list[StandardRow] = [
         limit_db=WHO_ROAD_LNIGHT,
         source="WHO Environmental Noise Guidelines (2018), Table 1",
         tooltip=(
-            "Lnight is the energy-average noise level during 23:00–07:00. "
-            "At 40 dB the WHO identifies the LOAEL (Lowest Observed Adverse "
-            "Effect Level) — the point where body movements during sleep begin. "
-            "At 45 dB, self-reported sleep quality declines. "
-            "Above 55 dB Lnight, significant sleep disruption and daytime fatigue occur."
+            "Lnight: energy average over 23:00–07:00, with no penalty (EU Directive 2002/49/EC, Annex I). "
+            "WHO Environmental Noise Guidelines for the European Region (2018): "
+            "road traffic 45 dB Lnight, strong recommendation."
         ),
         category="who_env",
     ),
@@ -181,12 +180,11 @@ MATRIX: list[StandardRow] = [
         limit_db=WHO_AIR_LDEN,
         source="WHO Environmental Noise Guidelines (2018), Table 1",
         tooltip=(
-            "Aircraft limits are stricter than road traffic (45 dB vs. 53 dB Lden) "
-            "because aircraft noise is intermittent and unpredictable, causing "
-            "approximately twice as much annoyance per dB. "
-            "At 50 dB Lden, 20% of residents near airports report being highly annoyed. "
-            "INDICATIVE ONLY: the sensor measures total acoustic energy and cannot "
-            "confirm that aircraft is the source."
+            "Lden: 24-hour energy average with +5 dB added to evening (19:00–23:00) and +10 dB to "
+            "night (23:00–07:00) readings (EU Directive 2002/49/EC, Annex I). "
+            "WHO Environmental Noise Guidelines for the European Region (2018): "
+            "aircraft 45 dB Lden, strong recommendation. "
+            "Shown for reference only: a sound level meter cannot identify the noise source."
         ),
         category="who_env",
         source_specific=True,
@@ -197,11 +195,10 @@ MATRIX: list[StandardRow] = [
         limit_db=WHO_AIR_LNIGHT,
         source="WHO Environmental Noise Guidelines (2018), Table 1",
         tooltip=(
-            "Set at 40 dB — matching the WHO LOAEL for sleep effects — because "
-            "a single aircraft event during deep sleep can cause measurable "
-            "cardiovascular arousal (elevated heart rate, cortisol release) "
-            "without the resident being consciously aware of it. "
-            "INDICATIVE ONLY: the sensor cannot confirm aircraft as the source."
+            "Lnight: energy average over 23:00–07:00, with no penalty (EU Directive 2002/49/EC, Annex I). "
+            "WHO Environmental Noise Guidelines for the European Region (2018): "
+            "aircraft 40 dB Lnight, strong recommendation. "
+            "Shown for reference only: a sound level meter cannot identify the noise source."
         ),
         category="who_env",
         source_specific=True,
@@ -214,12 +211,11 @@ MATRIX: list[StandardRow] = [
         limit_db=WHO_RAIL_LDEN,
         source="WHO Environmental Noise Guidelines (2018), Table 1",
         tooltip=(
-            "Railway Lden guideline of 54 dB(A) — slightly less strict than road "
-            "traffic (53 dB) because the dose–response relationship for railway "
-            "annoyance is somewhat lower per dB than for road traffic. "
-            "The WHO notes high uncertainty at this threshold due to limited "
-            "longitudinal evidence at that time. "
-            "INDICATIVE ONLY: the sensor cannot confirm railway as the source."
+            "Lden: 24-hour energy average with +5 dB added to evening (19:00–23:00) and +10 dB to "
+            "night (23:00–07:00) readings (EU Directive 2002/49/EC, Annex I). "
+            "WHO Environmental Noise Guidelines for the European Region (2018): "
+            "railway 54 dB Lden, strong recommendation. "
+            "Shown for reference only: a sound level meter cannot identify the noise source."
         ),
         category="who_env",
         source_specific=True,
@@ -230,11 +226,10 @@ MATRIX: list[StandardRow] = [
         limit_db=WHO_RAIL_LNIGHT,
         source="WHO Environmental Noise Guidelines (2018), Table 1",
         tooltip=(
-            "Railway Lnight limit of 44 dB(A) — slightly stricter than road traffic "
-            "(45 dB) because railway events tend to be discrete, loud, and very "
-            "noticeable during quiet nighttime background. The WHO designated this "
-            "as a Conditional recommendation reflecting evidence gaps. "
-            "INDICATIVE ONLY: the sensor cannot confirm railway as the source."
+            "Lnight: energy average over 23:00–07:00, with no penalty (EU Directive 2002/49/EC, Annex I). "
+            "WHO Environmental Noise Guidelines for the European Region (2018): "
+            "railway 44 dB Lnight, strong recommendation. "
+            "Shown for reference only: a sound level meter cannot identify the noise source."
         ),
         category="who_env",
         source_specific=True,
@@ -243,34 +238,32 @@ MATRIX: list[StandardRow] = [
     # ── WHO Indoor — Bedroom ─────────────────────────────────────────────────
     StandardRow(
         standard="WHO Indoor — Bedroom (average)",
-        metric="LAeq",
+        metric="LAeq, night 23:00–07:00",
         limit_db=WHO_BEDROOM_LAEQ,
         source="WHO Guidelines for Community Noise (1999), Table 4.1",
         tooltip=(
-            "Indoor bedroom average level to protect sleep quality. "
-            "30 dB(A) represents a near-quiet environment essential for restorative "
-            "sleep. Exceeding this causes measurable increases in body movement "
-            "and reduced sleep depth even when the resident does not wake up. "
-            "Applies only to a sensor placed INSIDE the bedroom; outdoor levels are "
-            "typically 15–25 dB higher than the corresponding indoor level (windows closed)."
+            "LAeq over the night inside a bedroom. WHO Guidelines for Community Noise (1999), "
+            "Table 4.1: 30 dB(A) LAeq, 8 h, inside bedrooms. Evaluated only for a microphone placed "
+            "inside the bedroom."
         ),
         category="who_indoor",
         indoor_only=True,
     ),
     StandardRow(
         standard="WHO Indoor — Bedroom (single event)",
-        metric="LAmax",
+        metric="LAmax, night 23:00–07:00",
         limit_db=WHO_BEDROOM_LAMAX,
         source="WHO Guidelines for Community Noise (1999), Table 4.1",
         tooltip=(
-            "A single noise event above 45 dB(A) inside the bedroom is sufficient "
-            "to cause sleep arousal — the WHO threshold to prevent awakening. "
-            "Even if the nightly average is low, one loud truck or aircraft can "
-            "interrupt a full sleep cycle and prevent recovery to deep sleep stages. "
-            "Applies only to a sensor placed INSIDE the bedroom."
+            "Highest night-time reading on the L-Max channel. WHO Guidelines for Community Noise "
+            "(1999), Table 4.1: 45 dB LAmax (fast) for single sound events inside bedrooms at night, "
+            "which the guideline text frames as a level not to be exceeded more than about 10-15 "
+            "times per night; a single maximum therefore cannot decide it, and this row is shown "
+            "for reference only. Evaluated only for a microphone placed inside the bedroom."
         ),
         category="who_indoor",
         indoor_only=True,
+        indicative_only=True,
     ),
 
     # ── Maryland COMAR — Residential ─────────────────────────────────────────
@@ -283,10 +276,7 @@ MATRIX: list[StandardRow] = [
             "Maryland's enforceable residential limit, 7 a.m. to 10 p.m. "
             "(COMAR .01B(5) defines daytime hours). It is measured at or within "
             "the property line of the RECEIVING property, not at the source "
-            "(.03D(2)). " + MD_TABLE2_METRIC_NOTE + " "
-            "At 65 dB(A) it is 12 dB above the WHO 53 dB Lden guideline: a level "
-            "can be fully legal under Maryland law and still exceed the WHO "
-            "health-based guideline."
+            "(.03D(2)). " + MD_TABLE2_METRIC_NOTE
         ),
         category="maryland",
     ),
@@ -298,9 +288,6 @@ MATRIX: list[StandardRow] = [
         tooltip=(
             "Maryland's enforceable residential limit, 10 p.m. to 7 a.m. "
             "(COMAR .01B(15) defines nighttime hours). " + MD_TABLE2_METRIC_NOTE + " "
-            "At 55 dB(A) it is 10 dB above the WHO 45 dB Lnight guideline, and "
-            "Maryland's night starts an hour earlier (10 p.m.) than the WHO night "
-            "used for Lnight (11 p.m.), so the two cover different windows. "
             "Prominent discrete tones and periodic noises must be 5 dB(A) below "
             "this level (COMAR .03A(3))."
         ),
@@ -342,6 +329,7 @@ def evaluate_compliance(
     laeq_day: float | None = None,
     laeq_night: float | None = None,
     lamax: float | None = None,
+    lamax_night: float | None = None,
     environment: str = "outdoor",
 ) -> list[dict]:
     """
@@ -380,8 +368,8 @@ def evaluate_compliance(
         (MATRIX[3], lnight),        # WHO Aircraft Lnight (indicative)
         (MATRIX[4], lden),          # WHO Railway Lden    (indicative)
         (MATRIX[5], lnight),        # WHO Railway Lnight  (indicative)
-        (MATRIX[6], laeq),          # WHO Bedroom LAeq    (indoor only)
-        (MATRIX[7], lamax),         # WHO Bedroom LAmax   (indoor only)
+        (MATRIX[6], lnight),        # WHO Bedroom LAeq, night 8 h = LAeq 23:00-07:00 (indoor only)
+        (MATRIX[7], lamax_night),   # WHO Bedroom LAmax, night-time readings (indoor only, indicative)
         (MATRIX[8], laeq_day),      # Maryland Residential Day   (Table 2)
         (MATRIX[9], laeq_night),    # Maryland Residential Night (Table 2)
         (MATRIX[10], ldn),          # Maryland residential goal  (Table 1, Ldn)
@@ -397,8 +385,8 @@ def evaluate_compliance(
         assert measured is not None
 
         delta = round(float(measured) - row.limit_db, 1)
-        if row.source_specific:
-            # Source-specific reference — report relation, not a compliance verdict.
+        if row.source_specific or row.indicative_only:
+            # Reference comparison — report the relation, not a compliance verdict.
             kind = "indicative"
             status = "ABOVE" if measured > row.limit_db else "BELOW"
         else:
