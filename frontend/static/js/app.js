@@ -519,6 +519,7 @@ function showFilterPanel() {
     if (!uploadedFilepath) { showError('No file uploaded'); return; }
 
     currentFilters = { exclusions: [], bound_start: null, bound_end: null, clock: null };
+    resetWeatherScreen();
     const listEl = document.getElementById('exclusionList');
     const previewBar = document.getElementById('filterPreviewBar');
     if (listEl) listEl.innerHTML = '';
@@ -546,6 +547,195 @@ async function loadClockOptions() {
     }
 }
 
+// ── Weather screening ────────────────────────────────────────────────────────
+// Removes readings taken in rain, snow, thunder or wind, using official station
+// records. Fails closed: any error leaves the record unscreened and says so.
+
+let weatherScreenId = null;   // id of the screen currently applied, or null
+let weatherScreen = null;     // its summary, for the result panel
+
+// Beyond this distance a station's precipitation says little about the site.
+// A judgement, not a standard: shower cells are commonly a few kilometres across.
+const WX_NEAR_KM = 40;
+
+function _wxEl(id) { return document.getElementById(id); }
+
+function _wxMessage(kind, text) {
+    const el = _wxEl('wxMessage');
+    if (!el) return;
+    if (!text) { el.style.display = 'none'; el.textContent = ''; return; }
+    el.className = 'wx-message ' + (kind || 'info');
+    el.textContent = text;
+    el.style.display = 'block';
+}
+
+function resetWeatherScreen() {
+    weatherScreenId = null;
+    weatherScreen = null;
+    if (currentFilters) currentFilters.weather_screen_id = null;
+    ['wxStations', 'wxResult'].forEach(id => {
+        const el = _wxEl(id);
+        if (el) { el.innerHTML = ''; el.style.display = 'none'; }
+    });
+    const btn = _wxEl('wxRemoveBtn');
+    if (btn) btn.style.display = 'none';
+    _wxMessage(null, '');
+}
+
+async function findWeatherStations() {
+    const location = (_wxEl('wxLocation')?.value || '').trim();
+    const list = _wxEl('wxStations');
+    _wxMessage(null, '');
+    if (!location) {
+        _wxMessage('error', 'Enter a 5-digit ZIP code, or coordinates as "latitude, longitude".');
+        return;
+    }
+    const btn = _wxEl('wxFindBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Searching…'; }
+    try {
+        const resp = await fetch('/api/weather/stations', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ location }),
+        });
+        const data = await _safeJson(resp);
+        if (!data || !data.success) {
+            list.style.display = 'none';
+            _wxMessage('error', (data && data.error) || 'Weather stations could not be listed.');
+            return;
+        }
+        // Prefer a station carrying the 1-minute archive, because hourly-only
+        // reports cannot verify a 15-minute period. Distance still wins beyond
+        // WX_NEAR_KM: weather 100 km away says little about rain at the site.
+        const near = data.stations.findIndex(x => x.ghcnd_id && x.has_1min
+                                             && toNumber(x.distance_km) <= WX_NEAR_KM);
+        const pick = near >= 0 ? near : data.stations.findIndex(x => x.ghcnd_id);
+        list.innerHTML = data.stations.map((st, i) => {
+            const usable = !!st.ghcnd_id;
+            const note = !usable ? ' — no NOAA daily record, cannot be used'
+                : st.has_1min ? ' · 1-minute observations'
+                : ' · hourly reports only, which usually cannot verify 15-minute periods';
+            return `<label class="wx-station${usable ? '' : ' disabled'}">
+                <input type="radio" name="wxStation" value="${escapeHtml(st.station_id)}"
+                       ${usable ? '' : 'disabled'} ${usable && i === pick ? 'checked' : ''}>
+                <span><strong>${escapeHtml(st.name)} (${escapeHtml(st.station_id)})</strong>
+                <small>${safeToFixed(st.distance_km, 1)} km away${note}</small></span>
+            </label>`;
+        }).join('') + `<div class="wx-actions"><button class="btn btn-primary btn-sm" id="wxRunBtn"
+            onclick="runWeatherScreen()">Fetch weather and screen this record</button></div>`;
+        list.style.display = 'block';
+
+        const far = data.stations.find(x => x.ghcnd_id && x.has_1min
+                                       && toNumber(x.distance_km) > WX_NEAR_KM);
+        const noneNear = !data.stations.some(x => x.ghcnd_id && x.has_1min
+                                             && toNumber(x.distance_km) <= WX_NEAR_KM);
+        if (noneNear && far) {
+            _wxMessage('error', `No station within ${WX_NEAR_KM} km carries 1-minute observations. `
+                + `The nearest that does is ${far.station_id}, ${safeToFixed(far.distance_km, 0)} km away, `
+                + `and its rain may not be your rain; a nearer hourly-only station usually cannot verify `
+                + `15-minute periods, so screening may remove everything. Treat the result with caution.`);
+        } else {
+            _wxMessage('info', `Stations nearest the ${data.location_basis}. Weather differs with distance, `
+                + `especially for showers.`);
+        }
+    } catch (err) {
+        _wxMessage('error', 'Weather stations could not be listed: ' + err.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Find weather stations'; }
+    }
+}
+
+async function runWeatherScreen() {
+    if (!uploadedFilepath) { showError('No file uploaded'); return; }
+    const stationId = document.querySelector('input[name="wxStation"]:checked')?.value;
+    if (!stationId) { _wxMessage('error', 'Choose a weather station first.'); return; }
+    const btn = _wxEl('wxRunBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Fetching…'; }
+    resetWeatherScreen();
+    _wxMessage('info', 'Fetching weather records and screening the record…');
+    const jobId = Math.random().toString(36).slice(2, 10);
+    const ticker = _pollProgress(jobId, 'Weather screening…');
+    try {
+        const resp = await fetch('/api/weather/screen', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                filepath: uploadedFilepath,
+                location: (_wxEl('wxLocation')?.value || '').trim(),
+                station_id: stationId,
+                mic_height_m: parseFloat(_wxEl('wxMicHeight')?.value),
+                clock: _selectedClock(),
+                job_id: jobId,
+            }),
+        });
+        const data = await _safeJson(resp);
+        if (!data || !data.success) {
+            _wxMessage('error', ((data && data.error) || 'Weather screening failed.')
+                + ' No screening was applied; results remain unscreened.');
+            return;
+        }
+        if (!data.usable) { _wxMessage('error', data.message); return; }
+        weatherScreen = data;
+        weatherScreenId = data.screen_id;
+        if (currentFilters) currentFilters.weather_screen_id = weatherScreenId;
+        _wxMessage(null, '');
+        renderWeatherScreenResult(data);
+        const rm = _wxEl('wxRemoveBtn');
+        if (rm) rm.style.display = '';
+    } catch (err) {
+        _wxMessage('error', 'Weather screening failed: ' + err.message + ' No screening was applied.');
+    } finally {
+        ticker.done();
+        if (btn) { btn.disabled = false; btn.textContent = 'Fetch weather and screen this record'; }
+    }
+}
+
+function renderWeatherScreenResult(data) {
+    const s = data.summary, st = data.station, labels = s.reason_labels || {};
+    const pct = n => (100 * n / Math.max(1, s.samples_total)).toFixed(1) + '%';
+    const rows = Object.entries(s.samples_by_reason || {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, n]) => `<tr><td>${escapeHtml(labels[k] || k)}</td>`
+             + `<td class="num">${n.toLocaleString()}</td><td class="num">${pct(n)}</td></tr>`)
+        .join('');
+    const snow = data.snow_source || {};
+    const snowText = snow.mode === 'depth'
+        ? `Snow depth from NOAA station ${escapeHtml(snow.ghcnd_id || '')}`
+          + (snow.distance_km ? `, ${safeToFixed(snow.distance_km, 1)} km away.` : ' (the weather station itself).')
+        : '';
+    const iq = data.identifier_quality || {};
+    const sensor = iq.reliable === false
+        ? ` The station's 1-minute precipitation sensor disagreed with its own hourly reports on `
+          + `${iq.only_1min_pct}% of ${(iq.minutes_compared || 0).toLocaleString()} shared minutes, so it was `
+          + `judged faulty and ignored.`
+        : '';
+    _wxEl('wxResult').innerHTML = `
+        <p><strong>${escapeHtml(st.name)} (${escapeHtml(st.station_id)})</strong>,
+        ${safeToFixed(st.distance_km, 1)} km away. ${escapeHtml(snowText)}${escapeHtml(sensor)}</p>
+        <table class="wx-table">
+            <thead><tr><th>Removed because</th><th class="num">Readings</th><th class="num">Share</th></tr></thead>
+            <tbody>${rows || '<tr><td colspan="3">Nothing removed</td></tr>'}
+                <tr><td><strong>Retained</strong></td>
+                    <td class="num"><strong>${s.samples_kept.toLocaleString()}</strong></td>
+                    <td class="num"><strong>${pct(s.samples_kept)}</strong></td></tr>
+            </tbody>
+        </table>
+        <p>The 1-minute archive covered ${s.blocks_with_1min_pct}% of 15-minute periods; the rest came from the
+        same station's 5-minute reports. Wind was converted from ${data.config.anemometer_height_m} m to the
+        ${data.config.mic_height_m} m microphone height (factor ${data.wind_height_factor}).
+        Readings were matched on the ${escapeHtml(data.tz)} clock.</p>
+        <p class="wx-note">Screening applies when you run the analysis. Every result, figure, report and export
+        will use the screened record, and the reports describe the screening.</p>
+        <div class="wx-actions">
+            <a class="btn btn-secondary btn-sm"
+               href="/api/weather/screen/${encodeURIComponent(data.screen_id)}/audit.csv">Period-by-period audit (CSV)</a>
+        </div>`;
+    _wxEl('wxResult').style.display = 'block';
+}
+
+function removeWeatherScreen() {
+    resetWeatherScreen();
+    _wxMessage('info', 'Weather screening removed. Run the analysis again to see unscreened results.');
+}
+
 function _selectedClock() {
     const src = document.getElementById('clock-source')?.value;
     const tgt = document.getElementById('clock-target')?.value;
@@ -553,6 +743,12 @@ function _selectedClock() {
 }
 
 function onClockChange() {
+    if (weatherScreenId) {
+        // The screen was built on the previous clock, so its readings no longer
+        // line up. Drop it rather than have the server refuse the analysis later.
+        resetWeatherScreen();
+        _wxMessage('info', 'The time zone changed, so the weather screen was cleared. Run it again.');
+    }
     // Bounds were shown on the previous report clock; re-derive them.
     refreshDataExtent();
 }
@@ -624,7 +820,8 @@ function addExclusionRow() {
 }
 
 function _collectFilters() {
-    const filters = { exclusions: [], bound_start: null, bound_end: null, clock: _selectedClock() };
+    const filters = { exclusions: [], bound_start: null, bound_end: null, clock: _selectedClock(),
+                      weather_screen_id: weatherScreenId };
     const startEl = document.getElementById('filter-bound-start');
     const endEl   = document.getElementById('filter-bound-end');
     const s = startEl ? startEl.value : '';
@@ -672,7 +869,8 @@ function _activeFilters() {
     const f = currentFilters;
     if (!f) return null;
     const converts = f.clock && f.clock.source !== f.clock.target;
-    return (f.exclusions.length || f.bound_start || f.bound_end || converts) ? f : null;
+    return (f.exclusions.length || f.bound_start || f.bound_end || converts
+            || f.weather_screen_id) ? f : null;
 }
 
 function applyFiltersAndAnalyze() {
@@ -681,8 +879,9 @@ function applyFiltersAndAnalyze() {
 }
 
 function skipFilters() {
-    // "Use all data" still honours the time zone setting.
-    currentFilters = { exclusions: [], bound_start: null, bound_end: null, clock: _selectedClock() };
+    // "Use all data" still honours the time zone setting and any weather screen.
+    currentFilters = { exclusions: [], bound_start: null, bound_end: null, clock: _selectedClock(),
+                       weather_screen_id: weatherScreenId };
     runAnalysis();
 }
 
@@ -2108,6 +2307,7 @@ function resetToUpload() {
     currentAnalysis = null;
     currentStandards = null;
     currentFilters = { exclusions: [], bound_start: null, bound_end: null };
+    resetWeatherScreen();
     window.computedDailySummary  = null;
     window.computedHourlySummary = null;
     window.mergeGapReport        = null;

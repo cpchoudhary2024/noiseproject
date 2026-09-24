@@ -693,3 +693,42 @@ select.filter-input { background: var(--surface); }
     .staged-file-item { flex-wrap: wrap; }
     .cm-tooltip-text { width: 260px; }
 }
+
+/* ── Weather screening ──────────────────────────────────────────────────── */
+.wx-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.wx-stations { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.wx-station {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 9px 12px;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    background: var(--surface);
+    font-size: 14px;
+    color: var(--ink-soft);
+    cursor: pointer;
+}
+.wx-station.disabled { opacity: 0.55; cursor: not-allowed; }
+.wx-station small { display: block; color: var(--muted); }
+.wx-message {
+    margin-top: 12px;
+    padding: 10px 14px;
+    border-left: 3px solid var(--accent);
+    background: var(--accent-tint);
+    color: var(--ink);
+    font-size: 13px;
+    line-height: 1.55;
+}
+.wx-message.error { border-left-color: #B42318; background: #FDF3F2; color: #7A271A; }
+.wx-result { margin-top: 14px; font-size: 13px; color: var(--ink-soft); line-height: 1.6; }
+.wx-result p { margin: 0 0 8px; }
+.wx-note { color: var(--muted); }
+.wx-table { width: 100%; border-collapse: collapse; margin: 10px 0 12px; }
+.wx-table th, .wx-table td {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--rule-soft);
+    text-align: left;
+}
+.wx-table th { color: var(--muted); font-weight: 600; }
+.wx-table td.num, .wx-table th.num { text-align: right; font-variant-numeric: tabular-nums; }

@@ -25,6 +25,7 @@ from analysis.periods import (daily_summary, hourly_summary, nightly_values, WHO
                               COMPLETE_COVERAGE_PCT)
 from analysis.clock import (DEFAULT_CLOCK, FOLD_COLUMN, describe_time_basis, ordering_key,
                             zone_abbreviations)
+from analysis.weather_screen import REASON_LABELS as WEATHER_REASON_LABELS
 from analysis.compliance_matrix import (evaluate_compliance,
                                         MD_RESIDENTIAL_DAY, MD_RESIDENTIAL_NIGHT,
                                         WHO_ROAD_LDEN, WHO_ROAD_LNIGHT)
@@ -297,7 +298,8 @@ class ReportGeneratorV2:
     def __init__(self, df, filepath, analysis=None, standards=None, daily_summary=None, hourly_summary=None,
                  device_id: str = '', source_files: list | None = None, merge_gap_report: dict | None = None,
                  custom_section_heading: str = '', custom_section_body: str = '', environment: str = 'outdoor',
-                 deidentify: bool = True, instrument_note: str | None = None):
+                 deidentify: bool = True, instrument_note: str | None = None,
+                 weather_screen: dict | None = None):
         """
         Initialize report generator with ONLY the uploaded data.
         NO external CSV file loading - all summaries computed from df.
@@ -342,6 +344,7 @@ class ReportGeneratorV2:
         self.custom_section_heading = str(custom_section_heading or '').strip()
         self.custom_section_body = str(custom_section_body or '').strip()
         self.environment = str(environment or 'outdoor').strip().lower()
+        self.weather_screen = weather_screen or None
         self.timestamps_synthetic = False  # set True if no real timestamps could be read
         self.timestamp_integrity = None
         self.analyzer = NoiseAnalyzer(df)
@@ -918,6 +921,10 @@ class ReportGeneratorV2:
         # Section 2: Data Quality & Completeness
         self._add_section_2_data_quality(story, styles, ts=ts)
         story.append(Spacer(1, 0.2 * inch))
+
+        if self.weather_screen:
+            self._add_weather_screen_section(story, styles)
+            story.append(Spacer(1, 0.2 * inch))
         
         # Section 3: Comparison with health guidelines and regulatory limits
         self._add_section_3_compliance(story, styles, ts=ts, leq_col=leq_col)
@@ -1503,7 +1510,8 @@ class ReportGeneratorV2:
         story.append(Paragraph(self._exceedance_note(self._exceedance_summary(ts, leq), brief=True), cap))
         story.append(Spacer(1, 0.08 * inch))
 
-        source_note = f" <b>Data source:</b> {escape(self._figure_source_label())}."
+        source_note = (f" <b>Data source:</b> {escape(self._figure_source_label())}."
+                       + self._figure_screen_note())
         avail_w = doc.width / inch
 
         # No forced break here. The definitions and results table fill page 1 and
@@ -1573,6 +1581,9 @@ class ReportGeneratorV2:
             "is indicative rather than a determination. [1]",
             cap))
         story.append(Spacer(1, 0.06 * inch))
+        if self.weather_screen:
+            story.append(Paragraph(self._weather_screen_resident_note(), cap))
+            story.append(Spacer(1, 0.06 * inch))
         story.append(Paragraph(
             f"<b>About these measurements.</b> Levels are A-weighted. Instrument and calibration: "
             f"{escape(self.instrument_note)} "
@@ -2009,6 +2020,159 @@ class ReportGeneratorV2:
     # OPTIONAL CUSTOM SECTION (user notes, inserted after Section 4)
     # ============================================================
 
+    # ============================================================
+    # WEATHER SCREENING DISCLOSURE
+    # ============================================================
+
+    _CLOCK_TEXT = {
+        'local_dst': "local time in {tz}, observing daylight saving time",
+        'local_standard': "local standard time in {tz}, without daylight saving",
+        'utc': "Coordinated Universal Time (UTC)",
+    }
+
+    def _weather_screen_station_text(self) -> str:
+        st = self.weather_screen['station']
+        return (f"{st['name']} ({st['station_id']}) Automated Surface Observing System station, "
+                f"{st['distance_km']:.1f} km from the monitoring location")
+
+    def _weather_screen_resident_note(self) -> str:
+        ws = self.weather_screen
+        pct = 100.0 * ws['rows_removed'] / max(1, ws['rows_considered'])
+        return (
+            "<b>About weather.</b> Readings taken during rain, snow, thunder or strong wind, "
+            "shortly before and after rain, while snow was on the ground, or when the weather "
+            "could not be confirmed were removed before these results were calculated, using "
+            f"official records from the {escape(self._weather_screen_station_text())}. "
+            f"{ws['rows_removed']:,} readings ({pct:.1f}%) were removed for this reason. Weather "
+            "at the station can differ from weather at the home, especially during showers.")
+
+    def _weather_snow_rule_text(self) -> str:
+        """Snow-cover rule, naming the record it was established from."""
+        ws, cfg = self.weather_screen, self.weather_screen['config']
+        src = ws.get('snow_source') or {'mode': 'depth'}
+        limit = (f"{cfg['snow_depth_limit_mm'] / 25.4:g} inch ({cfg['snow_depth_limit_mm']:g} mm)")
+        where = (f"station {escape(str(src.get('ghcnd_id', '')))}"
+                 + (f", {src['distance_km']:.1f} km from the monitoring location"
+                    if src.get('distance_km') else " (the weather station itself)"))
+        return (f"<b>Snow cover:</b> every day with {limit} or more of snow on the ground at NOAA "
+                f"{where}, and the day either side (IOA Good Practice Guide 2013, §2.7.3). Snow "
+                "depth is not measured by the airport's automated sensors.")
+
+    def _add_weather_screen_section(self, story, styles):
+        """Method, rules, sources and effect of the weather screen."""
+        ws = self.weather_screen
+        cfg, summ, st = ws['config'], ws['summary'], ws['station']
+        body = styles['BodyText']
+        story.append(Paragraph("Weather Screening (Rain, Snow, Thunder, Wind)", styles['h1']))
+        story.append(Paragraph(
+            "Readings recorded while the weather could have affected the microphone were removed "
+            "before any result in this report was calculated. Weather was taken from the "
+            f"{escape(self._weather_screen_station_text())} (station located from a "
+            f"{escape(ws['location_basis'])}; the location itself is not recorded). "
+            f"Sources: {escape(ws['sources'])}", body))
+        story.append(Spacer(1, 0.08 * inch))
+
+        blk = cfg['block_minutes']
+        clock = self._CLOCK_TEXT.get(ws['clock'], ws['clock']).format(tz=ws.get('tz') or st['tz'])
+        rules = [
+            f"The record was divided into {blk}-minute blocks. Logger timestamps were read as {escape(clock)}.",
+            "<b>Precipitation:</b> every block in which the station reported precipitation of any kind "
+            "(rain, drizzle, snow, ice pellets, hail or unidentified), or its rain gauge registered any "
+            "amount (ISO 1996-2:2017; NSW Noise Policy for Industry 2017, Fact Sheet A4).",
+            f"<b>Buffer:</b> {cfg['buffer_before_blocks']} block(s) before each precipitation or thunder "
+            "block, for rain-gauge latency (IOA Good Practice Guide 2013, §3.1.9), and "
+            f"{cfg['buffer_after_blocks']} block(s) after, because a wet windscreen alters readings "
+            "after rain stops (ISO 1996-2).",
+            "<b>Thunder:</b> every block in which thunder was reported at or near the station.",
+            (f"<b>Wind:</b> every block whose mean wind at microphone height exceeded "
+             f"{cfg['wind_limit_ms']:g} m/s (NSW Noise Policy for Industry 2017, Fact Sheet A4, which "
+             "sets the limit on an average at microphone height)"
+             + (f", and every block whose station wind or gust maximum at "
+                f"{cfg['anemometer_height_m']:g} m exceeded the same limit with no height reduction — a "
+                "stricter platform rule, informed by FHWA guidance, because a modelled height reduction "
+                "cannot prove the wind at the microphone"
+                if cfg.get('screen_station_wind') else
+                ". The station's own wind and gust maxima are reported in the period-by-period audit "
+                "trail but were not themselves grounds for exclusion")
+             + f". Station mean wind, measured at {cfg['anemometer_height_m']:g} m, was converted to the "
+             f"{cfg['mic_height_m']:g} m microphone height with the logarithmic wind profile, "
+             "v(h) = v(h_ref)·ln(h/z0)/ln(h_ref/z0), "
+             f"z0 = {cfg['roughness_length_m']:g} m (IEC 61400-11 reference roughness); factor "
+             f"{ws['wind_height_factor']:.3f}."),
+            self._weather_snow_rule_text(),
+            f"<b>Unverified weather:</b> blocks without known wind and precipitation in every {cfg['slot_minutes']}-minute "
+            "interval, neighbours within the configured buffer, and days whose snow cover could not be "
+            "established. Periods whose weather could not be verified are treated as affected, "
+            "never as clean.",
+        ]
+        for r in rules:
+            story.append(Paragraph(r, body))
+            story.append(Spacer(1, 0.04 * inch))
+        story.append(Spacer(1, 0.06 * inch))
+
+        story.append(Paragraph("<b>Readings removed from this report's data</b>", body))
+        considered = max(1, ws['rows_considered'])
+        for code, n in sorted(ws['rows_removed_by_reason'].items(), key=lambda kv: -kv[1]):
+            label = WEATHER_REASON_LABELS.get(code, code)
+            story.append(Paragraph(f"{escape(label)}: {n:,} ({100.0 * n / considered:.1f}%)", body))
+        kept = ws['rows_considered'] - ws['rows_removed']
+        # Native table graphic is preserved by both PDF and Word renderers.
+        shares = [kept / considered, ws['rows_removed'] / considered]
+        if all(v > 0 for v in shares):
+            bar = Table([["Retained", "Excluded"]], colWidths=[6.0 * inch * v for v in shares])
+            bar.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, 0), colors.HexColor('#0369a1')),
+                ('BACKGROUND', (1, 0), (1, 0), colors.HexColor('#b45309')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.white),
+                ('FONTSIZE', (0, 0), (-1, -1), 7),
+            ]))
+            # Avoid illegible labels on very narrow segments.
+            if min(shares) >= 0.12:
+                story.append(bar)
+        story.append(Paragraph("Screened results describe retained readings only. Excluded periods "
+                               "are not reconstructed; percentages below are sample counts, not time coverage.", body))
+        story.append(Paragraph(
+            f"<b>Retained:</b> {kept:,} of {ws['rows_considered']:,} readings "
+            f"({100.0 * kept / considered:.1f}%).", body))
+        story.append(Spacer(1, 0.08 * inch))
+
+        agree = summ.get('source_agreement')
+        quality = (f"The station's 1-minute archive covered {summ['blocks_with_1min_pct']:.1f}% of "
+                   f"blocks; {summ['blocks_verified_pct']:.1f}% met the wind/precipitation coverage rule. "
+                   "Missing minutes may be supplemented by METAR reports; gaps remain excluded.")
+        iq = ws.get('identifier_quality') or summ.get('identifier_quality') or {}
+        if iq.get('reliable') is False:
+            quality += (" The station's 1-minute precipitation identifier disagreed with its own "
+                        f"METAR reports on {iq.get('only_1min_pct')}% of "
+                        f"{iq.get('minutes_compared', 0):,} jointly observed minutes, so it was "
+                        "flagged as suspect. Positive precipitation evidence was retained conservatively; "
+                        "disagreement alone cannot establish dry conditions.")
+        if iq.get('impossible_snow_minutes'):
+            quality += (f" {iq['impossible_snow_minutes']:,} minutes carried a snow code at air "
+                        "unusually warm temperatures. These suspect reports were retained as precipitation "
+                        "evidence; temperature alone does not establish dry conditions.")
+        if agree:
+            quality += (f" Where both sources observed the same minute, they agreed on whether "
+                        f"precipitation was occurring in {agree['agree_pct']:.1f}% of "
+                        f"{agree['minutes_compared']:,} minutes; precipitation reported by either "
+                        "source was treated as precipitation.")
+        story.append(Paragraph(f"<b>Weather data quality.</b> {quality}", body))
+        story.append(Spacer(1, 0.08 * inch))
+        far = (" At this distance the screen can miss rain that fell only at the monitoring "
+               "location, and remove periods that were dry there; an on-site rain gauge would "
+               "settle both." if float(st.get('distance_km') or 0) > 25 else "")
+        story.append(Paragraph(
+            "<b>Limitations.</b> Weather at a station "
+            f"{st['distance_km']:.1f} km away can differ from weather at the microphone, "
+            f"particularly for showers.{far} Estimated microphone wind can overstate or understate actual "
+            "site wind. Retained observations are not certified free of weather effects. "
+            "On-site weather and surface-condition logs are needed for site verification. "
+            "Traffic on wet roads after rain is louder; that "
+            "effect is not screened. Removing weather-affected periods changes the time periods "
+            "the averages cover. The block-by-block record of this screen (reference "
+            f"{escape(ws['screen_id'])}) can be downloaded from the analysis platform.", body))
+        story.append(Spacer(1, 0.12 * inch))
+
     def _add_custom_section(self, story, styles):
         heading = self.custom_section_heading or "Additional Notes"
         story.append(Paragraph(f"Additional Notes: {escape(heading)}", styles['h1']))
@@ -2292,6 +2456,19 @@ class ReportGeneratorV2:
             self.timestamp_integrity = verdict
         self.timestamps_synthetic = True
         return pd.Series(pd.date_range(start=datetime.now(), periods=len(self.df), freq="s"))
+
+    def _figure_screen_note(self) -> str:
+        """Caption sentence stating that weather-affected periods are absent.
+
+        A figure drawn from a screened record must say so, or a gap in the line
+        reads as an instrument outage.
+        """
+        if not self.weather_screen:
+            return ""
+        ws = self.weather_screen
+        pct = 100.0 * ws['rows_removed'] / max(1, ws['rows_considered'])
+        return (f" Weather-screened: {pct:.1f}% of readings were removed as weather-affected or "
+                "unverifiable and are absent from this figure (see Weather Screening).")
 
     def _figure_source_label(self) -> str:
         """Caption text identifying the data behind a figure.
@@ -2837,6 +3014,13 @@ class ReportGeneratorV2:
             story.append(Paragraph(f"<b>Detected Logging Interval:</b> {escape(interval_label)}", body))
         story.append(Paragraph(f"<b>Expected Samples:</b> {expected_samples:,}", body))
         story.append(Paragraph(f"<b>Actual Samples in Dataset:</b> {actual_samples:,}", body))
+        if self.weather_screen:
+            ws = self.weather_screen
+            story.append(Paragraph(
+                f"<b>Removed by weather screening:</b> {ws['rows_removed']:,} readings (see Weather "
+                "Screening). These are deliberate exclusions, not instrument data loss: the time they "
+                "cover is taken out of the expected span rather than counted as missing, and every "
+                "result in this report uses only the remaining readings.", body))
         if uptime_pct is not None:
             story.append(Paragraph(f"<b>Data Completeness:</b> {uptime_pct:.2f}%", body))
         story.append(Spacer(1, 0.1 * inch))
@@ -3384,7 +3568,8 @@ class ReportGeneratorV2:
             return
 
         # Provenance now travels in the caption rather than inside the image.
-        src = f" <b>Data source:</b> {escape(self._figure_source_label())}."
+        src = (f" <b>Data source:</b> {escape(self._figure_source_label())}."
+               + self._figure_screen_note())
 
         lmax = self._get_numeric_series(lmax_col) if (lmax_col and lmax_col in self.df.columns) else None
         lmin = self._get_numeric_series(lmin_col) if (lmin_col and lmin_col in self.df.columns) else None

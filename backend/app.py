@@ -2,6 +2,7 @@ from flask import Flask, render_template, request, jsonify, send_file
 from flask_cors import CORS
 from flask.json.provider import DefaultJSONProvider
 import os
+import secrets
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -26,6 +27,12 @@ from analysis.clock import (FOLD_COLUMN, CLOCK_CHOICES, DEFAULT_CLOCK, ClockErro
                             apply_clock, mark_repeated_hour, zone_abbreviations, zone_label,
                             describe_time_basis, ordering_key)
 from analysis.acoustics import energetic_mean_db, compute_ldn_lden, energy_concentration
+from web_safety import StrictJSONProvider, reference, upload_path, owner
+from analysis.weather_screen import ScreenConfig
+from services.weather_sources import (LocationError, WeatherDataUnavailable,
+                                      nearest_stations, resolve_location)
+from services.weather_screening import (WeatherScreenError, apply_record, audit_csv_path,
+                                        build_screen, load_record, record_tz)
 from analysis.timestamp_utils import (assess_timestamp_integrity, primary_time_column,
                                       parse_timestamps_robust, resolve_time_column)
 import io
@@ -86,6 +93,25 @@ root_dir = os.path.dirname(backend_dir)
 app = Flask(__name__,
             template_folder=os.path.join(root_dir, 'frontend', 'templates'),
             static_folder=os.path.join(root_dir, 'frontend', 'static'))
+app.json = StrictJSONProvider(app)
+app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
+                  SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE', '0') == '1',
+                  UPLOAD_TTL_SECONDS=24 * 3600)
+
+
+@app.before_request
+def validate_browser_references():
+    # Establish ownership before any upload or parallel browser API call.
+    owner()
+    if request.path.startswith('/api/') and request.method == 'POST':
+        payload = request.get_json(silent=True) or request.form
+        for key in ('filepath', 'existing_filepath'):
+            if payload.get(key):
+                try:
+                    upload_path(payload[key])
+                except ValueError as exc:
+                    return jsonify({'error': str(exc)}), 404
 CORS(app)
 
 
@@ -136,6 +162,8 @@ RAW_UPLOAD_FOLDER = os.path.join(UPLOAD_FOLDER, 'raw')
 ARTIFACTS_DIR = os.environ.get('ARTIFACTS_DIR') or _default_artifacts
 ARTIFACTS_REPORTS_DIR = os.path.join(ARTIFACTS_DIR, 'reports')
 ARTIFACTS_CHARTS_DIR = os.path.join(ARTIFACTS_DIR, 'charts')
+WEATHER_CACHE_DIR = os.path.join(ARTIFACTS_DIR, 'weather_cache')
+WEATHER_SCREENS_DIR = os.path.join(ARTIFACTS_DIR, 'weather_screens')
 ALLOWED_EXTENSIONS = {'csv', 'xlsx', 'xls', 'wlg', 'parquet', 'pq'}
 MAX_UPLOAD_MB = int(os.environ.get('UPLOAD_MAX_MB', '200'))
 MAX_FILE_SIZE = MAX_UPLOAD_MB * 1024 * 1024
@@ -306,7 +334,7 @@ def _filters_requested(filters: dict | None) -> bool:
     clock = (filters.get('clock') or {})
     converts = bool(clock) and (clock.get('source') or DEFAULT_CLOCK) != (clock.get('target') or DEFAULT_CLOCK)
     return bool(filters.get('bound_start') or filters.get('bound_end')
-                or filters.get('exclusions') or converts)
+                or filters.get('exclusions') or filters.get('weather_screen_id') or converts)
 
 
 def _parse_bound(raw: str, *, end: bool) -> pd.Timestamp:
@@ -410,6 +438,13 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
             ) from exc
         keep &= ~((ts >= es) & (ts <= ee))
 
+    weather_info = None
+    weather_windows: list[tuple] = []
+    if filters.get('weather_screen_id'):
+        weather_info, w_keep = _weather_screen_mask(ts, keep, filters['weather_screen_id'])
+        weather_windows = _contiguous_windows(ts, (keep & ~w_keep).to_numpy())
+        keep &= w_keep
+
     clean_df = df[keep].copy()
     # Excluded windows are recorded so continuity reporting can show them as
     # the analyst's exclusions rather than as data the logger failed to record.
@@ -417,7 +452,19 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
     for excl in (filters.get('exclusions') or []):
         if excl.get('start') and excl.get('end'):
             excluded.append((_parse_bound(excl['start'], end=False), _parse_bound(excl['end'], end=True)))
+    # Weather-screened periods are exclusions the analyst applied, not readings
+    # the logger failed to record: listing them here keeps them out of missing
+    # time and completeness (analysis.gap_detector).
+    excluded.extend(weather_windows)
     clean_df.attrs = {**df.attrs, 'clock': clock_info, 'exclusions': excluded}
+    if weather_info:
+        clean_df.attrs = {**clean_df.attrs, 'weather_screen': weather_info}
+    if clean_df.empty and weather_info:
+        raise TemporalFilterError(
+            "No readings remain after weather screening combined with the selected dates. "
+            "Every remaining period was affected by weather or could not be verified. "
+            "Remove the weather screen or widen the date range."
+        )
     if clean_df.empty:
         span = ''
         if valid_ts.any():
@@ -433,6 +480,54 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
     )
     return clean_df
 
+
+
+def _contiguous_windows(ts: pd.Series, removed: np.ndarray) -> list[tuple]:
+    """Contiguous runs of removed readings, as (start, end) timestamps."""
+    if not removed.any():
+        return []
+    idx = np.flatnonzero(removed)
+    breaks = np.flatnonzero(np.diff(idx) > 1)
+    starts = np.concatenate(([idx[0]], idx[breaks + 1]))
+    ends = np.concatenate((idx[breaks], [idx[-1]]))
+    values = ts.to_numpy()
+    return [(pd.Timestamp(values[a]), pd.Timestamp(values[b])) for a, b in zip(starts, ends)
+            if pd.notna(values[a]) and pd.notna(values[b])]
+
+
+def _weather_screen_mask(ts: pd.Series, keep: pd.Series, screen_id: str) -> tuple[dict, pd.Series]:
+    """Keep-mask of a saved weather screen, plus the disclosure for results and reports.
+
+    ``ts`` is the record's timestamps in the report clock, the basis the screen
+    was built on; a screen made on any other basis fails its fingerprint and is
+    refused rather than silently misaligned.
+    """
+    try:
+        rec = load_record(WEATHER_SCREENS_DIR, screen_id)
+        w_keep, w_reason = apply_record(ts, rec)
+    except (WeatherScreenError, ValueError) as exc:
+        raise TemporalFilterError(str(exc)) from exc
+    w_keep = pd.Series(w_keep, index=keep.index)
+    removed = keep & ~w_keep
+    by_reason = w_reason[removed.to_numpy()].value_counts().to_dict()
+    info = {
+        'screen_id': rec['screen_id'],
+        'created_utc': rec['created_utc'],
+        'station': rec['station'],
+        'location_basis': rec['location_basis'],
+        'snow_source': rec.get('snow_source', {}),
+        'identifier_quality': rec.get('identifier_quality', {}),
+        'tz': record_tz(rec),
+        'clock': rec['clock'],
+        'config': rec['config'],
+        'wind_height_factor': rec['wind_height_factor'],
+        'sources': rec['sources'],
+        'summary': rec['summary'],
+        'rows_considered': int(keep.sum()),
+        'rows_removed': int(removed.sum()),
+        'rows_removed_by_reason': {str(k): int(v) for k, v in by_reason.items()},
+    }
+    return info, w_keep
 
 
 def _filtered_or_400(df, filters, tag: str):
@@ -472,17 +567,23 @@ def _new_upload_name(original: str) -> str:
     return f"{datetime.now():%Y%m%d_%H%M%S}_{secrets.token_hex(8)}_{stem[:80]}.{ext}"
 
 
+def _upload_reference(filepath: str) -> str:
+    """Signed, session-bound reference to an uploaded file, for the browser."""
+    return reference(os.path.basename(filepath))
+
+
 def _resolve_uploaded_filepath(filepath: str) -> str:
     """Map a client-supplied upload reference to its path in the raw upload folder.
 
-    Only a bare name in the form issued by ``_new_upload_name`` is accepted. Paths,
-    traversal attempts and names the server did not issue resolve to a path that
-    never exists, so every caller's existence check returns a clean 404.
+    References are signed and bound to the browser session that uploaded the
+    file, so another session's reference, a tampered one and an expired one all
+    resolve to a path that never exists, and every caller's existence check
+    returns a clean 404.
     """
-    name = str(filepath or '')
-    if not _UPLOAD_NAME_RE.fullmatch(name):
-        name = _NO_SUCH_UPLOAD
-    return os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], name))
+    try:
+        return upload_path(str(filepath or ''))
+    except ValueError:
+        return os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], _NO_SUCH_UPLOAD))
 
 
 def _run_retention_cleanup(*, keep_paths=()):
@@ -1361,7 +1462,7 @@ def upload_file():
         return jsonify({
             'success': True,
             'filename': filename,
-            'filepath': os.path.basename(filepath),
+            'filepath': _upload_reference(filepath),
             'rows': len(df),
             'columns': _visible_columns(df),
             'preview': _preview_records(df),
@@ -1420,6 +1521,7 @@ def analyze_data():
                 'date_filtered': bool(filters.get('bound_start') or filters.get('bound_end')
                                       or filters.get('exclusions')),
                 'clock_converted': bool((df.attrs.get('clock') or {}).get('converted')),
+                'weather_screen': df.attrs.get('weather_screen'),
             }
 
         # Check if analysis is already cached (only when no filters applied)
@@ -1695,7 +1797,7 @@ def analyze_data():
             'ingest_warnings': ingest_warnings,
             'key_findings': key_findings,
             'clock': clock_payload,
-            'filepath': os.path.basename(filepath)
+            'filepath': _upload_reference(filepath)
         })
 
     except Exception as e:
@@ -1807,7 +1909,7 @@ def upload_multi():
 
         return jsonify({
             'success': True,
-            'filepath': os.path.basename(merged_path),
+            'filepath': _upload_reference(merged_path),
             'merged_filename': merged_name,
             'source_files': filenames,
             'file_count': len(dfs),
@@ -1946,6 +2048,7 @@ def generate_report():
                 custom_section_body=custom_section_body,
                 instrument_note=instrument_note,
                 environment=environment,
+                weather_screen=df.attrs.get('weather_screen'),
             )
 
         _set_progress(job_id, 60, 'Generating document…')
@@ -3051,6 +3154,128 @@ def compare_report():
 
     except Exception as e:
         return _server_error(e)
+
+
+# ── Weather screening ─────────────────────────────────────────────────────────
+
+@app.route('/api/weather/stations', methods=['POST'])
+def weather_stations():
+    """Nearest ASOS stations to a ZIP code or coordinates.
+
+    The location is used for ranking only; it is not stored or echoed back.
+    """
+    try:
+        data = request.json or {}
+        lat, lon, basis = resolve_location(data.get('location'), WEATHER_CACHE_DIR)
+        stations = nearest_stations(lat, lon, WEATHER_CACHE_DIR, n=3)
+        return jsonify({'success': True, 'location_basis': basis, 'stations': [
+            {k: s[k] for k in ('station_id', 'name', 'distance_km', 'tz', 'ghcnd_id', 'has_1min')}
+            for s in stations]})
+    except LocationError as exc:
+        return jsonify({'success': False, 'error': str(exc), 'error_kind': 'location'}), 400
+    except WeatherDataUnavailable as exc:
+        return jsonify({'success': False, 'error': str(exc), 'error_kind': 'weather_unavailable'}), 503
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route('/api/weather/screen', methods=['POST'])
+def weather_screen():
+    """Fetch station weather for the uploaded record and build a screen.
+
+    The station is re-derived from the location on the server; the browser names
+    one of the returned stations but cannot supply station metadata. The screen
+    is built on the record's timestamps in the report clock, so the clock chosen
+    here and at analysis time must agree. Any failure to obtain or verify
+    weather returns an error and no screen.
+    """
+    try:
+        data = request.json or {}
+        job_id = str(data.get('job_id', '') or '')
+        filepath = data.get('filepath')
+        if not filepath:
+            return jsonify({'success': False, 'error': 'No file reference provided.'}), 400
+        filepath = _resolve_uploaded_filepath(filepath)
+        if not os.path.exists(filepath):
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+
+        try:
+            setting = ClockSetting.from_request(data.get('clock'))
+        except ClockError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+        try:
+            cfg = ScreenConfig(mic_height_m=float(data.get('mic_height_m', 1.5))).validate()
+        except (TypeError, ValueError) as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+
+        _set_progress(job_id, 5, 'Finding weather station…')
+        lat, lon, basis = resolve_location(data.get('location'), WEATHER_CACHE_DIR)
+        stations = nearest_stations(lat, lon, WEATHER_CACHE_DIR, n=3)
+        station = next((s for s in stations if s['station_id'] == data.get('station_id')), None)
+        if station is None:
+            return jsonify({'success': False, 'error': 'Choose one of the listed weather stations.'}), 400
+
+        df = _get_cached_df(filepath)
+        tcol = resolve_time_column(df)
+        if not tcol:
+            return jsonify({'success': False,
+                            'error': 'This file has no time column, so it cannot be matched to weather.'}), 400
+        integrity = assess_timestamp_integrity(df[tcol]).to_dict()
+        if not integrity.get('time_metrics_valid', True):
+            return jsonify({'success': False, 'error': 'The timestamps in this file are not reliable, '
+                            'so readings cannot be matched to weather.'}), 400
+        # Screen on the same timestamps the analysis will use: parsed, the
+        # repeated hour marked, and converted to the report clock.
+        parsed = df.copy()
+        parsed[tcol], _ = parse_timestamps_robust(df[tcol])
+        try:
+            parsed = apply_clock(parsed, tcol, setting)
+        except ClockError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+        ts = parsed[tcol]
+
+        rec = build_screen(ts, station, cfg, 'local_dst', cache_dir=WEATHER_CACHE_DIR,
+                           store_dir=WEATHER_SCREENS_DIR, location_basis=basis,
+                           tz=setting.target, site=(lat, lon),
+                           progress=lambda pct, msg: _set_progress(job_id, pct, msg))
+        return jsonify({
+            'success': True,
+            'usable': rec['usable'],
+            'screen_id': rec['screen_id'] if rec['usable'] else None,
+            'station': rec['station'],
+            'snow_source': rec.get('snow_source', {}),
+            'identifier_quality': rec.get('identifier_quality', {}),
+            'tz': record_tz(rec),
+            'clock': setting.to_dict(),
+            'config': rec['config'],
+            'wind_height_factor': rec['wind_height_factor'],
+            'summary': rec['summary'],
+            'sources': rec['sources'],
+            'message': None if rec['usable'] else (
+                'Every reading in this file falls in a period affected by weather or without '
+                'verifiable weather data. No screened analysis is possible.'),
+        })
+    except LocationError as exc:
+        return jsonify({'success': False, 'error': str(exc), 'error_kind': 'location'}), 400
+    except WeatherDataUnavailable as exc:
+        return jsonify({'success': False, 'error': str(exc), 'error_kind': 'weather_unavailable'}), 503
+    except WeatherScreenError as exc:
+        return jsonify({'success': False, 'error': str(exc), 'error_kind': 'weather_screen'}), 400
+    except Exception as e:
+        return _server_error(e)
+
+
+@app.route('/api/weather/screen/<screen_id>/audit.csv', methods=['GET'])
+def weather_screen_audit(screen_id):
+    """Block-by-block audit trail of a screen."""
+    try:
+        path = audit_csv_path(WEATHER_SCREENS_DIR, screen_id)
+    except WeatherScreenError as exc:
+        return jsonify({'error': str(exc)}), 400
+    if not os.path.exists(path):
+        return jsonify({'error': 'Audit file not found. Run weather screening again.'}), 404
+    return send_file(path, as_attachment=True, mimetype='text/csv',
+                     download_name=f'weather_screen_{screen_id}_blocks.csv')
 
 
 @app.route('/api/progress/<job_id>', methods=['GET'])

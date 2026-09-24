@@ -175,6 +175,33 @@
                         <button class="btn btn-secondary btn-sm" id="addExclusionBtn" onclick="addExclusionRow()">Add window</button>
                     </div>
 
+                    <div class="filter-group" id="weatherScreenCard">
+                        <h3 class="filter-group-title">Weather screening <span class="filter-optional">optional</span></h3>
+                        <p class="filter-desc">Removes readings taken while weather could have affected the microphone, using
+                        official records from the nearest NOAA/FAA airport weather station (ASOS): precipitation, thunder, snow
+                        on the ground, and wind above the limit at microphone height (ISO 1996-2; NSW Noise Policy for Industry,
+                        Fact Sheet A4; IOA Good Practice Guide 2013). A period whose weather cannot be confirmed is removed, never
+                        kept. Readings are matched to the weather on the logger clock set above. Your location is used only to find
+                        the station; it is not stored and never appears in a report.</p>
+                        <div class="filter-date-row">
+                            <div class="filter-field">
+                                <label for="wxLocation">ZIP code or latitude, longitude</label>
+                                <input id="wxLocation" class="filter-input" placeholder="e.g. 21044 or 39.20, -76.86" autocomplete="off">
+                            </div>
+                            <div class="filter-field">
+                                <label for="wxMicHeight">Microphone height (m)</label>
+                                <input id="wxMicHeight" class="filter-input" type="number" min="0.5" max="30" step="0.1" value="1.5">
+                            </div>
+                        </div>
+                        <div class="wx-actions">
+                            <button class="btn btn-secondary btn-sm" id="wxFindBtn" onclick="findWeatherStations()">Find weather stations</button>
+                            <button class="btn btn-secondary btn-sm" id="wxRemoveBtn" style="display:none;" onclick="removeWeatherScreen()">Remove weather screening</button>
+                        </div>
+                        <div id="wxStations" class="wx-stations" style="display:none;"></div>
+                        <div id="wxMessage" class="wx-message" style="display:none;" role="status"></div>
+                        <div id="wxResult" class="wx-result" style="display:none;"></div>
+                    </div>
+
                     <div class="filter-preview-bar" id="filterPreviewBar" style="display:none;">
                         <span id="filterPreviewText"></span>
                     </div>

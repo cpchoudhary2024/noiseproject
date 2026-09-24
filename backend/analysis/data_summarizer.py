@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class DataSummarizer:
-    """Generate daily, hourly, and weekly summaries with intelligent missing value filling"""
+    """Generate daily, hourly, and weekly summaries without synthesizing missing measurements"""
     
     def __init__(self, df):
         self.df = df.copy()
@@ -299,6 +299,17 @@ class DataSummarizer:
         
         return weekly_stats
     
+    def _write_weather_metadata(self, writer):
+        screen = self.df.attrs.get('weather_screen')
+        if not screen:
+            return
+        import json
+        sheet = writer.book.create_sheet('Weather Screening')
+        sheet.append(['Scope', 'Retained readings only; excluded periods are not reconstructed.'])
+        sheet.append(['Limitations', 'Remote station weather cannot certify conditions at the microphone.'])
+        for key, value in screen.items():
+            sheet.append([key, json.dumps(value) if isinstance(value, (dict, list)) else value])
+
     def generate_hourly_excel(self):
         """Generate hourly summary as Excel with formatting"""
         hourly_data = self.generate_hourly_summary()
@@ -309,6 +320,7 @@ class DataSummarizer:
         output = io.BytesIO()
         
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            self._write_weather_metadata(writer)
             row_offset = 0
             
             for col_name, hourly_df in hourly_data.items():
@@ -347,6 +359,7 @@ class DataSummarizer:
         output = io.BytesIO()
         
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            self._write_weather_metadata(writer)
             for col_name, daily_df in daily_data.items():
                 # Add title sheet
                 sheet = writer.book.create_sheet(col_name[:30][:26])
@@ -384,6 +397,7 @@ class DataSummarizer:
         output = io.BytesIO()
         
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            self._write_weather_metadata(writer)
             for col_name, weekly_df in weekly_data.items():
                 sheet = writer.book.create_sheet(col_name[:30][:26])
                 sheet.append([f'Weekly Summary - {col_name}'])

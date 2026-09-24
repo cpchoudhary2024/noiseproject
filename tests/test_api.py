@@ -47,7 +47,8 @@ def test_upload_returns_unguessable_reference(client):
     assert a['filepath'] != b['filepath'], 'same-second uploads of one file must not collide'
     for ref in (a['filepath'], b['filepath']):
         assert os.sep not in ref
-        assert client.app_module._UPLOAD_NAME_RE.fullmatch(ref)
+        # Opaque signed reference: no filename, no path, not guessable.
+        assert len(ref) > 40 and '/' not in ref and '..' not in ref
 
 
 @pytest.mark.parametrize('ref', [
@@ -63,7 +64,10 @@ def test_references_not_issued_by_server_are_refused(client, ref):
 
 def test_upload_keeps_extension_of_non_ascii_names(client):
     ref = _upload(client, name='测试.csv')['filepath']
-    assert ref.endswith('.csv')
+    # The reference is opaque, so check the stored file keeps the extension.
+    raw = client.app_module.app.config['RAW_UPLOAD_FOLDER']
+    stored = max((os.path.join(raw, f) for f in os.listdir(raw)), key=os.path.getmtime)
+    assert stored.endswith('.csv')
 
 
 def test_analyze_then_cached_rerun(client):
