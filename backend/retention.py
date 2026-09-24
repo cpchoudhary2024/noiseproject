@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -26,11 +27,13 @@ class RetentionPolicy:
     keep_raw_uploads: int = 15
     keep_charts_html: int = 15
     keep_reports: int = 15
+    # Uploads older than this are deleted whatever the counts; 0 disables.
+    max_age_hours: float = 2.0
     enabled: bool = True
 
 
 def _is_raw_upload(filename: str) -> bool:
-    return bool(re.match(r"^\d{8}_\d{6}_.+\.(csv|xlsx|xls)$", filename, re.IGNORECASE))
+    return bool(re.match(r"^\d{8}_\d{6}_.+\.(csv|xlsx|xls|parquet|pq|wlg)$", filename, re.IGNORECASE))
 
 
 def _is_chart_html(filename: str) -> bool:
@@ -46,8 +49,9 @@ def _apply_retention(
     predicate,
     keep: int,
     keep_paths: set[str],
+    max_age_s: float = 0.0,
 ) -> tuple[int, int]:
-    """Delete older matching files in directory.
+    """Delete matching files beyond the newest ``keep``, and any older than ``max_age_s``.
 
     Returns (deleted_count, kept_count).
     """
@@ -68,6 +72,10 @@ def _apply_retention(
 
     kept = candidates[:keep]
     to_delete = candidates[keep:]
+    if max_age_s > 0:
+        cutoff = time.time() - max_age_s
+        to_delete += [c for c in kept if c[0] < cutoff]
+        kept = [c for c in kept if c[0] >= cutoff]
 
     deleted_count = 0
     for _, path in to_delete:
@@ -98,7 +106,8 @@ def enforce_retention(
     - Best-effort: never raises on delete failures.
 
     Categories:
-    - Raw uploads: YYYYMMDD_HHMMSS_<original>.(csv|xlsx|xls)
+    - Raw uploads: YYYYMMDD_HHMMSS_<token>_<original>.(csv|xlsx|xls|parquet|pq|wlg),
+      also deleted once older than ``policy.max_age_hours``
     - Charts: charts_YYYYMMDD_HHMMSS.html
     - Reports: noise_analysis_*_YYYYMMDD_HHMMSS.(pdf|html)
     """
@@ -131,7 +140,8 @@ def enforce_retention(
     if reports_dir:
         os.makedirs(reports_dir, exist_ok=True)
 
-    deleted_raw, kept_raw = _apply_retention(raw_dir, _is_raw_upload, policy.keep_raw_uploads, keep_set)
+    deleted_raw, kept_raw = _apply_retention(raw_dir, _is_raw_upload, policy.keep_raw_uploads, keep_set,
+                                             max_age_s=policy.max_age_hours * 3600.0)
     deleted_charts, kept_charts = _apply_retention(charts_dir, _is_chart_html, policy.keep_charts_html, keep_set)
     deleted_reports, kept_reports = _apply_retention(reports_dir, _is_report_file, policy.keep_reports, keep_set)
 

@@ -1,0 +1,21 @@
+# Build context for `docker build` (local and Hugging Face Spaces).
+# Mirrors .gcloudignore: an allow-list, so data, study files, virtual
+# environments and generated artifacts never enter the image.
+*
+!Dockerfile
+!requirements.txt
+!backend
+!frontend
+
+backend/venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pdf
+**/*.xls
+**/*.xlsx
+**/*.csv
+**/*.wlg
+**/*.parquet
+**/*.docx
+**/*.png

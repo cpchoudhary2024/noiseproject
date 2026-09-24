@@ -6,8 +6,8 @@ Each period is bounded on the report clock and takes no readings from its
 neighbours:
 
 * Calendar day     00:00 on D to 00:00 on D+1, labelled D.
-* Daytime (COMAR)  07:00 to 22:00 on D (COMAR 26.02.03.01B(5)), labelled D.
-* Night (COMAR)    22:00 on D to 07:00 on D+1 (COMAR 26.02.03.01B(15)), labelled
+* Daytime (COMAR)  07:00 to 22:00 on D (COMAR 26.02.03.01B(4)), labelled D.
+* Night (COMAR)    22:00 on D to 07:00 on D+1 (COMAR 26.02.03.01B(14)), labelled
                    with the evening it starts, D.
 * Night (WHO)      23:00 on D to 07:00 on D+1 (Lnight, EU Directive 2002/49/EC
                    Annex I), labelled D.

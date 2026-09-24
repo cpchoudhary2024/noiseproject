@@ -8,9 +8,10 @@ Compliance standards matrix — ground-truth sourced exclusively from:
   • WHO Guidelines for Community Noise (Berglund et al., 1999)
     https://iris.who.int/handle/10665/66217
 
-  • Maryland Code of Maryland Regulations (COMAR) 26.02.03
-    .01 Definitions  ·  .02 Environmental Noise Standards (Table 1, goals)
-    .03 General Regulations (Table 2, maximum allowable levels)
+  • Maryland Code of Maryland Regulations (COMAR) 26.02.03, Control of Noise Pollution
+    https://regs.maryland.gov/us/md/exec/comar/26.02.03.01  (.01 Definitions)
+    https://regs.maryland.gov/us/md/exec/comar/26.02.03.02  (.02 Environmental Noise Standards)
+    .03 is repealed.
 
 VERIFICATION (5 Aug 2026). Values below were checked against primary sources,
 not against secondary summaries:
@@ -21,16 +22,25 @@ not against secondary summaries:
     Annex I: day 07:00-19:00 (12 h), evening 19:00-23:00 (4 h, +5 dB), night
     23:00-07:00 (8 h, +10 dB), averaged over a YEAR. Member States may shorten
     the evening by 1-2 h; the defaults are used here.
-  • Maryland COMAR 26.02.03 — confirmed against the regulation text.
-    .01B(5)  "Daytime hours" = 7 a.m. to 10 p.m.
-    .01B(15) "Nighttime hours" = 10 p.m. to 7 a.m.
-    .01B(4)  Ldn = 24 h energy average, +10 dB applied to 10 p.m.-7 a.m.
-    .02  Table 1 (GOALS): Industrial 70 dBA Leq(24), Commercial 64 dBA Ldn,
-         Residential 55 dBA Ldn.
-    .03  Table 2 (ENFORCEABLE, "a person may not cause or permit noise levels
-         which exceed those specified in Table 2"):
-         Day 75/67/65, Night 75/62/55 dBA for industrial/commercial/residential.
-         Table 2 states NO averaging period — see MD_TABLE2_METRIC_NOTE.
+  • Maryland COMAR 26.02.03 — re-verified against the current regulation text at
+    regs.maryland.gov on 21 Sep 2026 (the 5 Aug 2026 citations to .03 Table 2 and
+    to a residential Ldn goal are superseded):
+    .01B(4)  "Daytime hours" = 7 a.m. to 10 p.m., local time.
+    .01B(12) "Equivalent sound level" (Leq): energy-average level over a period.
+    .01B(14) "Nighttime hours" = 10 p.m. to 7 a.m., local time.
+    .02A(2)  the standards are "expressed in terms of equivalent A-weighted sound
+             levels"; the averaging time for the day/night columns is not stated.
+    .02B(1)  Table 1, Maximum Allowable Noise Levels (dBA) for receiving land use:
+             "A person may not cause or permit noise levels which exceed those
+             specified in this table": Day 75/67/65, Night 75/62/55 dBA for
+             industrial/commercial/residential.
+    .02B(3)  prominent discrete tones and periodic noises: 5 dBA below Table 1.
+    .02C     exemptions, including motor vehicles on public roads, aircraft at
+             licensed airports, railroads and residential air-conditioning and
+             heat-pump equipment (which have their own 70/75 dBA limits).
+    .02D     measured at or within the receiving property line (or zoning
+             boundary) with a Type II sound level meter or better.
+    The chapter no longer contains an Ldn definition or an Ldn goal.
 
 IMPORTANT: OSHA/NIOSH occupational standards are deliberately excluded from
 the environmental compliance matrix. They belong in an occupational assessment
@@ -90,8 +100,8 @@ WHO_BEDROOM_LAMAX = 45.0  # dB(A) — bedroom, single event (prevent awakening)
 WHO_LIVING_LAEQ   = 35.0  # dB(A) — living room
 WHO_CLASS_LAEQ    = 35.0  # dB(A) — classroom
 
-# ── Maryland COMAR 26.02.03.03 Table 2 — maximum allowable levels ─────────────
-# Daytime = 07:00–22:00  /  Nighttime = 22:00–07:00  (COMAR .01B(5) and .01B(15))
+# ── Maryland COMAR 26.02.03.02B(1) Table 1 — maximum allowable levels ────────
+# Daytime = 07:00–22:00  /  Nighttime = 22:00–07:00  (COMAR .01B(4) and .01B(14))
 MD_RESIDENTIAL_DAY    = 65.0   # dB(A)
 MD_RESIDENTIAL_NIGHT  = 55.0   # dB(A)
 MD_COMMERCIAL_DAY     = 67.0   # dB(A)
@@ -99,26 +109,19 @@ MD_COMMERCIAL_NIGHT   = 62.0   # dB(A)
 MD_INDUSTRIAL_DAY     = 75.0   # dB(A)
 MD_INDUSTRIAL_NIGHT   = 75.0   # dB(A)
 
-# ── Maryland COMAR 26.02.03.02 Table 1 — environmental noise standards ────────
-# The state's GOALS, distinct from the enforceable Table 2 above and expressed
-# on different metrics. The residential goal is an Ldn, which this platform
-# computes directly, and COMAR's own Ldn definition (.01B(4): +10 dB applied to
-# 10 p.m.–7 a.m.) matches the Ldn implemented in acoustics.py exactly.
-MD_GOAL_RESIDENTIAL_LDN = 55.0   # dB(A) Ldn
-MD_GOAL_COMMERCIAL_LDN  = 64.0   # dB(A) Ldn
-MD_GOAL_INDUSTRIAL_LEQ24 = 70.0  # dB(A) Leq(24)
-
-# COMAR Table 2 is headed "Maximum Allowable Noise Levels (dBA)" and states no
-# averaging period. The regulation defines "equivalent sound level" in .01B(13)
-# and says in .02A(2) that the STANDARDS (Table 1) are expressed in equivalent
-# levels, but it does not say the same of Table 2. Comparing a period LAeq
-# against Table 2 is therefore a reading of the regulation, not a quotation of
-# it, and every row derived from Table 2 says so rather than implying the
-# regulation settled the question.
-MD_TABLE2_METRIC_NOTE = (
-    "COMAR Table 2 is stated in dB(A) with no averaging period given. This "
-    "report compares it against the LAeq of the period, which is the most "
-    "common reading; a not-to-exceed reading of the same table would be stricter."
+# COMAR 26.02.03.02A(2) expresses the standards as equivalent A-weighted sound
+# levels without stating the averaging time of the day and night columns; the
+# platform uses the LAeq of the daytime and nighttime hours. A single logger's
+# total-level record is not a compliance determination: sources such as road
+# traffic, aircraft and railroads are exempt (.02C), and .02D sets where and with
+# what meter a compliance measurement is made.
+MD_METRIC_NOTE = (
+    "COMAR 26.02.03.02A(2) expresses these standards as equivalent A-weighted sound "
+    "levels; this comparison uses the LAeq of the daytime (07:00–22:00) or nighttime "
+    "(22:00–07:00) hours. It is not a legal determination: COMAR exempts sources "
+    "including motor vehicles on public roads, aircraft at licensed airports, railroads "
+    "and residential air-conditioning (26.02.03.02C), and a compliance measurement is "
+    "made at the receiving property line with a Type II or better meter (26.02.03.02D)."
 )
 
 
@@ -266,17 +269,15 @@ MATRIX: list[StandardRow] = [
         indicative_only=True,
     ),
 
-    # ── Maryland COMAR — Residential ─────────────────────────────────────────
+    # ── Maryland COMAR 26.02.03.02B(1), Table 1 — residential receiving land ──
     StandardRow(
         standard="MD COMAR Day (07:00-22:00)",
         metric="LAeq (07:00–22:00)",
         limit_db=MD_RESIDENTIAL_DAY,
-        source="COMAR 26.02.03.03 Table 2 — Maximum Allowable Noise Levels (residential)",
+        source="COMAR 26.02.03.02B(1), Table 1 — Maximum Allowable Noise Levels (residential)",
         tooltip=(
-            "Maryland's enforceable residential limit, 7 a.m. to 10 p.m. "
-            "(COMAR .01B(5) defines daytime hours). It is measured at or within "
-            "the property line of the RECEIVING property, not at the source "
-            "(.03D(2)). " + MD_TABLE2_METRIC_NOTE
+            "Maryland maximum allowable level for residential receiving land, daytime "
+            "hours 7 a.m. to 10 p.m. (COMAR 26.02.03.01B(4)). " + MD_METRIC_NOTE
         ),
         category="maryland",
     ),
@@ -284,36 +285,11 @@ MATRIX: list[StandardRow] = [
         standard="MD COMAR Night (22:00-07:00)",
         metric="LAeq (22:00–07:00)",
         limit_db=MD_RESIDENTIAL_NIGHT,
-        source="COMAR 26.02.03.03 Table 2 — Maximum Allowable Noise Levels (residential)",
+        source="COMAR 26.02.03.02B(1), Table 1 — Maximum Allowable Noise Levels (residential)",
         tooltip=(
-            "Maryland's enforceable residential limit, 10 p.m. to 7 a.m. "
-            "(COMAR .01B(15) defines nighttime hours). " + MD_TABLE2_METRIC_NOTE + " "
-            "Prominent discrete tones and periodic noises must be 5 dB(A) below "
-            "this level (COMAR .03A(3))."
-        ),
-        category="maryland",
-    ),
-
-    # ── Maryland COMAR .02 Table 1 — state environmental noise goal ───────────
-    # Distinct from Table 2 above: Table 1 is the goal the state is working
-    # toward, and for residential zones it is stated on Ldn — the one Maryland
-    # figure directly comparable with a long-term average rather than with a
-    # period level. Omitting it left the report silent on the state's own
-    # health-oriented standard while quoting only its enforcement floor.
-    StandardRow(
-        standard="MD COMAR environmental noise goal (residential)",
-        metric="Ldn",
-        limit_db=MD_GOAL_RESIDENTIAL_LDN,
-        source="COMAR 26.02.03.02 Table 1 — Environmental Noise Standards",
-        tooltip=(
-            "Maryland's environmental noise standard for residential zoning "
-            "districts, 55 dB(A) Ldn. COMAR .02B(1) calls the Table 1 values "
-            "\"goals for the attainment of an adequate environment\", which the "
-            "enforceable Table 2 limits are intended to achieve — so this is a "
-            "target rather than a level a person may not exceed. "
-            "Ldn is defined in COMAR .01B(4) as the 24-hour energy average with "
-            "+10 dB applied to 10 p.m.–7 a.m., which is exactly the Ldn computed "
-            "in this report."
+            "Maryland maximum allowable level for residential receiving land, nighttime "
+            "hours 10 p.m. to 7 a.m. (COMAR 26.02.03.01B(14)). Prominent discrete tones and "
+            "periodic noises must be 5 dBA below this level (26.02.03.02B(3)). " + MD_METRIC_NOTE
         ),
         category="maryland",
     ),
@@ -348,11 +324,11 @@ def evaluate_compliance(
 
     Result ``kind`` field
     ---------------------
-    ``"compliance"`` rows carry a PASS/FAIL verdict against a directly applicable
-    limit (road traffic, Maryland, indoor bedroom when indoor). ``"indicative"``
-    rows compare total measured energy against a *source-specific* reference
-    (aircraft, railway) that a source-blind meter cannot attribute — these report
-    ABOVE/BELOW the reference rather than a compliance verdict.
+    Every row's ``status`` is ``"ABOVE"`` or ``"AT OR BELOW"``: a comparison of the
+    total measured level with the value, never a compliance determination.
+    ``"comparison"`` rows use the metric the value is defined on. ``"indicative"``
+    rows are source-specific (aircraft, railway) or cannot be decided from a single
+    value (indoor bedroom LAmax).
     """
 
     def _valid(v: float | None) -> bool:
@@ -370,9 +346,8 @@ def evaluate_compliance(
         (MATRIX[5], lnight),        # WHO Railway Lnight  (indicative)
         (MATRIX[6], lnight),        # WHO Bedroom LAeq, night 8 h = LAeq 23:00-07:00 (indoor only)
         (MATRIX[7], lamax_night),   # WHO Bedroom LAmax, night-time readings (indoor only, indicative)
-        (MATRIX[8], laeq_day),      # Maryland Residential Day   (Table 2)
-        (MATRIX[9], laeq_night),    # Maryland Residential Night (Table 2)
-        (MATRIX[10], ldn),          # Maryland residential goal  (Table 1, Ldn)
+        (MATRIX[8], laeq_day),      # Maryland Residential Day   (Table 1)
+        (MATRIX[9], laeq_night),    # Maryland Residential Night (Table 1)
     ]
 
     results: list[dict] = []
@@ -385,13 +360,13 @@ def evaluate_compliance(
         assert measured is not None
 
         delta = round(float(measured) - row.limit_db, 1)
-        if row.source_specific or row.indicative_only:
-            # Reference comparison — report the relation, not a compliance verdict.
-            kind = "indicative"
-            status = "ABOVE" if measured > row.limit_db else "BELOW"
-        else:
-            kind = "compliance"
-            status = "PASS" if measured <= row.limit_db else "FAIL"
+        # A monitoring record is compared with each value; it does not establish
+        # compliance. The WHO values concern long-term noise from a named source
+        # and the meter records all sources; COMAR exempts major sources and sets
+        # its own measurement conditions. Rows on the metric the source defines are
+        # "comparison"; source-specific and single-event rows are "indicative".
+        kind = "indicative" if (row.source_specific or row.indicative_only) else "comparison"
+        status = "ABOVE" if measured > row.limit_db else "AT OR BELOW"
 
         results.append({
             "standard":        row.standard,

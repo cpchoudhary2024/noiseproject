@@ -129,8 +129,9 @@ class EnvironmentalMetricsCalculator:
         percentiles = [1, 5, 10, 25, 50, 75, 90, 95, 99]
         metrics = {}
         
+        # Lx is the level exceeded x % of the time: the (100 - x)th percentile.
         for p in percentiles:
-            metrics[f'L{p}'] = float(np.percentile(data, p))
+            metrics[f'L{p}'] = float(np.percentile(data, 100 - p))
         
         # Energy average (LAeq) — 10*log10(mean(10^(L/10))). An arithmetic mean of
         # decibels is not the equivalent continuous level and understates any
@@ -144,7 +145,7 @@ class EnvironmentalMetricsCalculator:
         metrics['Lrange'] = float(data.max() - data.min())
         
         # Interquartile range
-        metrics['IQR'] = float(metrics['L75'] - metrics['L25'])
+        metrics['IQR'] = float(metrics['L25'] - metrics['L75'])  # 75th minus 25th percentile
         
         return metrics
     

@@ -13,7 +13,6 @@ from plotly.subplots import make_subplots
 from analysis.noise_analyzer import NoiseAnalyzer
 from analysis.iso_epa_standards import StandardsAnalyzer
 from analysis.standards_reference import who_2018_environmental_noise_guideline_levels
-from analysis.chart_generator import AdvancedChartGenerator
 from analysis.acoustics import (compute_ldn_lden, energetic_mean_db,
                                 exceedance_levels_db, energy_concentration,
                                 time_above_level_by_period, time_above_level_in_window,
@@ -57,23 +56,14 @@ logger = logging.getLogger(__name__)
 
 # Instrument provenance statement.
 #
-# Each logger is factory-calibrated and ships with its own individual certificate,
-# which the study team retains. The report states this positively and offers the
-# certificates on request rather than listing them: with a fleet of units, what a
-# reader needs is to know WHICH device produced the data so the right certificate
-# can be requested — hence the device identifier printed alongside. The
-# manufacturer's IEC 61672-1 position is stated rather than glossed, because
-# "meets the accuracy requirements of" is not the same as certified Class 1.
+# A logger export carries no instrument metadata, so nothing about the instrument
+# or its calibration is asserted unless the user supplies it (the "Instrument"
+# field, passed as ``instrument_note``). Reports previously named a specific
+# logger model and a calibration regime for every upload, including files from
+# other instruments.
 DEFAULT_INSTRUMENT_NOTE = (
-    "Measurements were made with a Convergence Instruments NSRT_W_mk4 sound level "
-    "logger, A-weighted. Each unit is factory-calibrated and supplied with its own "
-    "individual manufacturer's certificate of calibration. Certificates are retained "
-    "by the study team and are available on request; the device identifier above "
-    "indicates which unit produced this dataset. The manufacturer states that these "
-    "units meet the accuracy requirements of IEC 61672-1 but does not certify them as "
-    "Class 1 or Class 2 instruments. Where a formal Class 1 determination is required, "
-    "a certified meter with documented field calibration before and after the survey "
-    "should be used."
+    "Not provided. The data file carries no instrument metadata and none was entered, "
+    "so the instrument model, serial number and calibration are not stated in this report."
 )
 
 # Labels that are safe to print: study codes, home letters, device serials.
@@ -296,7 +286,7 @@ class ReportGeneratorV2:
     Implements 8-section architecture:
     1. Executive Acoustic Summary
     2. Data Quality & Completeness (QA/QC)
-    3. Global Regulatory & Health Compliance (LEQ only)
+    3. Comparison with health guidelines and regulatory limits (LEQ only)
     4. Single-Event Sleep Disturbance (L-Max only)
     5. Daily Summary Matrix (Multi-week variance)
     6. Diurnal Hourly Profile (24-hour cycle)
@@ -646,13 +636,13 @@ class ReportGeneratorV2:
                 excess = lden_v - WHO_LDEN_LIMIT
                 bullets.append(
                     f"24-hour weighted average (Lden): {_f(lden_v)} dB(A). "
-                    f"Exceeds the WHO 2018 road-traffic guideline of {WHO_LDEN_LIMIT} dB(A) "
+                    f"Above the WHO 2018 road-traffic guideline value of {WHO_LDEN_LIMIT} dB(A) "
                     f"by {_f(excess)} dB."
                 )
             else:
                 bullets.append(
                     f"24-hour weighted average (Lden): {_f(lden_v)} dB(A). "
-                    f"Within the WHO 2018 road-traffic guideline of {WHO_LDEN_LIMIT} dB(A)."
+                    f"At or below the WHO 2018 road-traffic guideline value of {WHO_LDEN_LIMIT} dB(A)."
                 )
 
         lnight_v = _v(lnight)
@@ -661,13 +651,13 @@ class ReportGeneratorV2:
                 excess = lnight_v - WHO_LNIGHT_LIMIT
                 bullets.append(
                     f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
-                    f"Exceeds the WHO 2018 road-traffic guideline of {WHO_LNIGHT_LIMIT} dB(A) "
+                    f"Above the WHO 2018 road-traffic guideline value of {WHO_LNIGHT_LIMIT} dB(A) "
                     f"by {_f(excess)} dB."
                 )
             elif lnight_v > WHO_LOAEL_NIGHT:
                 bullets.append(
                     f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
-                    f"Within the WHO 2018 road-traffic guideline of {WHO_LNIGHT_LIMIT} dB(A) but above the "
+                    f"At or below the WHO 2018 road-traffic guideline value of {WHO_LNIGHT_LIMIT} dB(A) but above the "
                     f"lowest-observed-adverse-effect level (LOAEL) of {WHO_LOAEL_NIGHT} dB(A), "
                     f"at which initial sleep disturbance effects begin."
                 )
@@ -689,11 +679,12 @@ class ReportGeneratorV2:
             note = ("Lden and Lnight could not be computed for this dataset because usable "
                     "timestamps were unavailable. WHO 2018 guidelines are defined on Lden and "
                     "Lnight, which apply +5 dB (evening) and +10 dB (night) penalties, so they "
-                    "cannot be inferred from LAeq alone and no compliance verdict is issued here.")
+                    "cannot be inferred from LAeq alone and no comparison is made here.")
             bullets.append(f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). {note}")
 
         bullet_lines = "\n".join(f"  • {b}" for b in bullets)
-        para4 = f"WHO 2018 Health Guideline Compliance:\n{bullet_lines}"
+        para4 = (f"Comparison with the WHO 2018 road-traffic guideline values "
+                 f"(total measured level, all sources):\n{bullet_lines}")
 
         # ── Assemble with paragraph separators ──────────────────────────────
         parts = [para1, para2]
@@ -928,7 +919,7 @@ class ReportGeneratorV2:
         self._add_section_2_data_quality(story, styles, ts=ts)
         story.append(Spacer(1, 0.2 * inch))
         
-        # Section 3: Global Regulatory & Health Compliance
+        # Section 3: Comparison with health guidelines and regulatory limits
         self._add_section_3_compliance(story, styles, ts=ts, leq_col=leq_col)
         story.append(Spacer(1, 0.2 * inch))
         
@@ -1308,9 +1299,9 @@ class ReportGeneratorV2:
             "<b>Lden has no such figure</b> because it adds +5 dB to evening and +10 dB to night readings "
             "before averaging: its 53 dB(A) sits on a penalty-weighted scale that no measured reading is "
             "on, so a count of readings above 53 dB(A) would not be about Lden at all. "
-            "<b>None of these shares is a compliance verdict.</b> Every limit here is assessed on a period "
-            "average, and a period can pass on its average while spending real time above the level; the "
-            "verdict rows above carry the assessment. WHO further intends Lden and Lnight as long-term "
+            "<b>None of these shares is a compliance determination.</b> Every value here is compared on a period "
+            "average, and a period can sit below on its average while spending real time above the level; the "
+            "comparison rows above carry that comparison. WHO further intends Lden and Lnight as long-term "
             "annual averages, so figures from a short record are indicative."
         )
 
@@ -1368,7 +1359,7 @@ class ReportGeneratorV2:
             "it was consistent. "
             "<b>Colours</b> — orange is daytime (07:00\u201322:00), dark blue on the shaded background is "
             "night (22:00\u201307:00), following the Maryland COMAR definition. [3] "
-            f"<b>Dashed lines</b> — the COMAR 26.02.03.03 Table 2 residential limits, "
+            f"<b>Dashed lines</b> — the COMAR 26.02.03.02B(1) Table 1 residential limits, "
             f"{MD_RESIDENTIAL_DAY:.0f} dB(A) by day and {MD_RESIDENTIAL_NIGHT:.0f} dB(A) by night, each "
             f"drawn only across the hours its period covers. They apply to the LAeq of the whole day or "
             f"whole night period, reported {metrics_at}, not to a single hour or a single reading. [2]"
@@ -1583,15 +1574,14 @@ class ReportGeneratorV2:
             cap))
         story.append(Spacer(1, 0.06 * inch))
         story.append(Paragraph(
-            "<b>About these measurements.</b> Levels were recorded with a Convergence Instruments "
-            "NSRT_W_mk4 sound level logger, A-weighted. Each unit is factory-calibrated and supplied with "
-            "its own manufacturer's certificate, retained by the study team and available on request. "
+            f"<b>About these measurements.</b> Levels are A-weighted. Instrument and calibration: "
+            f"{escape(self.instrument_note)} "
             "A sound level meter records total sound energy; it does not identify what produced a sound, "
             "so attributing any level here to a particular source requires evidence beyond these "
             "measurements. ISO 1996-2 notes that the combined standard uncertainty of an environmental "
             "noise measurement is typically 1 to 3 dB, so smaller differences should not be treated as "
-            "meaningful. The full technical report, with the compliance assessment, the calibration "
-            "statement and the data-quality record, is available from the study team.",
+            "meaningful. The technical report gives the guideline comparisons, the method and the "
+            "data-quality record in full.",
             cap))
         story.append(Spacer(1, 0.06 * inch))
         story.append(Paragraph("<b>Sources</b>", cap))
@@ -1624,13 +1614,16 @@ class ReportGeneratorV2:
             "recommendations. Lden and Lnight are defined in EU Directive 2002/49/EC, Annex I, as "
             "long-term averages over a year.",
 
-            "[2] COMAR 26.02.03.03A(1), Table 2, Maximum Allowable Noise Levels: residential "
-            "65 dB(A) by day and 55 dB(A) at night; measured at or within the property line of the "
-            "receiving property (.03D(2)); prominent discrete tones and periodic noises must be "
-            "5 dB(A) lower (.03A(3)).",
+            "[2] COMAR 26.02.03.02B(1), Table 1, Maximum Allowable Noise Levels: residential "
+            "65 dBA by day and 55 dBA at night, expressed as equivalent A-weighted sound levels "
+            "(.02A(2)); prominent discrete tones and periodic noises must be 5 dBA lower (.02B(3)); "
+            "sources including motor vehicles on public roads, licensed airports, railroads and "
+            "residential air-conditioning are exempt (.02C); measured at or within the property "
+            "line of the receiving property with a Type II or better meter (.02D). Regulation .03 "
+            "has been repealed.",
 
-            "[3] COMAR 26.02.03.01B(5) and B(15): daytime is 7 a.m. to 10 p.m., nighttime is "
-            "10 p.m. to 7 a.m. B(13) defines equivalent sound level; B(4) defines Ldn.",
+            "[3] COMAR 26.02.03.01B(4) and B(14): daytime is 7 a.m. to 10 p.m., nighttime is "
+            "10 p.m. to 7 a.m. B(12) defines equivalent A-weighted sound level.",
 
             "[4] ISO 1996-1 and ISO 1996-2, <i>Acoustics \u2014 Description, measurement and assessment "
             "of environmental noise</i>: definition of the equivalent continuous sound level, and a "
@@ -2070,11 +2063,9 @@ class ReportGeneratorV2:
 
         A report offered as evidence must let a reader establish what was
         measured, by what instrument, and that the file analysed is the file they
-        hold. Logger exports carry no instrument metadata, so the serial number
-        and calibration date cannot be read from the data. They are not invented
-        or passed over in silence either: the report names the instrument, states
-        that each unit carries its own certificate, offers those on request, and
-        prints the device identifier so a reader knows which one to ask for.
+        hold. Logger exports carry no instrument metadata, so the instrument and
+        its calibration are stated only as the user supplied them, and otherwise
+        reported as not provided; they are never inferred.
         """
         story.append(Paragraph("Data Provenance &amp; Chain of Custody", styles['h2']))
 
@@ -2122,11 +2113,8 @@ class ReportGeneratorV2:
 
         story.append(Paragraph(
             f"<b>Instrument and calibration.</b> {escape(self.instrument_note)} "
-            "The data file itself carries no instrument metadata, so the serial number, the "
-            "calibration date and the deployment geometry (microphone height, orientation and "
-            "distance from any reflecting facade) are not reproduced in this report and are held "
-            "with the study records. The device identifier above is the key to those records: it "
-            "identifies which unit produced this dataset, and therefore which certificate applies. "
+            "The deployment geometry (microphone height, orientation and distance from any "
+            "reflecting facade) is not recorded in the data file and is not reproduced here. "
             "Levels reported here are reproducible from the source file independently of that "
             "documentation.",
             styles['BodyText']
@@ -2180,7 +2168,7 @@ class ReportGeneratorV2:
         story.append(Paragraph("<b>Source Attribution</b>", styles['h2']))
         story.append(Paragraph(
             "Acoustic sensors measure total environmental energy; they do not definitively identify specific noise sources "
-            "(e.g., distinguishing a commercial aircraft from a heavy goods vehicle). Source-specific compliance requires "
+            "(e.g., distinguishing a commercial aircraft from a heavy goods vehicle). A source-specific comparison requires "
             "cross-referencing with external databases (e.g., ADS-B flight tracking).",
             styles['BodyText']
         ))
@@ -2190,8 +2178,8 @@ class ReportGeneratorV2:
         story.append(Paragraph("<b>Health vs. Legal Limits</b>", styles['h2']))
         story.append(Paragraph(
             "This report evaluates data against both biological health guidelines (WHO 2018) and local regulatory limits "
-            "(e.g., Maryland COMAR). Passing local legal zoning limits does not inherently guarantee the absence of adverse "
-            "physiological health impacts.",
+            "(e.g., Maryland COMAR). A level at or below a regulatory limit does not guarantee the absence of adverse "
+            "health effects.",
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.12 * inch))
@@ -2247,32 +2235,6 @@ class ReportGeneratorV2:
     def _fmt_db_plain(cls, value) -> str:
         """Format dB value for table cells (unit in header). NO FUSION."""
         return cls._fmt_float(value, 2)
-
-    @staticmethod
-    def _status_pass_fail(limit_db: float, measured_db) -> str:
-        """Return PASS/FAIL status. NO FUSION."""
-        try:
-            if measured_db is None:
-                return "N/A"
-            v = float(measured_db)
-            if not np.isfinite(v):
-                return "N/A"
-            return "PASS" if v <= float(limit_db) else "FAIL"
-        except Exception:
-            return "N/A"
-
-    @staticmethod
-    def _exceedance_amount(limit_db: float, measured_db):
-        """Return exceedance margin. NO FUSION."""
-        try:
-            if measured_db is None:
-                return None
-            v = float(measured_db)
-            if not np.isfinite(v):
-                return None
-            return max(0.0, v - float(limit_db))
-        except Exception:
-            return None
 
     # ============================================================
     # ACOUSTIC COLUMN DETECTION
@@ -2371,26 +2333,6 @@ class ReportGeneratorV2:
         return pd.to_numeric(self.df[col], errors="coerce")
 
     # ============================================================
-    # WHO COMPLIANCE CHECKER
-    # ============================================================
-
-    def _check_who_compliance_failures(self, ts: pd.Series, leq: pd.Series) -> bool:
-        """Check if ANY WHO 2018 guideline is exceeded."""
-        try:
-            env = compute_ldn_lden(ts, leq) or {}
-            lden = env.get('Lden')
-            lnight = env.get('Lnight')
-            
-            if lden is not None and float(lden) > 53.0:
-                return True
-            if lnight is not None and float(lnight) > 45.0:
-                return True
-            
-            return False
-        except Exception:
-            return False
-
-    # ============================================================
     # SECTION 1: EXECUTIVE ACOUSTIC SUMMARY
     # ============================================================
 
@@ -2465,9 +2407,6 @@ class ReportGeneratorV2:
         story.append(Paragraph(f"<b>{_perlbl} Energy Average (LAeq):</b> {escape(laeq_str)}", styles['BodyText']))
         story.append(Spacer(1, 0.1 * inch))
 
-        # WHO compliance check
-        who_fails = self._check_who_compliance_failures(ts, leq)
-
         try:
             laeq_v = float(laeq) if laeq is not None else float('nan')
         except Exception:
@@ -2475,20 +2414,13 @@ class ReportGeneratorV2:
 
         if np.isfinite(laeq_v):
             laeq_str = escape(self._fmt_float(laeq_v))
-            if who_fails:
-                interp = (
-                    f"The equivalent continuous sound level (LAeq) over the measurement period was "
-                    f"{laeq_str} dB(A). <b>The WHO 2018 guidelines are exceeded</b> — see Section 3, "
-                    f"which evaluates Lden and Lnight, the metrics those guidelines are defined on."
-                )
-            else:
-                # Measured value only: descriptive bands such as "high for a
-                # residential environment" are not defined by any cited standard.
-                interp = (
-                    f"The equivalent continuous sound level (LAeq) over the measurement period was "
-                    f"{laeq_str} dB(A). Section 3 compares the record with the WHO 2018 guideline "
-                    f"values and the Maryland COMAR limits."
-                )
+            # Measured value only: descriptive bands such as "high for a
+            # residential environment" are not defined by any cited standard.
+            interp = (
+                f"The equivalent continuous sound level (LAeq) over the measurement period was "
+                f"{laeq_str} dB(A). Section 3 compares the record with the WHO 2018 guideline "
+                f"values and the Maryland COMAR limits."
+            )
         else:
             interp = "The environment exhibits an average continuous noise level that could not be computed due to missing/invalid LEQ values."
 
@@ -2947,23 +2879,22 @@ class ReportGeneratorV2:
     # ============================================================
 
     def _add_section_3_compliance(self, story, styles, *, ts: pd.Series, leq_col: str | None):
-        story.append(Paragraph("Section 3: Regulatory &amp; Health Compliance", styles['h1']))
+        story.append(Paragraph("Section 3: Comparison with Health Guidelines and Regulatory Limits", styles['h1']))
 
         # Every standard in this section (WHO Lden/Lnight, COMAR day/night) is
         # defined on a specific time window. With no real timestamps there is no
         # window, so a verdict here would be an assertion about a day that was
         # invented by the parser. Withhold the whole section rather than print a
-        # PASS/FAIL that cannot be defended.
+        # comparison that cannot be defended.
         if getattr(self, 'timestamps_synthetic', False):
             story.append(Paragraph(
-                "<b>Compliance assessment withheld.</b> Every standard applied in this report "
+                "<b>Comparison withheld.</b> Every standard applied in this report "
                 "(WHO 2018 Lden and Lnight, Maryland COMAR daytime and nighttime limits) is "
                 "defined over a specific time-of-day window. The date and time information in "
                 "this file could not be read, so those windows cannot be established and no "
-                "compliance verdict can be issued. The overall average level and the statistical "
+                "comparison can be made. The overall average level and the statistical "
                 "percentiles elsewhere in this report remain valid. Re-export the source file "
-                "with a full 'YYYY-MM-DD HH:MM:SS' timestamp column to obtain a compliance "
-                "assessment.",
+                "with a full 'YYYY-MM-DD HH:MM:SS' timestamp column to obtain the comparison.",
                 styles['BodyText']
             ))
             story.append(Spacer(1, 0.12 * inch))
@@ -3022,7 +2953,7 @@ class ReportGeneratorV2:
 
         if not results:
             story.append(Paragraph(
-                "Compliance matrix could not be computed — timestamps or LEQ values may be missing.",
+                "The comparison could not be computed — timestamps or LEQ values may be missing.",
                 styles['BodyText']
             ))
             story.append(Spacer(1, 0.12 * inch))
@@ -3045,11 +2976,11 @@ class ReportGeneratorV2:
                                      textColor=colors.HexColor('#6b7280'), fontName='Helvetica-Oblique')
 
         header_row = [
-            Paragraph("Regulatory Standard",    hdr_style_left),
+            Paragraph("Guideline or limit",     hdr_style_left),
             Paragraph("Metric",                 hdr_style_left),
             Paragraph("Measured\n(dB(A))",      hdr_style),
-            Paragraph("Limit\n(dB(A))",         hdr_style),
-            Paragraph("Assessment",             hdr_style_left),
+            Paragraph("Value\n(dB(A))",         hdr_style),
+            Paragraph("Measured vs value",      hdr_style_left),
         ]
 
         rows = []
@@ -3061,13 +2992,13 @@ class ReportGeneratorV2:
                 rel = "above" if r['status'] == 'ABOVE' else "below"
                 assess_txt = f"{self._fmt_float(margin, 1)} dB {rel} source reference — indicative only"
                 assess_style = assess_ref
-            elif r['status'] == 'PASS':
+            elif r['status'] == 'AT OR BELOW':
                 margin = abs(delta)
-                assess_txt = f"Within limit by {self._fmt_float(margin, 1)} dB — compliant"
+                assess_txt = f"At or below the value by {self._fmt_float(margin, 1)} dB"
                 assess_style = assess_pass
             else:
                 excess = abs(delta)
-                assess_txt = f"Exceeds limit by {self._fmt_float(excess, 1)} dB — non-compliant"
+                assess_txt = f"Above the value by {self._fmt_float(excess, 1)} dB"
                 assess_style = assess_fail
             rows.append([
                 Paragraph(escape(str(r['standard'])), cell_8),
@@ -3098,15 +3029,15 @@ class ReportGeneratorV2:
 
         story.append(Spacer(1, 0.08 * inch))
         story.append(Paragraph(
-            "<i>A PASS under Maryland COMAR does not imply absence of health risk — "
-            "WHO 2018 health-based thresholds are stricter than most local zoning limits.</i>",
+            "<i>A level at or below the Maryland COMAR values does not imply absence of health "
+            "risk: the WHO 2018 health-based guideline values are lower.</i>",
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.10 * inch))
 
-        # How often the level sat above each limit. The pass/fail rows above
+        # How often the level sat above each limit. The comparison rows above
         # report whole-period averages, which say nothing about how the exposure
-        # was distributed: a period can pass on its average while spending a
+        # was distributed: a period can sit below on its average while spending a
         # meaningful share of its hours above the level.
         exc_stats = self._exceedance_summary(ts, self._get_numeric_series(leq_col))
         story.append(Paragraph("Time and periods above the limits", styles['h2']))
@@ -3142,20 +3073,22 @@ class ReportGeneratorV2:
         )
         story.append(Paragraph(
             "<b>How to read these rows:</b> "
-            "The road-traffic (Lden ≤ 53 dB(A), Lnight ≤ 45 dB(A)) and Maryland COMAR rows are evaluated as "
-            "<b>compliance</b> checks against the total measured environmental level. "
-            "The aircraft (Lden ≤ 45 dB(A)) and railway (Lden ≤ 54 dB(A)) rows are shown as "
-            "<b>indicative reference comparisons only</b>: these WHO guidelines were derived from studies that "
-            "attributed noise exclusively to a single source, but the sound level meter measures total combined "
-            "acoustic energy and cannot confirm the source. They therefore report how the measured level sits "
-            "relative to the reference, not a pass/fail verdict. "
+            "Each row compares the total measured level with a guideline or limit value and states whether "
+            "it is above, or at or below, that value. It is not a determination of compliance. "
+            "The WHO 2018 guideline values are specific to one noise source (road traffic Lden 53 dB(A) and "
+            "Lnight 45 dB(A); aircraft Lden 45 dB(A); railway Lden 54 dB(A)), while the sound level meter "
+            "measures the combined sound of all sources and cannot attribute it to one; the aircraft and "
+            "railway rows are therefore shown as <b>indicative</b> only. "
+            "The Maryland COMAR values apply to noise a person causes at a receiving property; motor vehicles "
+            "on public roads, licensed airports, railroads and residential air-conditioning are exempt "
+            "(COMAR 26.02.03.02C), and a compliance measurement is made at the receiving property line with a "
+            "Type II or better meter (26.02.03.02D). "
             + ("With an indoor microphone, the WHO 1999 bedroom rows compare the night-time LAeq "
                "(23:00–07:00) with 30 dB(A), and show the night-time LAmax against 45 dB for reference "
                "only: that guideline concerns how often 45 dB is exceeded in a night, which a single "
                "maximum cannot decide. " if self.environment == 'indoor' else "") +
             "Additionally, WHO 2018 intends Lden/Lnight to represent long-term annual average exposure; a "
-            "measurement period of days or weeks is indicative only. "
-            "This information is provided to prevent misinterpretation of the compliance results.",
+            "measurement period of days or weeks is indicative only.",
             who_note_style
         ))
         story.append(Spacer(1, 0.12 * inch))
@@ -3555,7 +3488,7 @@ class ReportGeneratorV2:
             "The dashed rings mark 45 dB and 53 dB for visual orientation only. They are the WHO guideline "
             "VALUES, but those guidelines are defined on Lnight and Lden — a night-long and a 24-hour "
             "penalty-weighted average respectively — so an individual hour rising above a ring is not an "
-            "exceedance. The compliance assessment in Section 3 evaluates the correct metrics." + src,
+            "exceedance. The comparison in Section 3 uses the correct metrics." + src,
             cap_col
         )
 

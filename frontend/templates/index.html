@@ -41,7 +41,7 @@
                     <h2>Analyze a monitoring record</h2>
                     <p>Computes LAeq, Lden, Lnight, Ldn and percentile levels (L5–L95) from sound level logger
                     exports and compares them with the WHO Environmental Noise Guidelines (2018) and
-                    Maryland COMAR 26.02.03. Files are processed on the server and are not retained after the session.</p>
+                    Maryland COMAR 26.02.03.</p>
                 </div>
 
                 <div class="upload-layout">
@@ -50,7 +50,8 @@
                         <h3>Drop logger files here, or click to select</h3>
                         <p>CSV, XLSX, XLS, Parquet or WLG. Select several files to merge consecutive deployments into one record.</p>
                         <span class="btn btn-primary upload-button">Select files</span>
-                        <p class="upload-hint">Tested with NSRT_W mk4 exports. For records over about 500,000 rows, Parquet uploads at roughly half the size of XLSX with identical results.</p>
+                        <p class="upload-hint">Tested with NSRT_W mk4 exports. The hosted site accepts up to 32 MB per upload, counting all files selected together; for records over about 500,000 rows, Parquet uploads at roughly half the size of XLSX with identical results.</p>
+                        <p class="upload-hint">Uploaded files are stored on the server only for the analysis. Each is given a random reference known only to your browser, and is deleted automatically after two hours, or sooner when newer uploads replace it.</p>
                         <input type="file" id="fileInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.wlg" multiple hidden>
                     </div>
 
@@ -76,7 +77,7 @@
                     <ol class="method-steps">
                         <li><strong>Upload</strong>One logger export, or several consecutive deployments to merge.</li>
                         <li><strong>Analysis period</strong>Optionally restrict dates or exclude invalid windows.</li>
-                        <li><strong>Results</strong>Period levels, compliance matrix, figures, PDF/Word report and data exports.</li>
+                        <li><strong>Results</strong>Period levels, guideline comparison, figures, PDF/Word report and data exports.</li>
                     </ol>
                     <dl class="metric-defs">
                         <dt>LAeq</dt><dd>Energy-average A-weighted level over a period</dd>
@@ -209,6 +210,12 @@
                                placeholder="e.g. Home A" maxlength="80">
                         <span class="device-id-hint">Printed on the PDF and Word reports and in chart titles.</span>
                     </div>
+                    <div class="device-id-inner">
+                        <label class="device-id-label" for="instrumentInput">Instrument</label>
+                        <input type="text" id="instrumentInput" class="device-id-input instrument-input"
+                               placeholder="e.g. model, serial, calibration date" maxlength="300">
+                        <span class="device-id-hint">Optional. Reports state "not provided" when blank.</span>
+                    </div>
                     <div class="device-env-inner">
                         <span class="device-id-label">Microphone</span>
                         <div class="env-toggle" id="envToggle" role="group" aria-label="Microphone placement">
@@ -257,7 +264,7 @@
                 <div class="results-tabs">
                     <div class="tab-header" role="tablist">
                         <button class="tab-btn active" data-tab="health-assessment">Period levels</button>
-                        <button class="tab-btn" data-tab="compliance">Compliance matrix</button>
+                        <button class="tab-btn" data-tab="compliance">Guideline comparison</button>
                         <button class="tab-btn" data-tab="visualizations">Charts</button>
                         <button class="tab-btn" data-tab="statistics">Statistics</button>
                         <button class="tab-btn" data-tab="standards-comparison">Standards reference</button>
@@ -272,10 +279,11 @@
                             WHO Environmental Noise Guidelines (2018), WHO Guidelines for Community Noise (1999) and
                             Maryland COMAR 26.02.03. Occupational limits (OSHA, NIOSH) do not apply to community
                             monitoring and are listed only in the Standards reference.
-                            Δ = measured − limit; a positive Δ is an exceedance.
+                            Each row compares the total measured level with a guideline or limit value; it is not a
+                            determination of compliance. Δ = measured − value.
                         </p>
                         <div id="complianceContainer">
-                            <p class="empty-note">Run an analysis to see compliance results.</p>
+                            <p class="empty-note">Run an analysis to see the comparison.</p>
                         </div>
                     </div>
 
@@ -331,7 +339,7 @@
                             <div id="timeSeriesChart" class="chart-box" style="min-height: 420px;"></div>
                             <figcaption class="chart-explainer">
                                 Energy-average level (LAeq) for each calendar day (00:00–24:00), and for the night beginning on the evening of that date (22:00 to 07:00 the next morning). Hollow markers are days or nights with less than 99.5% of the period measured; hover for coverage. The 53 and 45 dB(A) lines are reference values only: the WHO guidelines
-                                they correspond to are evaluated on Lden and Lnight in the Compliance matrix.
+                                they correspond to are compared on Lden and Lnight in the Guideline comparison tab.
                             </figcaption>
                         </figure>
                     </div>
@@ -496,7 +504,7 @@
                     </div>
                     <div class="disclaimer-item">
                         <dt class="disclaimer-label">Health guidelines and legal limits</dt>
-                        <dd>WHO 2018 values are health-based guidelines; COMAR 26.02.03 values are regulatory limits. Meeting a regulatory limit does not imply meeting the health-based guideline.</dd>
+                        <dd>WHO 2018 values are health-based guidelines; COMAR 26.02.03 values are regulatory limits for noise a person causes at a receiving property, with exempt sources such as road traffic, licensed airports and railroads. Being at or below a regulatory limit does not imply being at or below the health-based guideline.</dd>
                     </div>
                     <div class="disclaimer-item">
                         <dt class="disclaimer-label">Instrument</dt>

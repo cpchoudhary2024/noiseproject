@@ -715,7 +715,7 @@ function renderMetricsPanel() {
     const hh = h => `${String(h).padStart(2, '0')}:00–${String((Number(h) + 1) % 24).padStart(2, '0')}:00`;
 
     // [label, value, unit, qualifier]. Guideline values are stated as numbers
-    // for context; the verdicts themselves are in the Compliance matrix.
+    // for context; the comparisons themselves are in the Guideline comparison tab.
     const items = [['LAeq, whole record', fmt(kf.avg_laeq), 'dB(A)', 'Energy average of all LEQ readings']];
     if (timeValid && num(kf.lden)) {
         items.push(['Lden', fmt(kf.lden), 'dB(A)', 'WHO 2018 road-traffic guideline value: 53']);
@@ -806,7 +806,7 @@ function setDeploymentEnvironment(env) {
     const hint = document.getElementById('envHint');
     if (hint) {
         hint.textContent = next === 'indoor'
-            ? 'Indoor: WHO bedroom limits (30 dB LAeq / 45 dB LAmax) are included in the compliance matrix.'
+            ? 'Indoor: WHO bedroom limits (30 dB LAeq / 45 dB LAmax) are included in the guideline comparison.'
             : 'Outdoor: WHO indoor bedroom limits are omitted (not comparable to an outdoor mic).';
     }
 
@@ -840,7 +840,7 @@ function renderComplianceMatrix(matrixRows) {
     if (!container) return;
 
     if (!matrixRows || matrixRows.length === 0) {
-        container.innerHTML = `<p class="empty-note">The compliance matrix could not be computed: Lden and Lnight
+        container.innerHTML = `<p class="empty-note">The guideline comparison could not be computed: Lden and Lnight
             need a readable date and time column.</p>`;
         return;
     }
@@ -849,7 +849,7 @@ function renderComplianceMatrix(matrixRows) {
     const categories = {
         who_env:    { label: 'WHO 2018 — Environmental (Road Traffic, Aircraft & Railway)', rows: [] },
         who_indoor: { label: 'WHO 1999 / 2018 — Indoor (Bedroom)', rows: [] },
-        maryland:   { label: 'Maryland COMAR 26.02.03 — Legal Limits and State Goals', rows: [] },
+        maryland:   { label: 'Maryland COMAR 26.02.03.02 — Maximum Allowable Noise Levels (residential)', rows: [] },
     };
 
     matrixRows.forEach(r => {
@@ -861,11 +861,11 @@ function renderComplianceMatrix(matrixRows) {
     let html = `<table class="cm-table">
         <thead>
             <tr>
-                <th>Regulatory Standard</th>
+                <th>Guideline or limit</th>
                 <th>Metric</th>
                 <th>Measured</th>
-                <th>Limit</th>
-                <th>Status</th>
+                <th>Value</th>
+                <th>Measured vs value</th>
                 <th>Delta</th>
             </tr>
         </thead>
@@ -878,29 +878,25 @@ function renderComplianceMatrix(matrixRows) {
 
         cat.rows.forEach(r => {
             const indicative = r.kind === 'indicative';
-            const pass   = r.status === 'PASS';
+            const above  = r.status === 'ABOVE';
             const delta  = toNumber(r.delta_db);
             const deltaStr = Number.isFinite(delta)
                 ? (delta >= 0 ? `+${delta.toFixed(1)}` : delta.toFixed(1))
                 : '—';
             const deltaCls = indicative ? 'zero' : (delta > 0 ? 'positive' : (delta < 0 ? 'negative' : 'zero'));
 
-            // Source-specific (aircraft/railway): show a neutral "indicative reference"
-            // pill instead of PASS/FAIL — a source-blind meter cannot attribute the source.
+            // Every row is a comparison of the total measured level, not a compliance
+            // determination. Indicative rows (source-specific or not decidable from one
+            // value) get a neutral pill.
             let pillCls, pillIcon, pillText;
             if (indicative) {
                 pillCls  = 'indicative';
                 pillIcon = 'ⓘ';
-                pillText = 'Indicative';
-            } else if (/goal/i.test(r.standard || '')) {
-                // COMAR Table 1 values are goals, not limits: no pass/fail verdict.
-                pillCls  = pass ? 'pass' : 'fail';
-                pillIcon = '';
-                pillText = pass ? 'At or below goal' : 'Above goal';
+                pillText = above ? 'Above (indicative)' : 'At or below (indicative)';
             } else {
-                pillCls  = pass ? 'pass' : 'fail';
-                pillIcon = pass ? '✓' : '✕';
-                pillText = r.status;
+                pillCls  = above ? 'fail' : 'pass';
+                pillIcon = '';
+                pillText = above ? 'Above' : 'At or below';
             }
 
             const tooltip = r.tooltip ? `
@@ -922,14 +918,19 @@ function renderComplianceMatrix(matrixRows) {
 
     html += `</tbody></table>
     <div class="cm-caveats">
+        <p><strong>What these rows are:</strong> each row compares the total measured level (all sources) with a
+        guideline or limit value. It is not a determination of compliance.</p>
         <p><strong>Indicative rows:</strong> aircraft and railway guidelines are source-specific and the meter
         cannot identify the source; the indoor bedroom LAmax guideline concerns how often 45 dB is exceeded
-        in a night, which a single maximum cannot decide. These rows are reference comparisons, not pass/fail verdicts.</p>
+        in a night, which a single maximum cannot decide.</p>
+        <p><strong>Maryland COMAR:</strong> the limits apply to noise a person causes at a receiving property.
+        Motor vehicles on public roads, licensed airports, railroads and residential air-conditioning are exempt
+        (26.02.03.02C), and a compliance measurement is made at the receiving property line with a Type II or
+        better meter (26.02.03.02D).</p>
         <p><strong>Measurement window:</strong> WHO 2018 intends Lden/Lnight as long-term <em>annual average</em>
         exposure. A monitoring period of days or weeks is indicative of conditions during that window only.</p>
-        <p class="table-note">Delta = measured − limit; a positive delta is an exceedance. The Maryland residential
-        goal (COMAR 26.02.03.02, Table 1) is a target, not an enforceable limit. Hover ⓘ for each metric's
-        definition and source.</p>
+        <p class="table-note">Delta = measured − value; a positive delta means the measured level is above the value.
+        Hover ⓘ for each metric's definition and source.</p>
     </div>`;
 
     container.innerHTML = html;
@@ -1123,8 +1124,8 @@ function displayExecutiveSummary(statistics) {
         ['LAeq, evening',       '19:00–23:00 (Lden evening period)',             env.LAeq_evening_lden],
         ['Lnight',              '23:00–07:00; no penalty',                        env.Lnight],
         ['Lden',                'Day + evening (+5 dB) + night (+10 dB), 24 h',   env.Lden],
-        ['LAeq, COMAR day',     '07:00–22:00 (COMAR 26.02.03.01B(5))',           env.LAeq_day_ldn],
-        ['LAeq, COMAR night',   '22:00–07:00 (COMAR 26.02.03.01B(15))',          env.LAeq_night_ldn],
+        ['LAeq, COMAR day',     '07:00–22:00 (COMAR 26.02.03.01B(4))',           env.LAeq_day_ldn],
+        ['LAeq, COMAR night',   '22:00–07:00 (COMAR 26.02.03.01B(14))',          env.LAeq_night_ldn],
         ['Ldn',                 'Day + night (+10 dB, 22:00–07:00), 24 h',        env.Ldn],
     ];
 
@@ -1133,13 +1134,13 @@ function displayExecutiveSummary(statistics) {
 
     container.innerHTML = `
         <p class="section-note">Energy averages of the <strong>${escapeHtml(col.trim())}</strong> channel over each
-        averaging period, computed across the whole record. Guideline comparisons are in the Compliance matrix.</p>
+        averaging period, computed across the whole record. Guideline comparisons are in the Guideline comparison tab.</p>
         <table class="data-table">
             <thead><tr><th scope="col">Metric</th><th scope="col">Averaging period</th><th scope="col" class="num">dB(A)</th></tr></thead>
             <tbody>${body}</tbody>
         </table>
-        <p class="table-note">Lden and Lnight are defined in EU Directive 2002/49/EC, Annex I; Ldn and the day/night hours
-        in COMAR 26.02.03.01. WHO defines Lden and Lnight as annual averages; over a shorter record they describe the
+        <p class="table-note">Lden and Lnight are defined in EU Directive 2002/49/EC, Annex I; Ldn follows US EPA (1974);
+        the COMAR day and night hours are defined in COMAR 26.02.03.01B(4) and B(14). WHO defines Lden and Lnight as annual averages; over a shorter record they describe the
         measured period only.</p>`;
 }
 
@@ -1398,33 +1399,26 @@ function displayStandards(_standards) {
     `);
 
     // ── 3. Maryland COMAR 26.02.03 ─────────────────────────────────────────
-    // Two different tables in two different regulations, previously merged into
-    // one and cited to the wrong section. Table 2 (.03) is the enforceable
-    // limit; Table 1 (.02) is the state's goal and is stated on Ldn.
+    // Regulation .03 is repealed; the limits are in .02B(1), Table 1.
+    // Verified against regs.maryland.gov, 21 Sep 2026.
     const s3 = section(`
-        ${sectionHeader('Maryland COMAR 26.02.03 — Noise Control', 'Code of Maryland Regulations — Control of Noise Pollution, Maryland Department of the Environment')}
-        <p class="ref-text"><strong>Enforceable limits — COMAR 26.02.03.03, Table 2.</strong> &ldquo;A person may not cause or permit noise levels which exceed those specified in Table 2.&rdquo; Measured at or within the property line of the <em>receiving</em> property (.03D(2)).</p>
+        ${sectionHeader('Maryland COMAR 26.02.03 — Control of Noise Pollution', 'Code of Maryland Regulations, Maryland Department of the Environment')}
+        <p class="ref-text"><strong>Maximum allowable noise levels — COMAR 26.02.03.02B(1), Table 1.</strong> &ldquo;A person may not cause or permit noise levels which exceed those specified in this table&rdquo;, except as provided in .02B(2)–(3) and .02C. The standards are &ldquo;expressed in terms of equivalent A-weighted sound levels&rdquo; (.02A(2)).</p>
         ${stdTable(
-            ['Receiving Zone', 'Day (7 am – 10 pm)', 'Night (10 pm – 7 am)', 'Averaging period'],
+            ['Receiving land use', 'Day (7 am – 10 pm)', 'Night (10 pm – 7 am)'],
             [
-                ['Residential', limitBadge('65 dB(A)'), limitBadge('55 dB(A)'), 'Not stated in the regulation'],
-                ['Commercial', limitBadge('67 dB(A)'), limitBadge('62 dB(A)'), 'Not stated in the regulation'],
-                ['Industrial', limitBadge('75 dB(A)'), limitBadge('75 dB(A)'), 'Not stated in the regulation'],
+                ['Residential', limitBadge('65 dB(A)'), limitBadge('55 dB(A)')],
+                ['Commercial', limitBadge('67 dB(A)'), limitBadge('62 dB(A)')],
+                ['Industrial', limitBadge('75 dB(A)'), limitBadge('75 dB(A)')],
             ],
         )}
         <div class="ref-note">
-          <strong>On the averaging period.</strong> Table 2 is headed &ldquo;Maximum Allowable Noise Levels (dBA)&rdquo; and gives no averaging time. COMAR defines &ldquo;equivalent sound level&rdquo; (.01B(13)) and says the <em>standards</em> in Table 1 are expressed in equivalent levels, but says nothing of the kind about Table 2. This platform compares Table 2 against the <strong>LAeq of the period</strong>, which is the common reading — a not-to-exceed reading of the same table would be stricter. Prominent discrete tones and periodic noises must be <strong>5 dB(A) below</strong> these levels (.03A(3)).
+          <strong>How this platform uses the table.</strong> The residential values are compared with the <strong>LAeq of the daytime or nighttime hours</strong>. This is a comparison, not a legal determination:
+          <br>· <strong>Exempt sources</strong> (.02C) include motor vehicles on public roads, aircraft at licensed airports, railroads and rapid rail transit, and residential air-conditioning and heat-pump equipment (limited separately to 70 and 75 dB(A)). A sound level meter records all of these together.
+          <br>· <strong>Measurement</strong> (.02D): at or within the property line of the receiving property, with a meter meeting Type II or better specifications.
+          <br>· Prominent discrete tones and periodic noises must be <strong>5 dB(A) below</strong> the table values (.02B(3)); construction and demolition may reach 90 dB(A) by day (.02B(2)).
         </div>
-        <p class="ref-text"><strong>State goals — COMAR 26.02.03.02, Table 1.</strong> &ldquo;Goals for the attainment of an adequate environment&rdquo;, which the Table 2 limits above are intended to achieve. These are targets, not levels a person may not exceed.</p>
-        ${stdTable(
-            ['Zoning District', 'Level', 'Metric', 'Averaging period'],
-            [
-                ['Residential', limitBadge('55 dB(A)'), 'Ldn', '24 hours, +10 dB applied to 10 pm – 7 am'],
-                ['Commercial', limitBadge('64 dB(A)'), 'Ldn', '24 hours, +10 dB applied to 10 pm – 7 am'],
-                ['Industrial', limitBadge('70 dB(A)'), 'Leq(24)', '24 hours, no penalty'],
-            ],
-        )}
-        <p class="ref-source">Day and night hours are defined in COMAR 26.02.03.01B(5) and B(15); Ldn in B(4). Verified against the regulation text, 5 Aug 2026. Note that Maryland's night starts at 10 pm, an hour earlier than the 11 pm night used by WHO Lnight — the two cover different windows and are not interchangeable.</p>
+        <p class="ref-source">Day and night hours are defined in COMAR 26.02.03.01B(4) and B(14). Regulation .03 has been repealed. Verified against the regulation text on regs.maryland.gov, 21 Sep 2026. Maryland's night starts at 10 pm, an hour earlier than the 11 pm night used by WHO Lnight — the two cover different windows and are not interchangeable.</p>
     `);
 
     // ── 4. Occupational Standards ──────────────────────────────────────────
@@ -1527,7 +1521,7 @@ function displayStandards(_standards) {
     container.innerHTML = `
         <div class="ref-wrapper">
           <div class="ref-intro">
-            <p class="section-note">The WHO 2018 and Maryland COMAR 26.02.03 values used in the compliance matrix were checked against the primary documents (5 Aug 2026). The WHO 1999, US EPA 1974 and occupational values are listed from the cited documents for reference and are not used in any result. Each limit is shown with the averaging period it is defined over.</p>
+            <p class="section-note">The WHO 2018 values (checked 5 Aug 2026) and Maryland COMAR 26.02.03 values (checked 21 Sep 2026) used in the comparison table were checked against the primary documents. The WHO 1999, US EPA 1974 and occupational values are listed from the cited documents for reference and are not used in any result. Each limit is shown with the averaging period it is defined over.</p>
           </div>
           ${s0}${s0b}${s1}${s2}${s3}${s4}${s5}
         </div>`;
@@ -1782,7 +1776,7 @@ function displayPlainEnglishSummary(text) {
         const bulletLines = lines.filter(l => l.trim().startsWith('•'));
         const headerText  = lines.filter(l => !l.trim().startsWith('•')).join(' ').trim();
         if (headerText) {
-            htmlParts.push(headerText.startsWith('WHO ')
+            htmlParts.push(bulletLines.length
                 ? `<p class="summary-subhead">${escapeHtml(headerText)}</p>`
                 : `<p>${escapeHtml(headerText)}</p>`);
         }
@@ -1820,6 +1814,7 @@ function generateReport(reportType, format = 'pdf') {
             job_id: _reportJobId,
             filters: _activeFilters(),
             device_id: deviceId,
+            instrument: (document.getElementById('instrumentInput')?.value || '').trim(),
             source_files: sourceFiles,
             environment: deploymentEnvironment,
             merge_gap_report: window.mergeGapReport || null,

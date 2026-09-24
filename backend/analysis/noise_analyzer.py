@@ -460,7 +460,9 @@ class NoiseAnalyzer:
         def _status(limit_db: float, value_db: float | None) -> str:
             if value_db is None:
                 return "N/A"
-            return "PASS" if value_db <= limit_db else "FAIL"
+            # A comparison of the total measured level, not a compliance verdict:
+            # the meter cannot attribute the level to the source a guideline covers.
+            return "AT OR BELOW" if value_db <= limit_db else "ABOVE"
 
         def _result(limit_db: float, value_db: float | None, *, metric: str, strength: str) -> dict:
             exceeded = None

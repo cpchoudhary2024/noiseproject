@@ -1,16 +1,2 @@
-Flask>=3.0.0
-Flask-CORS>=4.0.0
-pandas>=2.2.0
-numpy>=1.26.0
-openpyxl>=3.1.2
-# Plotly 7 dropped support for kaleido < 1, and kaleido 1 needs a separately
-# installed Chrome. Without both, every PDF figure silently fails to render.
-plotly>=5.18.0,<7
-scipy>=1.12.0
-reportlab>=4.1.0
-Pillow>=10.1.0
-Werkzeug>=3.0.0
-kaleido==0.2.1
-python-docx>=0.8.11
-gunicorn>=21.2.0
-psutil>=5.9.0
+# Single source of truth: the repository-root requirements file.
+-r ../requirements.txt

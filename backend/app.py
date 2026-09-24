@@ -34,6 +34,7 @@ import threading
 from collections import OrderedDict
 import math
 import uuid
+import secrets
 
 import retention
 
@@ -95,17 +96,25 @@ def _server_error(exc: Exception):
 
 
 def _finite_or_none(obj):
-    """Recursively replace NaN/Infinity with None.
+    """Recursively make ``obj`` valid JSON: NaN/Infinity/NA/NaT become None,
+    NumPy scalars and arrays become Python values.
 
     Python's json emits bare ``NaN``, which is not JSON: the browser's parser
     rejects the whole response, so one missing daily value blanked every chart
-    fed by that endpoint.
+    fed by that endpoint. NumPy integers, booleans and arrays are not
+    serialisable at all and turned the response into a 500.
     """
+    if obj is None or obj is pd.NA or obj is pd.NaT:
+        return None
+    if isinstance(obj, (bool, np.bool_)):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
     if isinstance(obj, (float, np.floating)):
         return float(obj) if math.isfinite(obj) else None
     if isinstance(obj, dict):
         return {k: _finite_or_none(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, (list, tuple, np.ndarray)):
         return [_finite_or_none(v) for v in obj]
     return obj
 
@@ -444,47 +453,36 @@ def _filtered_or_400(df, filters, tag: str):
     return out, None
 
 
-def _resolve_uploaded_filepath(filepath: str) -> str:
-    """Resolve a client-provided filepath, constrained to server-managed folders.
+# Server-side upload names: a time prefix (read by retention) and 64 random bits.
+# The random part makes a name unguessable and collision-free, so an upload can
+# be opened only with the reference returned to the browser that sent it.
+_UPLOAD_NAME_RE = re.compile(r'\d{8}_\d{6}_[0-9a-f]{16}_[A-Za-z0-9_.-]+\.[a-z]+')
+_NO_SUCH_UPLOAD = '.no-such-upload'
 
-    Security: the client only ever supplies paths the server itself handed out
-    (under uploads/ or artifacts/). A bare basename is looked up inside the
-    upload folders; a full path is honoured ONLY if it normalises to a location
-    inside an allowed root. Anything else (``/etc/passwd``, ``../../secret``) is
-    rejected by falling back to a basename lookup in uploads/raw, which will not
-    exist and yields a clean 404 — preventing arbitrary file read / path traversal.
+
+def _new_upload_name(original: str) -> str:
+    """Unguessable server-side name for an uploaded or merged file.
+
+    The extension is kept separately because ``secure_filename`` drops non-ASCII
+    stems entirely (``'测试.csv'`` becomes ``'csv'``), which would lose the format.
     """
-    filepath = str(filepath or '')
+    stem, _, ext = str(original or '').rpartition('.')
+    stem = secure_filename(stem) or 'upload'
+    ext = re.sub(r'[^a-z0-9]', '', ext.lower()) or 'csv'
+    return f"{datetime.now():%Y%m%d_%H%M%S}_{secrets.token_hex(8)}_{stem[:80]}.{ext}"
 
-    # Roots the client is permitted to reference.
-    allowed_roots = [
-        os.path.abspath(app.config['RAW_UPLOAD_FOLDER']),
-        os.path.abspath(app.config['UPLOAD_FOLDER']),
-        os.path.abspath(ARTIFACTS_REPORTS_DIR),
-        os.path.abspath(ARTIFACTS_CHARTS_DIR),
-    ]
 
-    def _within_allowed(p: str) -> bool:
-        # realpath, not abspath: abspath normalises '..' but does not follow
-        # symlinks, so a symlink planted inside uploads/ could still point at an
-        # arbitrary file outside the allowed roots.
-        ap = os.path.realpath(p)
-        return any(ap == os.path.realpath(root) or ap.startswith(os.path.realpath(root) + os.sep)
-                   for root in allowed_roots)
+def _resolve_uploaded_filepath(filepath: str) -> str:
+    """Map a client-supplied upload reference to its path in the raw upload folder.
 
-    # Bare basename → look up inside the upload folders only.
-    if os.path.basename(filepath) == filepath:
-        raw_candidate = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], filepath))
-        if os.path.exists(raw_candidate):
-            return raw_candidate
-        return os.path.abspath(os.path.join(app.config['UPLOAD_FOLDER'], filepath))
-
-    # Full/relative path → honour only if it resolves inside an allowed root.
-    if _within_allowed(filepath):
-        return os.path.abspath(filepath)
-
-    # Reject traversal: treat as a basename inside uploads/raw (non-existent → 404).
-    return os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], os.path.basename(filepath)))
+    Only a bare name in the form issued by ``_new_upload_name`` is accepted. Paths,
+    traversal attempts and names the server did not issue resolve to a path that
+    never exists, so every caller's existence check returns a clean 404.
+    """
+    name = str(filepath or '')
+    if not _UPLOAD_NAME_RE.fullmatch(name):
+        name = _NO_SUCH_UPLOAD
+    return os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], name))
 
 
 def _run_retention_cleanup(*, keep_paths=()):
@@ -498,6 +496,7 @@ def _run_retention_cleanup(*, keep_paths=()):
             keep_raw_uploads=int(os.environ.get('RETENTION_KEEP_RAW', '15')),
             keep_charts_html=int(os.environ.get('RETENTION_KEEP_CHARTS', '15')),
             keep_reports=int(os.environ.get('RETENTION_KEEP_REPORTS', '15')),
+            max_age_hours=float(os.environ.get('RETENTION_MAX_AGE_HOURS', '2')),
             enabled=os.environ.get('RETENTION_ENABLED', '1') not in {'0', 'false', 'False'},
         )
         retention.enforce_retention(
@@ -1323,7 +1322,7 @@ def upload_file():
             return jsonify({'error': 'Only CSV, Excel, Parquet and WLG (Larson Davis) files are allowed'}), 400
         
         # Save file
-        filename = secure_filename(datetime.now().strftime("%Y%m%d_%H%M%S_") + file.filename)
+        filename = _new_upload_name(file.filename)
         filepath = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], filename))
         file.save(filepath)
         
@@ -1758,7 +1757,7 @@ def upload_multi():
             if not allowed_file(f.filename):
                 return jsonify({'error': f'Unsupported file type: {f.filename}. Only CSV, Excel, WLG are allowed.'}), 400
 
-            fname = secure_filename(datetime.now().strftime("%Y%m%d_%H%M%S_") + f.filename)
+            fname = _new_upload_name(f.filename)
             fpath = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], fname))
             f.save(fpath)
 
@@ -1781,7 +1780,7 @@ def upload_multi():
             return jsonify({'error': 'Merged dataset is empty.'}), 400
 
         # Save merged file
-        merged_name = f"MERGED_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        merged_name = _new_upload_name('merged.csv')
         merged_path = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], merged_name))
         merged_df.to_csv(merged_path, index=False)
 
@@ -1829,7 +1828,7 @@ def upload_multi():
 def compliance_check():
     """
     Run the compliance matrix against an already-uploaded file
-    and return a structured pass/fail table.
+    and return the guideline comparison rows (ABOVE / AT OR BELOW).
     """
     try:
         data = request.json or {}
@@ -1933,6 +1932,7 @@ def generate_report():
         merge_gap_report       = (data or {}).get('merge_gap_report') or None
         custom_section_heading = str((data or {}).get('custom_section_heading', '') or '').strip()
         custom_section_body    = str((data or {}).get('custom_section_body', '') or '').strip()
+        instrument_note        = str((data or {}).get('instrument', '') or '').strip()[:300] or None
         environment            = str((data or {}).get('environment', 'outdoor') or 'outdoor').strip().lower()
 
         def _make_generator():
@@ -1944,6 +1944,7 @@ def generate_report():
                 merge_gap_report=merge_gap_report,
                 custom_section_heading=custom_section_heading,
                 custom_section_body=custom_section_body,
+                instrument_note=instrument_note,
                 environment=environment,
             )
 
@@ -2116,6 +2117,8 @@ def _results_workbook(df: pd.DataFrame, analysis: dict, frames: dict, environmen
         ('Readings analysed', len(df)),
         ('Level channel for period metrics', str(leq_col or '').strip()),
         ('Microphone placement', environment),
+        ('Guideline comparison', 'Total measured level (all sources) compared with each guideline or '
+                                 'limit value; not a determination of compliance.'),
         ('Generated', datetime.now().strftime('%Y-%m-%d %H:%M')),
     ], columns=['Item', 'Value'])
 
@@ -2166,7 +2169,7 @@ def _results_workbook(df: pd.DataFrame, analysis: dict, frames: dict, environmen
         if not matrix.empty:
             keep = [c for c in ('standard', 'metric', 'measured_db', 'limit_db', 'delta_db', 'status', 'kind', 'source')
                     if c in matrix.columns]
-            matrix[keep].to_excel(writer, sheet_name='Compliance', index=False)
+            matrix[keep].to_excel(writer, sheet_name='Guideline comparison', index=False)
         if not minute.empty:
             minute.to_excel(writer, sheet_name='1-minute LAeq', index=False)
     output.seek(0)
@@ -2799,7 +2802,7 @@ def compare_files():
                 continue
             if not allowed_file(file.filename):
                 return jsonify({'error': f'Unsupported file type: {file.filename}. Use CSV, XLSX, or WLG.'}), 400
-            filename = secure_filename(datetime.now().strftime("%Y%m%d_%H%M%S_") + file.filename)
+            filename = _new_upload_name(file.filename)
             filepath = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], filename))
             file.save(filepath)
             saved_paths.append(filepath)
@@ -2919,7 +2922,7 @@ def compare_report():
         story.append(Paragraph("Side-by-side summary", styles['h1']))
         story.append(Spacer(1, 0.08 * inch))
 
-        def _verdict_cell(v, limit):
+        def _compare_cell(v, limit):
             if v is None:
                 return "N/A"
             if v <= limit:
@@ -2942,8 +2945,8 @@ def compare_report():
             ["Times"] + [escape_xml(d.get('abbreviations') or d.get('time_basis') or 'N/A') for d in datasets],
             ["Data completeness"] + [_cont(d) for d in datasets],
             ["LAeq, whole record, dB(A)"] + [_db(d.get('laeq')) for d in datasets],
-            ["Lden, dB(A) (WHO 53)"] + [_verdict_cell(d.get('lden'), 53.0) for d in datasets],
-            ["Lnight, dB(A) (WHO 45)"] + [_verdict_cell(d.get('lnight'), 45.0) for d in datasets],
+            ["Lden, dB(A) (WHO 53)"] + [_compare_cell(d.get('lden'), 53.0) for d in datasets],
+            ["Lnight, dB(A) (WHO 45)"] + [_compare_cell(d.get('lnight'), 45.0) for d in datasets],
             ["LAmax, dB(A)"] + [_db(d.get('lmax')) for d in datasets],
             ["L10, dB(A)"] + [_db(d.get('l10')) for d in datasets],
             ["L90, dB(A)"] + [_db(d.get('l90')) for d in datasets],
