@@ -233,8 +233,8 @@ class NoiseAnalyzer:
                 'max': round(float(data.max()), 2),
                 'range': round(float(data.max() - data.min()), 2),
                 'variance': round(float(data.var()), 2),
-                'skewness': round(float(stats.skew(data)), 2),
-                'kurtosis': round(float(stats.kurtosis(data)), 2),
+                'skewness': round(float(stats.skew(data)), 2) if len(data) >= 3 and data.nunique() > 1 else None,
+                'kurtosis': round(float(stats.kurtosis(data)), 2) if len(data) >= 4 and data.nunique() > 1 else None,
                 'cv': round(float((data.std() / data.mean()) * 100), 2),  # Coefficient of variation
                 'interquartile_range': round(float(data.quantile(0.75) - data.quantile(0.25)), 2)
             }
@@ -267,6 +267,9 @@ class NoiseAnalyzer:
         if not time_col:
             return {}
 
+        from analysis.timestamp_utils import assess_timestamp_integrity
+        if not assess_timestamp_integrity(self.df[time_col]).to_dict().get('time_metrics_valid'):
+            return {}
         ts = self._parsed_timestamps(time_col)
         if ts.notna().sum() == 0:
             return {}
@@ -296,7 +299,7 @@ class NoiseAnalyzer:
                 return non_peak
 
             # Last resort: single-column datasets.
-            return self.noise_columns[:] if len(self.noise_columns) == 1 else []
+            return []
 
         metrics: dict[str, dict[str, float]] = {}
         for col in _leq_columns():
@@ -397,6 +400,8 @@ class NoiseAnalyzer:
     
     def _identify_distribution(self, data):
         """Identify the type of distribution"""
+        if len(data) < 4 or data.nunique() <= 1:
+            return 'Insufficient variation to assess distribution shape'
         skewness = stats.skew(data)
         kurtosis = stats.kurtosis(data)
         
@@ -450,153 +455,22 @@ class NoiseAnalyzer:
         return outliers
     
     def _check_compliance(self):
-        """Assess measurements against published guideline levels.
+        """Expose the same indicative rows as the dashboard (no legacy verdicts)."""
+        from analysis.compliance_matrix import matrix_from_analysis, primary_column
+        stats = self._calculate_statistics()
+        env = self._calculate_environmental_metrics()
+        col = primary_column(stats)
+        if col is None:
+            return {}
+        rows = matrix_from_analysis({'statistics': stats, 'environmental_metrics': env})
+        result = {'current_leq': stats[col].get('laeq_db'),
+                  'current_Lden': env.get(col, {}).get('Lden'),
+                  'current_Lnight': env.get(col, {}).get('Lnight')}
+        for row in rows:
+            result[row['standard'] + ' — ' + row['metric']] = {
+                **row, 'value_db': row['measured_db'], 'exceeded_by_db': max(0, row['delta_db'])}
+        return {col: result}
 
-        Notes:
-        - Many "standards" are methods (e.g., ISO 1996) or are jurisdiction-specific.
-        - WHO 2018 provides health-based guideline levels for long-term exposure.
-        - Transport guidelines are expressed in Lden/Lnight; leisure is LAeq,24h.
-        """
-
-        def _status(limit_db: float, value_db: float | None) -> str:
-            if value_db is None:
-                return "N/A"
-            return "PASS" if value_db <= limit_db else "FAIL"
-
-        def _result(limit_db: float, value_db: float | None, *, metric: str, strength: str) -> dict:
-            exceeded = None
-            if value_db is not None:
-                exceeded = max(0.0, float(value_db) - float(limit_db))
-            return {
-                "status": _status(limit_db, value_db),
-                "limit_db": float(limit_db),
-                "value_db": round(float(value_db), 2) if value_db is not None else None,
-                "exceeded_by_db": round(float(exceeded), 2) if exceeded is not None else None,
-                "metric": metric,
-                "recommendation_strength": strength,
-            }
-
-        def _is_lmax(col_name: str) -> bool:
-            l = (col_name or "").lower()
-            return ("lmax" in l) or ("l-max" in l) or ("max" in l and "leq" not in l and "laeq" not in l)
-
-        def _is_lmin(col_name: str) -> bool:
-            l = (col_name or "").lower()
-            return ("lmin" in l) or ("l-min" in l) or ("min" in l and "leq" not in l and "laeq" not in l)
-
-        def _leq_columns() -> list[str]:
-            leq_like = [
-                c for c in self.noise_columns
-                if ("leq" in c.lower() or "laeq" in c.lower() or "l_eq" in c.lower())
-                and not _is_lmax(c)
-                and not _is_lmin(c)
-            ]
-            if leq_like:
-                return leq_like
-            non_peak = [c for c in self.noise_columns if not _is_lmax(c) and not _is_lmin(c)]
-            if non_peak:
-                return non_peak
-            return self.noise_columns[:] if len(self.noise_columns) == 1 else []
-
-        leq_cols = set(_leq_columns())
-
-        # Attempt to compute environmental metrics once (timestamps required).
-        from analysis.timestamp_utils import resolve_time_column
-        env_metrics_by_col: dict[str, dict[str, float]] = {}
-        time_col = resolve_time_column(self.df)
-        ts = pd.Series(dtype='datetime64[ns]')
-        if time_col:
-            ts = self._parsed_timestamps(time_col)
-            if ts.notna().sum() > 0:
-                # Only compute Lden/Lnight metrics for LEQ-like columns.
-                for col in leq_cols:
-                    y = pd.to_numeric(self.df[col], errors="coerce")
-                    out = compute_ldn_lden(ts, y)
-                    if out:
-                        env_metrics_by_col[col] = out
-
-        who = who_2018_environmental_noise_guideline_levels()
-        g = who.get("guidelines", {})
-
-        compliance: dict[str, dict] = {}
-        for col in self.noise_columns:
-            data = self.df[col].dropna()
-            laeq = energetic_mean_db(data)
-            current_leq = float(laeq) if laeq is not None else float(data.mean())
-
-            env = env_metrics_by_col.get(col, {})
-            current_lden = env.get("Lden")
-            current_lnight = env.get("Lnight")
-            current_laeq_24h = env.get("LAeq_24h")
-
-            out: dict[str, object] = {
-                "current_leq": round(current_leq, 2),
-                "current_Lden": round(float(current_lden), 2) if current_lden is not None else "N/A",
-                "current_Lnight": round(float(current_lnight), 2) if current_lnight is not None else "N/A",
-                "current_LAeq_24h": round(float(current_laeq_24h), 2) if current_laeq_24h is not None else "N/A",
-            }
-
-            # WHO 2018 (transport): compare only for LEQ-like columns.
-            if col in leq_cols:
-                # Without identifying the dominant source (road/rail/aircraft/wind),
-                # only apply a conservative, general transport reference comparison.
-                for key, label in [
-                    ("road_traffic", "WHO 2018 Transport (road traffic reference)"),
-                ]:
-                    entry = g.get(key, {})
-                    metrics_db = (entry.get("metrics_db") or {})
-                    strength = str(entry.get("recommendation_strength") or "")
-
-                    if "Lden" in metrics_db:
-                        out[f"{label} — Lden"] = _result(
-                            float(metrics_db["Lden"]),
-                            float(current_lden) if current_lden is not None else None,
-                            metric="Lden",
-                            strength=strength,
-                        )
-
-                    if "Lnight" in metrics_db:
-                        out[f"{label} — Lnight"] = _result(
-                            float(metrics_db["Lnight"]),
-                            float(current_lnight) if current_lnight is not None else None,
-                            metric="Lnight",
-                            strength=strength,
-                        )
-
-            # WHO 2018 (leisure): LAeq,24h only makes sense for LEQ-like columns.
-            if col in leq_cols:
-                leisure = g.get("leisure", {})
-                leisure_metrics = (leisure.get("metrics_db") or {})
-                if "LAeq_24h" in leisure_metrics:
-                    out["WHO 2018 Leisure — LAeq,24h"] = _result(
-                        float(leisure_metrics["LAeq_24h"]),
-                        float(current_laeq_24h) if current_laeq_24h is not None else None,
-                        metric="LAeq_24h",
-                        strength=str(leisure.get("recommendation_strength") or ""),
-                    )
-
-            # Single-event sleep disturbance (LAmax) should come from L-Max streams.
-            # This is not a WHO 2018 Lden/Lnight guideline comparison.
-            if time_col and ts.notna().any() and _is_lmax(col):
-                try:
-                    y = pd.to_numeric(self.df[col], errors="coerce")
-                    h = ts.dt.hour
-                    is_night = (h >= 23) | (h < 7)
-                    night_max = float(y[is_night].max()) if (is_night.any() and y[is_night].notna().any()) else None
-                    if night_max is not None:
-                        out["Sleep disturbance (facade) — LAmax night"] = _result(
-                            60.0,
-                            night_max,
-                            metric="LAmax_night",
-                            strength="contextual",
-                        )
-                except Exception:
-                    pass
-
-            compliance[col] = out
-
-        return compliance
-    
     def _generate_interpretations(self):
         """Generate human-readable interpretations"""
         interpretations = []

@@ -1,0 +1,113 @@
+{
+ "Noise": [
+  "G01.750.770.776.567",
+  "G16.500.275.600",
+  "N06.230.400"
+ ],
+ "Acoustics": [
+  "H01.671.031"
+ ],
+ "Sound": [
+  "G01.750.770.776"
+ ],
+ "Sound Spectrography": [
+  "E05.855"
+ ],
+ "Noise, Occupational": [
+  "N06.230.400.500",
+  "N06.850.460.610.526"
+ ],
+ "Noise, Transportation": [
+  "N06.230.400.550",
+  "N06.850.460.610.680"
+ ],
+ "Environmental Exposure": [
+  "N06.850.460.350"
+ ],
+ "Environmental Monitoring": [
+  "N06.850.460.350.080",
+  "N06.850.780.375"
+ ],
+ "Environmental Pollution": [
+  "N06.850.460"
+ ],
+ "Residence Characteristics": [
+  "N01.224.791",
+  "N06.850.505.400.800"
+ ],
+ "Housing": [
+  "J03.340",
+  "N01.224.791.400",
+  "N06.230.150.360"
+ ],
+ "Cities": [
+  "G16.500.275.069",
+  "N06.230.069",
+  "Z01.433"
+ ],
+ "Rural Population": [
+  "N01.600.725"
+ ],
+ "Urban Population": [
+  "N01.600.900"
+ ],
+ "Power Plants": [
+  "J01.780",
+  "J03.540.680"
+ ],
+ "Industry": [
+  "J01.576"
+ ],
+ "Wind": [
+  "G16.500.175.249.200",
+  "G16.500.275.063.725.154.200",
+  "G16.500.750.775.780"
+ ],
+ "Manufacturing Industry": [
+  "J01.576.655"
+ ],
+ "Extraction and Processing Industry": [
+  "J01.576.655.875"
+ ],
+ "Natural Gas": [
+  "D20.345.369",
+  "N06.230.132.258.369"
+ ],
+ "Petroleum": [
+  "D20.345.630",
+  "N06.230.132.258.630"
+ ],
+ "Mining": [
+  "J01.576.655.875.500"
+ ],
+ "Waste Management": [
+  "N06.850.780.200.800.800.900",
+  "N06.850.860.510.900"
+ ],
+ "Refuse Disposal": [
+  "N06.850.780.200.800.800.700",
+  "N06.850.860.510.900.600"
+ ],
+ "Environmental Policy": [
+  "I01.655.500.608.180",
+  "I01.880.604.825.608.180",
+  "N03.623.500.608.180"
+ ],
+ "Reference Standards": [
+  "E05.978.808"
+ ],
+ "Guidelines as Topic": [
+  "N04.761.700.350",
+  "N05.700.350"
+ ],
+ "Environmental Health": [
+  "H02.229"
+ ],
+ "Facility Design and Construction": [
+  "J01.086.339",
+  "N02.278.200"
+ ],
+ "Air Pollution": [
+  "N06.850.460.100"
+ ]
+}

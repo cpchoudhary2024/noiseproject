@@ -2626,3 +2626,65 @@ body {
     .nav-links { gap: 4px; }
     .nav-link-btn { padding: 6px 10px; font-size: 12px; }
 }
+
+/* ── Weather screening card ─────────────────────────────────────────────── */
+.wx-card { background: white; margin-bottom: 20px; }
+.wx-badge {
+    margin-left: auto;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    background: #f3f4f6;
+    color: #4b5563;
+}
+.wx-badge.applied { background: var(--success-light); color: #065f46; }
+.wx-inputs {
+    display: grid;
+    grid-template-columns: 2fr 1fr 1.6fr;
+    gap: 16px;
+    margin-bottom: 14px;
+}
+.wx-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.wx-stations { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.wx-station {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid #d1d5db;
+    border-radius: 8px;
+    font-size: 14px;
+    color: #374151;
+    cursor: pointer;
+}
+.wx-station.disabled { opacity: 0.55; cursor: not-allowed; }
+.wx-station small { color: #6b7280; }
+.wx-message {
+    margin-top: 14px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    line-height: 1.6;
+    border-left: 5px solid;
+}
+.wx-message.error { background: var(--danger-light); border-color: var(--danger); color: #7f1d1d; }
+.wx-message.info  { background: var(--accent-light); border-color: var(--accent-dark); color: #0c4a6e; }
+.wx-result { margin-top: 16px; font-size: 13px; color: #374151; line-height: 1.6; }
+.wx-result table { width: 100%; border-collapse: collapse; margin: 8px 0 12px; }
+.wx-result th, .wx-result td { padding: 6px 8px; border-bottom: 1px solid #e5e7eb; text-align: left; }
+.wx-result td.num, .wx-result th.num { text-align: right; font-variant-numeric: tabular-nums; }
+@media (max-width: 720px) {
+    .wx-inputs { grid-template-columns: 1fr; }
+}
+
+/* Audit 2026-09-21: readable limits/retention notice and narrow-screen navigation. */
+.upload-policy { color: #475569; font-size: 13px; line-height: 1.6; margin: 16px 0; }
+.footer-disclaimer, .footer-disclaimer p, .disclaimer-grid p { color: #cbd5e1; }
+@media (max-width: 480px) {
+    .nav-container { flex-wrap: wrap; gap: 10px; }
+    .logo-text p { max-width: none; }
+    .nav-status { margin-left: auto; }
+    .nav-links { gap: 6px; }
+    .nav-link-btn { padding: 8px 10px; }
+}

@@ -15,7 +15,7 @@ from analysis.environmental_viz import EnvironmentalVisualizationEngine
 from analysis.environmental_metrics import EnvironmentalMetricsCalculator
 from analysis.noise_analyzer import NoiseAnalyzer
 
-def test_environmental_metrics():
+def check_environmental_metrics():
     """Test EnvironmentalMetricsCalculator"""
     print("\n" + "="*70)
     print("TEST 1: Environmental Metrics Calculator")
@@ -78,7 +78,7 @@ def test_environmental_metrics():
         traceback.print_exc()
         return False
 
-def test_environmental_visualizations():
+def check_environmental_visualizations():
     """Test EnvironmentalVisualizationEngine"""
     print("\n" + "="*70)
     print("TEST 2: Environmental Visualization Engine")
@@ -135,7 +135,7 @@ def test_environmental_visualizations():
         print(f"\n❌ FAIL: {len(visualizations) - passed} visualizations failed")
         return False
 
-def test_module_imports():
+def check_module_imports():
     """Test that all modules import correctly"""
     print("\n" + "="*70)
     print("TEST 0: Module Imports")
@@ -169,13 +169,13 @@ def main():
     results = []
     
     # Test module imports
-    results.append(("Module Imports", test_module_imports()))
+    results.append(("Module Imports", check_module_imports()))
     
     # Test metrics calculator
-    results.append(("Environmental Metrics", test_environmental_metrics()))
+    results.append(("Environmental Metrics", check_environmental_metrics()))
     
     # Test visualizations
-    results.append(("Environmental Visualizations", test_environmental_visualizations()))
+    results.append(("Environmental Visualizations", check_environmental_visualizations()))
     
     # Summary
     print("\n" + "="*70)
@@ -200,3 +200,13 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
+def test_environmental_metrics():
+    assert check_environmental_metrics(), "environmental_metrics check failed"
+
+def test_environmental_visualizations():
+    assert check_environmental_visualizations(), "environmental_visualizations check failed"
+
+def test_module_imports():
+    assert check_module_imports(), "module_imports check failed"

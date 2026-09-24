@@ -59,13 +59,13 @@ class EnvironmentalMetricsCalculator:
         """
         if standards is None:
             standards = {
-                'residential_day': 55,
-                'residential_night': 45,
-                'commercial': 65,
-                'industrial': 75
+                'reference_55_db': 55,
+                'reference_45_db': 45,
+                'reference_65_db': 65,
+                'reference_75_db': 75
             }
         
-        data = self.df[noise_col].dropna()
+        data = pd.to_numeric(self.df[noise_col], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
         metrics = {}
 
         # A sample count is NOT a duration. These loggers record at 1 Hz, so
@@ -80,7 +80,7 @@ class EnvironmentalMetricsCalculator:
             n_below = int((~exceeds).sum())
             metrics[std_name] = {
                 'exceedance_count': n_above,
-                'exceedance_frequency_pct': float((exceeds.sum() / len(data) * 100)),
+                'exceedance_frequency_pct': float((exceeds.sum() / len(data) * 100)) if len(data) else None,
                 # Mean amount by which the limit is exceeded, in dB.
                 'avg_exceedance_amount': float((data[exceeds] - limit).mean()) if exceeds.any() else 0,
                 'max_exceedance': float((data[exceeds] - limit).max()) if exceeds.any() else 0,
@@ -124,7 +124,7 @@ class EnvironmentalMetricsCalculator:
         Returns:
             Dict with percentile values
         """
-        data = self.df[noise_col].dropna()
+        data = pd.to_numeric(self.df[noise_col], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
         
         percentiles = [1, 5, 10, 25, 50, 75, 90, 95, 99]
         metrics = {}
@@ -248,7 +248,7 @@ class EnvironmentalMetricsCalculator:
         Returns:
             Dict with variability metrics
         """
-        data = self.df[noise_col].dropna()
+        data = pd.to_numeric(self.df[noise_col], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
         mean = data.mean()
         
         metrics = {}

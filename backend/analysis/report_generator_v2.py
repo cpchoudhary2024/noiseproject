@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import math
+import uuid
+from analysis.assessment import concern_level as shared_concern_level, assessment_note
 import os
 import re
 import json
@@ -19,6 +21,7 @@ from analysis.acoustics import (compute_ldn_lden, energetic_mean_db,
                                 nightly_lnight, LDEN_DEFAULT)
 from analysis.gap_detector import detect_gaps, gap_report_to_dict, data_completeness_pct, _modal_interval_seconds
 from analysis.docx_from_story import render_story_to_docx, PageTrackingDocTemplate
+from analysis.weather_screen import REASON_LABELS as WEATHER_REASON_LABELS
 from analysis.compliance_matrix import (evaluate_compliance,
                                         MD_RESIDENTIAL_DAY, MD_RESIDENTIAL_NIGHT,
                                         WHO_ROAD_LDEN, WHO_ROAD_LNIGHT)
@@ -46,25 +49,12 @@ from xml.sax.saxutils import escape
 # reader can still verify byte-for-byte which file produced the report — without
 # disclosing who it belongs to.
 
-# Instrument provenance statement.
-#
-# Each logger is factory-calibrated and ships with its own individual certificate,
-# which the study team retains. The report states this positively and offers the
-# certificates on request rather than listing them: with a fleet of units, what a
-# reader needs is to know WHICH device produced the data so the right certificate
-# can be requested — hence the device identifier printed alongside. The
-# manufacturer's IEC 61672-1 position is stated rather than glossed, because
-# "meets the accuracy requirements of" is not the same as certified Class 1.
+# No instrument model or calibration evidence can be inferred from a data file.
 DEFAULT_INSTRUMENT_NOTE = (
-    "Measurements were made with a Convergence Instruments NSRT_W_mk4 sound level "
-    "logger, A-weighted. Each unit is factory-calibrated and supplied with its own "
-    "individual manufacturer's certificate of calibration. Certificates are retained "
-    "by the study team and are available on request; the device identifier above "
-    "indicates which unit produced this dataset. The manufacturer states that these "
-    "units meet the accuracy requirements of IEC 61672-1 but does not certify them as "
-    "Class 1 or Class 2 instruments. Where a formal Class 1 determination is required, "
-    "a certified meter with documented field calibration before and after the survey "
-    "should be used."
+    "Instrument model, certification and calibration records were not supplied to this "
+    "analysis. A-weighted levels and equal sample integration times are assumed. "
+    "Verify these assumptions and retain field calibration and deployment records "
+    "before using this report for a formal assessment."
 )
 
 # Labels that are safe to print: study codes, home letters, device serials.
@@ -254,13 +244,16 @@ class ReportGeneratorV2:
     def __init__(self, df, filepath, analysis=None, standards=None, daily_summary=None, hourly_summary=None,
                  device_id: str = '', source_files: list | None = None, merge_gap_report: dict | None = None,
                  custom_section_heading: str = '', custom_section_body: str = '', environment: str = 'outdoor',
-                 deidentify: bool = True, instrument_note: str | None = None):
+                 deidentify: bool = True, instrument_note: str | None = None,
+                 weather_screen: dict | None = None):
         """
         Initialize report generator with ONLY the uploaded data.
         NO external CSV file loading - all summaries computed from df.
 
         environment : 'outdoor' (default) or 'indoor' — controls whether the WHO
         indoor bedroom guidelines are evaluated in the compliance matrix.
+        weather_screen : disclosure of the weather screen already applied to
+        ``df`` (station, rules, readings removed), or None when not screened.
         """
         self.df = df.copy()
         self.filepath = filepath
@@ -297,6 +290,7 @@ class ReportGeneratorV2:
         self.custom_section_heading = str(custom_section_heading or '').strip()
         self.custom_section_body = str(custom_section_body or '').strip()
         self.environment = str(environment or 'outdoor').strip().lower()
+        self.weather_screen = weather_screen or None
         self.timestamps_synthetic = False  # set True if no real timestamps could be read
         self.timestamp_integrity = None
         self.analyzer = NoiseAnalyzer(df)
@@ -323,6 +317,55 @@ class ReportGeneratorV2:
         if self._standards is None:
             self._standards = self.standards.analyze()
         return self._standards
+
+    def generate_html_report(self, report_type='comprehensive', output_dir=None):
+        """Render the same report story as PDF/Word, including its disclosures."""
+        import base64
+        from html import escape as html_escape
+        from reportlab.lib.pagesizes import landscape, letter
+
+        doc = SimpleDocTemplate(io.BytesIO(), pagesize=landscape(letter),
+                                leftMargin=0.5*inch, rightMargin=0.5*inch)
+        story = self._build_technical_story(doc, report_type)
+
+        def render(item):
+            if isinstance(item, Paragraph):
+                # Plain text prevents ReportLab-specific markup becoming active HTML.
+                return '<p>' + html_escape(item.getPlainText()) + '</p>'
+            if isinstance(item, Table):
+                return '<table>' + ''.join('<tr>' + ''.join(
+                    '<td>' + render(cell) + '</td>' for cell in row
+                ) + '</tr>' for row in item._cellvalues) + '</table>'
+            if isinstance(item, (list, tuple)):
+                return ''.join(render(child) for child in item)
+            if isinstance(item, KeepTogether):
+                return render(item._content)
+            if isinstance(item, Image):
+                source = item.filename
+                if hasattr(source, 'getvalue'):
+                    data = source.getvalue()
+                else:
+                    with open(source, 'rb') as image_file:
+                        data = image_file.read()
+                return '<img alt="Acoustic analysis figure; description follows" src="data:image/png;base64,' + base64.b64encode(data).decode('ascii') + '">'
+            if isinstance(item, PageBreak):
+                return '<hr>'
+            if isinstance(item, Spacer):
+                return ''
+            return html_escape(str(item))
+
+        directory = output_dir or os.path.dirname(self.filepath)
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f'noise_analysis_{uuid.uuid4().hex}.html')
+        with open(path, 'w', encoding='utf-8') as output:
+            output.write('<!doctype html><html lang="en"><meta charset="utf-8">'
+                         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                         '<title>Environmental noise report</title><style>'
+                         'body{font:15px/1.6 system-ui;max-width:1100px;margin:auto;padding:24px;color:#1e293b}'
+                         'table{border-collapse:collapse;width:100%;display:block;overflow:auto}'
+                         'td{border:1px solid #cbd5e1;padding:8px}img{max-width:100%;height:auto}'
+                         '</style><body>' + render(story) + '</body></html>')
+        return path
 
     # ============================================================
     # PLAIN-ENGLISH DATASET SUMMARY (template-based, no AI)
@@ -613,145 +656,22 @@ class ReportGeneratorV2:
         except Exception:
             pass
 
-        # ── 4. WHO compliance bullet points ─────────────────────────────────
-        WHO_LDEN_LIMIT   = 53.0   # WHO 2018, Table 1 (road traffic, Lden)
-        WHO_LNIGHT_LIMIT = 45.0   # WHO 2018, Table 1 (road traffic, Lnight)
-        # 40 dB Lnight,outside is the LOAEL established in the WHO Night Noise
-        # Guidelines for Europe (2009), which WHO 2018 carries forward.
-        WHO_LOAEL_NIGHT  = 40.0
-
-        # Ordered severity so the worst finding wins, rather than the last one.
-        _RANK = {"LOW": 0, "MODERATE": 1, "MODERATE-HIGH": 2, "HIGH": 3, "SERIOUS": 4}
-
-        concern_level = "LOW"
+        # Shared descriptive assessment; no source-specific annual verdict.
+        lden_v, lnight_v = _v(lden), _v(lnight)
+        if environment == 'indoor' or timestamps_unusable:
+            lden_v = lnight_v = None
         bullets = []
-
-        lden_v = _v(lden)
-        if lden_v is not None:
-            if lden_v > WHO_LDEN_LIMIT:
-                excess = lden_v - WHO_LDEN_LIMIT
-                bullets.append(
-                    f"24-hour weighted average (Lden): {_f(lden_v)} dB(A). "
-                    f"Exceeds the WHO 2018 road-traffic guideline of {WHO_LDEN_LIMIT} dB(A) "
-                    f"by {_f(excess)} dB."
-                )
-                # Graduated by how far the guideline is exceeded. Previously every
-                # tier here was rewritten to HIGH further down, so a 0.1 dB and a
-                # 15 dB exceedance produced an identical verdict.
-                if excess >= 10:
-                    concern_level = "SERIOUS"
-                elif excess >= 5:
-                    concern_level = "HIGH"
-                else:
-                    concern_level = "MODERATE-HIGH"
-            else:
-                bullets.append(
-                    f"24-hour weighted average (Lden): {_f(lden_v)} dB(A). "
-                    f"Within the WHO 2018 road-traffic guideline of {WHO_LDEN_LIMIT} dB(A)."
-                )
-
-        lnight_v = _v(lnight)
-        if lnight_v is not None:
-            if lnight_v > WHO_LNIGHT_LIMIT:
-                excess = lnight_v - WHO_LNIGHT_LIMIT
-                bullets.append(
-                    f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
-                    f"Exceeds the WHO 2018 sleep-protection limit of {WHO_LNIGHT_LIMIT} dB(A) "
-                    f"by {_f(excess)} dB."
-                )
-                night_tier = ("SERIOUS" if excess >= 10 else
-                              "HIGH" if excess >= 5 else "MODERATE-HIGH")
-                if _RANK.get(night_tier, 0) > _RANK.get(concern_level, 0):
-                    concern_level = night_tier
-            elif lnight_v > WHO_LOAEL_NIGHT:
-                bullets.append(
-                    f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
-                    f"Within the WHO 2018 limit of {WHO_LNIGHT_LIMIT} dB(A) but above the "
-                    f"lowest-observed-adverse-effect level (LOAEL) of {WHO_LOAEL_NIGHT} dB(A), "
-                    f"at which initial sleep disturbance effects begin."
-                )
-                if _RANK.get("MODERATE", 0) > _RANK.get(concern_level, 0):
-                    concern_level = "MODERATE"
-            else:
-                bullets.append(
-                    f"Nighttime level (Lnight, 23:00–07:00): {_f(lnight_v)} dB(A). "
-                    f"Below the {WHO_LOAEL_NIGHT} dB(A) lowest-observed-adverse-effect level "
-                    f"(WHO Night Noise Guidelines for Europe, 2009), the level below which WHO "
-                    f"does not identify adverse sleep effects in the general population."
-                )
-
+        for label, value, limit in [('Lden', lden_v, 53.0), ('Lnight (23:00–07:00)', lnight_v, 45.0)]:
+            if value is not None:
+                relation = 'above' if value > limit else 'at or below'
+                bullets.append(f"{label}: {_f(value)} dB(A), {relation} the WHO 2018 road-traffic reference of {limit:.1f} dB(A).")
         if not bullets:
-            # No Lden/Lnight available. LAeq is NOT comparable to the WHO limits:
-            # Lden adds +5 dB to evening and +10 dB to night samples, so Lden is
-            # always >= LAeq — often by 3-6 dB on these datasets. Declaring a
-            # record "below the WHO Lden threshold" on the strength of its LAeq
-            # therefore produces false passes. State the limitation instead of
-            # rendering a verdict that the available metric cannot support.
-            note = ("Lden and Lnight could not be computed for this dataset because usable "
-                    "timestamps were unavailable. WHO 2018 guidelines are defined on Lden and "
-                    "Lnight, which apply +5 dB (evening) and +10 dB (night) penalties, so they "
-                    "cannot be inferred from LAeq alone and no compliance verdict is issued here.")
-            if laeq_v > 65:
-                concern_level = "HIGH"
-                bullets.append(
-                    f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). This is high enough "
-                    f"that a WHO guideline exceedance is likely once Lden/Lnight are available. {note}"
-                )
-            elif laeq_v > WHO_LDEN_LIMIT:
-                concern_level = "MODERATE"
-                bullets.append(
-                    f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). This already exceeds "
-                    f"the {WHO_LDEN_LIMIT} dB(A) Lden guideline value before any evening or night "
-                    f"penalty is applied, so an exceedance is likely. {note}"
-                )
-            else:
-                concern_level = "MODERATE"
-                bullets.append(
-                    f"Whole-record average level (LAeq): {_f(laeq_v)} dB(A). {note} "
-                    f"Re-export the file with a full date and time column to obtain a verdict."
-                )
-
-        bullet_lines = "\n".join(f"  • {b}" for b in bullets)
-        para4 = f"WHO 2018 Health Guideline Compliance:\n{bullet_lines}"
-
-        # ── 5. Concern-level paragraph ───────────────────────────────────────
-        concern_map = {
-            "LOW": (
-                "The acoustic environment is generally within WHO health-based guidelines. "
-                "No immediate action is indicated, but periodic re-monitoring is advisable."
-            ),
-            "MODERATE": (
-                "Noise levels are within WHO guidelines but above the lowest level at which sleep "
-                "effects are observed. Continued monitoring is recommended, particularly for "
-                "sensitive occupants such as children or elderly residents."
-            ),
-            # A guideline exceedance of less than 5 dB. This tier existed in the
-            # severity ranking but had no text, so it fell through to the
-            # "within WHO guidelines" wording above — directly contradicting the
-            # bullets immediately preceding it, which read "Exceeds ... by 2.0 dB".
-            "MODERATE-HIGH": (
-                "WHO 2018 health-based guidelines are exceeded, by less than 5 dB. Exceedances of "
-                "this size are close to the 1-3 dB combined measurement uncertainty that ISO 1996-2 "
-                "associates with environmental noise measurement, so the margin should not be read "
-                "as precise. Continued monitoring is recommended, and a certified acoustic "
-                "assessment would establish the exceedance more firmly."
-            ),
-            "HIGH": (
-                "WHO 2018 health-based guidelines are exceeded. Based on WHO evidence, prolonged "
-                "exposure at these levels is associated with increased risk of cardiovascular effects "
-                "(hypertension, ischaemic heart disease) and impaired sleep quality. Professional "
-                "acoustic assessment and noise-reduction measures are recommended."
-            ),
-            "SERIOUS": (
-                "Noise levels significantly exceed WHO guidelines. WHO 2018 identifies strong "
-                "cardiovascular and sleep health risks at these levels. Immediate professional "
-                "acoustic assessment is strongly recommended."
-            ),
-        }
-        if concern_level not in concern_map:
-            concern_level = "HIGH" if laeq_v > 55 else "MODERATE"
-
-        para5 = f"Overall Concern Level: {concern_level}. {concern_map[concern_level]}"
+            bullets.append('Outdoor reference comparisons are unavailable: check placement, timestamps and period coverage. LAeq cannot substitute for Lden or Lnight.')
+        para4 = "WHO 2018 Indicative Reference Comparison:\n" + "\n".join(f"  • {b}" for b in bullets)
+        concern_level = shared_concern_level(lden_v, lnight_v)
+        para5 = f"Overall Concern Level: {concern_level}. {assessment_note(lden_v, lnight_v)}"
+        if environment == 'indoor':
+            para5 = 'Overall Concern Level: NOT ASSESSED. Outdoor transport criteria do not apply indoors. See the conditional bedroom reference comparisons.'
 
         # ── Assemble with paragraph separators ──────────────────────────────
         parts = [para1, para2]
@@ -858,7 +778,7 @@ class ReportGeneratorV2:
 
     def generate_pdf_report(self, report_type='comprehensive', output_dir: str | None = None):
         """Generate the 8-section publication-grade PDF report."""
-        report_filename = f"noise_analysis_{report_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        report_filename = f"noise_analysis_{report_type}_{datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:12]}.pdf"
         report_dir = output_dir or os.path.dirname(self.filepath)
         os.makedirs(report_dir, exist_ok=True)
         report_path = os.path.join(report_dir, report_filename)
@@ -873,7 +793,7 @@ class ReportGeneratorV2:
 
         Built from the identical story, so the two documents cannot diverge.
         """
-        report_filename = f"noise_analysis_{report_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        report_filename = f"noise_analysis_{report_type}_{datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:12]}.docx"
         report_dir = output_dir or os.path.dirname(self.filepath)
         os.makedirs(report_dir, exist_ok=True)
         report_path = os.path.join(report_dir, report_filename)
@@ -962,6 +882,10 @@ class ReportGeneratorV2:
         # Section 2: Data Quality & Completeness
         self._add_section_2_data_quality(story, styles, ts=ts)
         story.append(Spacer(1, 0.2 * inch))
+
+        if self.weather_screen:
+            self._add_weather_screen_section(story, styles)
+            story.append(Spacer(1, 0.2 * inch))
         
         # Section 3: Global Regulatory & Health Compliance
         self._add_section_3_compliance(story, styles, ts=ts, leq_col=leq_col)
@@ -1404,7 +1328,7 @@ class ReportGeneratorV2:
             "it was consistent. "
             "<b>Colours</b> — orange is daytime (07:00\u201322:00), dark blue on the shaded background is "
             "night (22:00\u201307:00), following the Maryland COMAR definition. [3] "
-            f"<b>Dashed lines</b> — the COMAR 26.02.03.03 Table 2 residential limits, "
+            f"<b>Dashed lines</b> — the COMAR 26.02.03.02B(1) Table 1 residential limits, "
             f"{MD_RESIDENTIAL_DAY:.0f} dB(A) by day and {MD_RESIDENTIAL_NIGHT:.0f} dB(A) by night, each "
             f"drawn only across the hours its period covers. They apply to the LAeq of the whole day or "
             f"whole night period, reported {metrics_at}, not to a single hour or a single reading. [2]"
@@ -1462,7 +1386,7 @@ class ReportGeneratorV2:
         str
             Absolute path to the written PDF.
         """
-        report_filename = f"resident_noise_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        report_filename = f"resident_noise_summary_{datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:12]}.pdf"
         report_dir = output_dir or os.path.dirname(self.filepath)
         os.makedirs(report_dir, exist_ok=True)
         report_path = os.path.join(report_dir, report_filename)
@@ -1474,7 +1398,7 @@ class ReportGeneratorV2:
 
     def generate_resident_docx_report(self, output_dir: str | None = None) -> str:
         """The resident summary as an editable Word file, from the same story."""
-        report_filename = f"resident_noise_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        report_filename = f"resident_noise_summary_{datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:12]}.docx"
         report_dir = output_dir or os.path.dirname(self.filepath)
         os.makedirs(report_dir, exist_ok=True)
         report_path = os.path.join(report_dir, report_filename)
@@ -1618,16 +1542,13 @@ class ReportGeneratorV2:
             "is indicative rather than a determination. [1]",
             cap))
         story.append(Spacer(1, 0.06 * inch))
+        if self.weather_screen:
+            story.append(Paragraph(self._weather_screen_resident_note(), cap))
+            story.append(Spacer(1, 0.06 * inch))
         story.append(Paragraph(
-            "<b>About these measurements.</b> Levels were recorded with a Convergence Instruments "
-            "NSRT_W_mk4 sound level logger, A-weighted. Each unit is factory-calibrated and supplied with "
-            "its own manufacturer's certificate, retained by the study team and available on request. "
-            "A sound level meter records total sound energy; it does not identify what produced a sound, "
-            "so attributing any level here to a particular source requires evidence beyond these "
-            "measurements. ISO 1996-2 notes that the combined standard uncertainty of an environmental "
-            "noise measurement is typically 1 to 3 dB, so smaller differences should not be treated as "
-            "meaningful. The full technical report, with the compliance assessment, the calibration "
-            "statement and the data-quality record, is available from the study team.",
+            "<b>About these measurements.</b> " + DEFAULT_INSTRUMENT_NOTE +
+            " A sound level meter does not identify the source. This is a monitoring-period "
+            "reference comparison, not a medical assessment or legal compliance determination.",
             cap))
         story.append(Spacer(1, 0.06 * inch))
         story.append(Paragraph("<b>Sources</b>", cap))
@@ -1670,7 +1591,7 @@ class ReportGeneratorV2:
 
             "[4] ISO 1996-1 and ISO 1996-2, <i>Acoustics \u2014 Description, measurement and assessment "
             "of environmental noise</i>: definition of the equivalent continuous sound level, and a "
-            "combined measurement uncertainty of the order of 1 to 3 dB.",
+            "measurement methods; dataset-specific uncertainty requires a documented budget.",
 
             "[5] WHO, <i>Guidelines for Community Noise</i> (Berglund, Lindvall &amp; Schwela, 1999), "
             "ISBN 92-4-154553-4: the decibel scale and its relation to perceived loudness; indoor "
@@ -2052,6 +1973,150 @@ class ReportGeneratorV2:
     # OPTIONAL CUSTOM SECTION (user notes, inserted after Section 4)
     # ============================================================
 
+    # ============================================================
+    # WEATHER SCREENING DISCLOSURE
+    # ============================================================
+
+    _CLOCK_TEXT = {
+        'local_dst': "local time in {tz}, observing daylight saving time",
+        'local_standard': "local standard time in {tz}, without daylight saving",
+        'utc': "Coordinated Universal Time (UTC)",
+    }
+
+    def _weather_screen_station_text(self) -> str:
+        st = self.weather_screen['station']
+        return (f"{st['name']} ({st['station_id']}) Automated Surface Observing System station, "
+                f"{st['distance_km']:.1f} km from the monitoring location")
+
+    def _weather_screen_resident_note(self) -> str:
+        ws = self.weather_screen
+        pct = 100.0 * ws['rows_removed'] / max(1, ws['rows_considered'])
+        return (
+            "<b>About weather.</b> Readings taken during rain, snow, thunder or strong wind, "
+            "shortly before and after rain, while snow was on the ground, or when the weather "
+            "could not be confirmed were removed before these results were calculated, using "
+            f"official records from the {escape(self._weather_screen_station_text())}. "
+            f"{ws['rows_removed']:,} readings ({pct:.1f}%) were removed for this reason. Weather "
+            "at the station can differ from weather at the home, especially during showers.")
+
+    def _weather_snow_rule_text(self) -> str:
+        """Snow-cover rule, naming the record it was established from."""
+        ws, cfg = self.weather_screen, self.weather_screen['config']
+        src = ws.get('snow_source') or {'mode': 'depth'}
+        limit = (f"{cfg['snow_depth_limit_mm'] / 25.4:g} inch ({cfg['snow_depth_limit_mm']:g} mm)")
+        where = (f"station {escape(str(src.get('ghcnd_id', '')))}"
+                 + (f", {src['distance_km']:.1f} km from the monitoring location"
+                    if src.get('distance_km') else " (the weather station itself)"))
+        return (f"<b>Snow cover:</b> every day with {limit} or more of snow on the ground at NOAA "
+                f"{where}, and the day either side (IOA Good Practice Guide 2013, §2.7.3). Snow "
+                "depth is not measured by the airport's automated sensors.")
+
+    def _add_weather_screen_section(self, story, styles):
+        """Method, rules, sources and effect of the weather screen."""
+        ws = self.weather_screen
+        cfg, summ, st = ws['config'], ws['summary'], ws['station']
+        body = styles['BodyText']
+        story.append(Paragraph("Weather Screening (Rain, Snow, Thunder, Wind)", styles['h1']))
+        story.append(Paragraph(
+            "Readings recorded while the weather could have affected the microphone were removed "
+            "before any result in this report was calculated. Weather was taken from the "
+            f"{escape(self._weather_screen_station_text())} (station located from a "
+            f"{escape(ws['location_basis'])}; the location itself is not recorded). "
+            f"Sources: {escape(ws['sources'])}", body))
+        story.append(Spacer(1, 0.08 * inch))
+
+        blk = cfg['block_minutes']
+        clock = self._CLOCK_TEXT.get(ws['clock'], ws['clock']).format(tz=ws.get('tz') or st['tz'])
+        rules = [
+            f"The record was divided into {blk}-minute blocks. Logger timestamps were read as {escape(clock)}.",
+            "<b>Precipitation:</b> every block in which the station reported precipitation of any kind "
+            "(rain, drizzle, snow, ice pellets, hail or unidentified), or its rain gauge registered any "
+            "amount (ISO 1996-2:2017; NSW Noise Policy for Industry 2017, Fact Sheet A4).",
+            f"<b>Buffer:</b> {cfg['buffer_before_blocks']} block(s) before each precipitation or thunder "
+            "block, for rain-gauge latency (IOA Good Practice Guide 2013, §3.1.9), and "
+            f"{cfg['buffer_after_blocks']} block(s) after, because a wet windscreen alters readings "
+            "after rain stops (ISO 1996-2).",
+            "<b>Thunder:</b> every block in which thunder was reported at or near the station.",
+            f"<b>Wind:</b> every block whose observed station wind or gust, or estimated mean microphone wind, exceeded "
+            f"{cfg['wind_limit_ms']:g} m/s. Screening station maxima without height reduction is a conservative platform rule informed by FHWA guidance. Station mean wind, measured at "
+            f"{cfg['anemometer_height_m']:g} m, was converted to the {cfg['mic_height_m']:g} m "
+            "microphone height with the logarithmic wind profile, v(h) = v(h_ref)·ln(h/z0)/ln(h_ref/z0), "
+            f"z0 = {cfg['roughness_length_m']:g} m (IEC 61400-11 reference roughness); factor "
+            f"{ws['wind_height_factor']:.3f}.",
+            self._weather_snow_rule_text(),
+            f"<b>Unverified weather:</b> blocks without known wind and precipitation in every {cfg['slot_minutes']}-minute "
+            "interval, neighbours within the configured buffer, and days whose snow cover could not be "
+            "established. Periods whose weather could not be verified are treated as affected, "
+            "never as clean.",
+        ]
+        for r in rules:
+            story.append(Paragraph(r, body))
+            story.append(Spacer(1, 0.04 * inch))
+        story.append(Spacer(1, 0.06 * inch))
+
+        story.append(Paragraph("<b>Readings removed from this report's data</b>", body))
+        considered = max(1, ws['rows_considered'])
+        for code, n in sorted(ws['rows_removed_by_reason'].items(), key=lambda kv: -kv[1]):
+            label = WEATHER_REASON_LABELS.get(code, code)
+            story.append(Paragraph(f"{escape(label)}: {n:,} ({100.0 * n / considered:.1f}%)", body))
+        kept = ws['rows_considered'] - ws['rows_removed']
+        # Native table graphic is preserved by both PDF and Word renderers.
+        shares = [kept / considered, ws['rows_removed'] / considered]
+        if all(v > 0 for v in shares):
+            bar = Table([["Retained", "Excluded"]], colWidths=[6.0 * inch * v for v in shares])
+            bar.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, 0), colors.HexColor('#0369a1')),
+                ('BACKGROUND', (1, 0), (1, 0), colors.HexColor('#b45309')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.white),
+                ('FONTSIZE', (0, 0), (-1, -1), 7),
+            ]))
+            # Avoid illegible labels on very narrow segments.
+            if min(shares) >= 0.12:
+                story.append(bar)
+        story.append(Paragraph("Screened results describe retained readings only. Excluded periods "
+                               "are not reconstructed; percentages below are sample counts, not time coverage.", body))
+        story.append(Paragraph(
+            f"<b>Retained:</b> {kept:,} of {ws['rows_considered']:,} readings "
+            f"({100.0 * kept / considered:.1f}%).", body))
+        story.append(Spacer(1, 0.08 * inch))
+
+        agree = summ.get('source_agreement')
+        quality = (f"The station's 1-minute archive covered {summ['blocks_with_1min_pct']:.1f}% of "
+                   f"blocks; {summ['blocks_verified_pct']:.1f}% met the wind/precipitation coverage rule. "
+                   "Missing minutes may be supplemented by METAR reports; gaps remain excluded.")
+        iq = ws.get('identifier_quality') or summ.get('identifier_quality') or {}
+        if iq.get('reliable') is False:
+            quality += (" The station's 1-minute precipitation identifier disagreed with its own "
+                        f"METAR reports on {iq.get('only_1min_pct')}% of "
+                        f"{iq.get('minutes_compared', 0):,} jointly observed minutes, so it was "
+                        "flagged as suspect. Positive precipitation evidence was retained conservatively; "
+                        "disagreement alone cannot establish dry conditions.")
+        if iq.get('impossible_snow_minutes'):
+            quality += (f" {iq['impossible_snow_minutes']:,} minutes carried a snow code at air "
+                        "unusually warm temperatures. These suspect reports were retained as precipitation "
+                        "evidence; temperature alone does not establish dry conditions.")
+        if agree:
+            quality += (f" Where both sources observed the same minute, they agreed on whether "
+                        f"precipitation was occurring in {agree['agree_pct']:.1f}% of "
+                        f"{agree['minutes_compared']:,} minutes; precipitation reported by either "
+                        "source was treated as precipitation.")
+        story.append(Paragraph(f"<b>Weather data quality.</b> {quality}", body))
+        story.append(Spacer(1, 0.08 * inch))
+        far = (" At this distance the screen can miss rain that fell only at the monitoring "
+               "location, and remove periods that were dry there; an on-site rain gauge would "
+               "settle both." if float(st.get('distance_km') or 0) > 25 else "")
+        story.append(Paragraph(
+            "<b>Limitations.</b> Weather at a station "
+            f"{st['distance_km']:.1f} km away can differ from weather at the microphone, "
+            f"particularly for showers.{far} Estimated microphone wind can overstate or understate actual "
+            "site wind. Retained observations are not certified free of weather effects. "
+            "On-site weather and surface-condition logs are needed for site verification. "
+            "Traffic on wet roads after rain is louder; that "
+            "effect is not screened. Removing weather-affected periods changes the time periods "
+            "the averages cover. The block-by-block record of this screen (reference "
+            f"{escape(ws['screen_id'])}) can be downloaded from the analysis platform.", body))
+        story.append(Spacer(1, 0.12 * inch))
+
     def _add_custom_section(self, story, styles):
         heading = self.custom_section_heading or "Additional Notes"
         story.append(Paragraph(f"Additional Notes: {escape(heading)}", styles['h1']))
@@ -2133,6 +2198,10 @@ class ReportGeneratorV2:
             ("Samples analysed", f"{len(self.df):,}"),
             ("Device / location identifier", self.device_id or "Not supplied"),
             ("Sensor placement", self.environment),
+            ("Weather screening", (
+                f"Applied: {self.weather_screen['rows_removed']:,} readings removed using ASOS station "
+                f"{self.weather_screen['station']['station_id']} (screen {self.weather_screen['screen_id']})"
+                if self.weather_screen else "Not applied")),
             ("Report generated", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
         ]
         if self.source_files:
@@ -2194,15 +2263,11 @@ class ReportGeneratorV2:
         # Measurement uncertainty.
         story.append(Paragraph("<b>Measurement Uncertainty</b>", styles['h2']))
         story.append(Paragraph(
-            "No numerical uncertainty budget is stated in this report: deriving one requires the "
-            "deployment geometry and meteorological conditions, which are held with the study "
-            "records rather than in the data file. For context, ISO 1996-2 notes that the combined "
-            "standard uncertainty of an environmental noise measurement is typically of the order of "
-            "1 to 3 dB once instrument tolerance, microphone position, source variability and "
-            "meteorological conditions are accounted for. Differences between values in this report "
-            "smaller than that should not be treated as meaningful, and any comparison close to a "
-            "guideline or limit should be interpreted accordingly rather than as a definitive "
-            "pass or fail.",
+            "Measurement uncertainty has not been quantified. An uncertainty budget requires "
+            "instrument specifications, calibration, deployment geometry, sampling and weather "
+            "evidence. Small differences or comparisons close to a reference should not be treated "
+            "as definitive. ISO 1996-2 describes assessment methodology; no universal uncertainty "
+            "value is assigned to this dataset.",
             styles['BodyText']
         ))
         story.append(Spacer(1, 0.12 * inch))
@@ -2569,17 +2634,14 @@ class ReportGeneratorV2:
             energy_dominance=energy_concentration(leq.dropna()),
         )
 
-        # Determine box colour by concern level
-        _sl = summary_text.lower()
-        if 'concern level: high' in _sl or 'concern level: serious' in _sl:
-            _box_bg, _box_border = '#FEF2F2', '#991b1b'
-            _level_label, _level_fg = 'HIGH', '#991b1b'
-        elif 'concern level: moderate' in _sl:
-            _box_bg, _box_border = '#FFFBEB', '#92400e'
-            _level_label, _level_fg = 'MODERATE', '#92400e'
+        _match = re.search(r'Overall Concern Level: ([A-Z -]+)\.', summary_text)
+        _level_label = _match.group(1) if _match else 'NOT ASSESSED'
+        if _level_label in ('HIGH', 'SERIOUS', 'MODERATE-HIGH'):
+            _box_bg, _box_border, _level_fg = '#FEF2F2', '#991b1b', '#991b1b'
+        elif _level_label == 'MODERATE':
+            _box_bg, _box_border, _level_fg = '#FFFBEB', '#92400e', '#92400e'
         else:
-            _box_bg, _box_border = '#EFF6FF', '#3D5A80'
-            _level_label, _level_fg = 'LOW', '#166534'
+            _box_bg, _box_border, _level_fg = '#EFF6FF', '#3D5A80', '#334155'
 
         # Inner style — NO border, no background (the Table provides the single outer box)
         _inner_style = ParagraphStyle(
@@ -2930,7 +2992,11 @@ class ReportGeneratorV2:
         interval_s = interval_s if interval_s and interval_s > 0 else 1.0
         expected_samples = int(expected_seconds / interval_s) + 1
         actual_samples = len(self.df)
-        uptime_pct = min(100.0, (100.0 * actual_samples / max(1, expected_samples)))
+        # Completeness describes the instrument record. Readings removed by the
+        # weather screen were recorded, so they count as present here and are
+        # reported on their own line; otherwise every screen reads as data loss.
+        weather_removed = int(self.weather_screen['rows_removed']) if self.weather_screen else 0
+        uptime_pct = min(100.0, (100.0 * (actual_samples + weather_removed) / max(1, expected_samples)))
         interval_label = (f"{interval_s:.0f} s" if interval_s >= 1 else f"{interval_s:.3f} s")
 
         if getattr(self, 'timestamps_synthetic', False):
@@ -2943,6 +3009,13 @@ class ReportGeneratorV2:
             story.append(Paragraph(f"<b>Detected Logging Interval:</b> {escape(interval_label)}", styles['BodyText']))
         story.append(Paragraph(f"<b>Expected Samples:</b> {expected_samples:,}", styles['BodyText']))
         story.append(Paragraph(f"<b>Actual Samples in Dataset:</b> {actual_samples:,}", styles['BodyText']))
+        if self.weather_screen:
+            ws = self.weather_screen
+            story.append(Paragraph(
+                f"<b>Removed by weather screening:</b> {ws['rows_removed']:,} readings. These are "
+                "deliberate exclusions (see Weather Screening), not instrument data loss, so they are "
+                "not counted as missing in the completeness figure below. All results in this report "
+                "use only the remaining readings.", styles['BodyText']))
         story.append(Paragraph(f"<b>Uptime (Data Completeness):</b> {self._fmt_float(uptime_pct, 1)}%", styles['BodyText']))
         story.append(Spacer(1, 0.1 * inch))
 
@@ -3135,7 +3208,7 @@ class ReportGeneratorV2:
                 # Source-specific reference (aircraft/railway) — no compliance verdict.
                 margin = abs(delta)
                 rel = "above" if r['status'] == 'ABOVE' else "below"
-                assess_txt = f"{self._fmt_float(margin, 1)} dB {rel} source reference — indicative only"
+                assess_txt = f"{self._fmt_float(margin, 1)} dB {rel} reference — indicative only"
                 assess_style = assess_ref
             elif r['status'] == 'PASS':
                 margin = abs(delta)
@@ -3174,7 +3247,7 @@ class ReportGeneratorV2:
 
         story.append(Spacer(1, 0.08 * inch))
         story.append(Paragraph(
-            "<i>A PASS under Maryland COMAR does not imply absence of health risk — "
+            "<i>This Maryland screening comparison does not establish legal compliance or absence of health risk. "
             "WHO 2018 health-based thresholds are stricter than most local zoning limits.</i>",
             styles['BodyText']
         ))
@@ -3217,60 +3290,12 @@ class ReportGeneratorV2:
             borderWidth=1,
         )
         story.append(Paragraph(
-            "<b>How to read these rows:</b> "
-            "The road-traffic (Lden ≤ 53 dB(A), Lnight ≤ 45 dB(A)) and Maryland COMAR rows are evaluated as "
-            "<b>compliance</b> checks against the total measured environmental level. "
-            "The aircraft (Lden ≤ 45 dB(A)) and railway (Lden ≤ 54 dB(A)) rows are shown as "
-            "<b>indicative reference comparisons only</b>: these WHO guidelines were derived from studies that "
-            "attributed noise exclusively to a single source, but the sound level meter measures total combined "
-            "acoustic energy and cannot confirm the source. They therefore report how the measured level sits "
-            "relative to the reference, not a pass/fail verdict. "
-            "Additionally, WHO 2018 intends Lden/Lnight to represent long-term annual average exposure; a "
-            "measurement period of days or weeks is indicative only. "
-            "This information is provided to prevent misinterpretation of the compliance results.",
-            who_note_style
-        ))
-        story.append(Spacer(1, 0.12 * inch))
-
-    # ============================================================
-    # SECTION 4: SINGLE-EVENT SLEEP DISTURBANCE (L-MAX)
-    # ============================================================
-
-    def _add_section_4_sleep_disturbance(self, story, styles, *, ts: pd.Series, lmax_col: str | None):
-        story.append(Paragraph("Section 4: Single-Event Sleep Disturbance (L-Max only)", styles['h1']))
-
-        if not lmax_col or lmax_col not in self.df.columns:
-            story.append(Paragraph("L-Max stream not available.", styles['BodyText']))
-            story.append(Spacer(1, 0.12 * inch))
-            return
-
-        lmax = self._get_numeric_series(lmax_col)
-        h = ts.dt.hour
-        is_night = (h >= 23) | (h < 7)
-        night = lmax[is_night]
-
-        if night.dropna().empty:
-            story.append(Paragraph("No valid nighttime L-Max samples found (23:00–07:00).", styles['BodyText']))
-            story.append(Spacer(1, 0.12 * inch))
-            return
-
-        la_max_night = float(night.max())
-        exceed_threshold = 60.0
-        n_events = int((night > exceed_threshold).sum())
-        n_total = int(night.notna().sum())
-        pct = (100.0 * n_events / max(1, n_total))
-
-        # Convert sample count to duration using the MEASURED logging interval.
-        # A hardcoded 1 Hz assumption reported the sample count divided by 60 as
-        # "minutes", which is wrong by the ratio of the true interval to 1 s — a
-        # logger recording every 2 s understated the duration twofold, and one
-        # recording every minute understated it sixtyfold.
-        interval_s = _modal_interval_seconds(ts.dropna())
-        interval_s = interval_s if interval_s and interval_s > 0 else None
-        minutes_exceeding = (n_events * interval_s / 60.0) if interval_s else None
-
-        story.append(Paragraph(
-            f"<b>Nighttime hours isolated:</b> 23:00–07:00. Peak extraction uses <b>{escape(lmax_col)}</b> only.",
+            "<b>How to read these rows:</b> All rows are indicative comparisons. WHO transport "
+            "references are source-specific annual outdoor averages, while this record measures "
+            "total sound over the monitoring period. Maryland period-average comparisons do not "
+            "establish a legal verdict: source exemptions, receiving land use, measurement method "
+            "and any tonal adjustment must be established. Indoor bedroom references are conditional "
+            "on placement and night coverage. The current Maryland source is COMAR 26.02.03.02B(1), Table 1.",
             styles['BodyText']
         ))
         story.append(Paragraph(

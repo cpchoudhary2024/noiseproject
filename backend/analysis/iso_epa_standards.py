@@ -262,10 +262,9 @@ class StandardsAnalyzer:
                 'Bedroom single event: LAmax': 45,
                 'Living room / Classroom: LAeq': 35,
             },
-            'WHO Health Thresholds': {
-                'Sleep LOAEL (Lnight)': 40,
-                'Cardiovascular risk threshold (Lden)': 55,
-                'Annoyance begins (Lden)': 50,
+            'WHO 2009 Night Noise Guidance': {
+                'Outdoor annual night-noise target (Lnight)': 40,
+                'Interim target, not a no-effect threshold (Lnight)': 55,
             },
             'OSHA (Occupational)': {
                 'Permissible Exposure Limit (8h TWA)': 90,
@@ -279,148 +278,37 @@ class StandardsAnalyzer:
         }
         return limits
     
-    def get_health_based_assessment(self):
-        """Provide health-based noise assessment using WHO thresholds.
-        
-        This assessment identifies potential health impacts based on:
-        - WHO 2018 Environmental Noise Guidelines
-        - Sleep disturbance thresholds
-        - Cardiovascular risk indicators
-        - Child learning/cognitive impacts
-        """
-        who = who_2018_environmental_noise_guideline_levels()
-        health_thresholds = who.get("health_thresholds", {})
-        
-        assessment = {
-            "title": "Health-Based Noise Impact Assessment",
-            "source": "WHO 2018 Environmental Noise Guidelines",
-            "assessment_by_metric": {},
-        }
-        
-        # Attempt to compute environmental metrics if timestamps exist.
-        # Use the shared resolver and the robust parser — a positional pick with a
-        # naive dayfirst parse produced a different timeline here than the rest of
-        # the platform, so the health assessment could disagree with the report.
-        from analysis.timestamp_utils import resolve_time_column, parse_timestamps_robust
-        time_col = resolve_time_column(self.df)
-
-        has_time_data = False
-        env_metrics_by_col = {}
-
-        if time_col:
-            ts, _ = parse_timestamps_robust(self.df[time_col])
-            if ts.notna().sum() > 0:
-                has_time_data = True
-                for col in self.noise_columns:
-                    y = pd.to_numeric(self.df[col], errors="coerce")
-                    out = compute_ldn_lden(ts, y)
-                    if out:
-                        env_metrics_by_col[col] = out
-        
-        for col in self.noise_columns:
-            data = self.df[col].dropna()
-            if data.empty:
-                continue
-            
-            laeq = energetic_mean_db(data)
-            leq = float(laeq) if laeq is not None else float(data.mean())
-            max_level = data.max()
-            
-            col_assessment = {
-                "LAeq_overall": round(leq, 1),
-                "LAmax": round(max_level, 1),
-                "health_impacts": [],
-                "concern_level": "Low",
-            }
-            
-            # Environmental metrics if available
-            if col in env_metrics_by_col:
-                env = env_metrics_by_col[col]
-                if "Lden" in env:
-                    col_assessment["Lden"] = round(env["Lden"], 1)
-                    # Check Lden against cardiovascular threshold
-                    if env["Lden"] > 55:
-                        col_assessment["health_impacts"].append({
-                            "threshold": "Cardiovascular risk (55 dB Lden)",
-                            "current_level": round(env["Lden"], 1),
-                            "excess": round(env["Lden"] - 55, 1),
-                            "effect": f"Cardiovascular disease risk increases ~8% per 10 dB above threshold"
-                        })
-                        col_assessment["concern_level"] = "Moderate to High"
-                    elif env["Lden"] > 50:
-                        col_assessment["health_impacts"].append({
-                            "threshold": "Annoyance onset (50 dB Lden)",
-                            "current_level": round(env["Lden"], 1),
-                            "effect": "Noticeable annoyance; 6-12% of population highly annoyed"
-                        })
-                        col_assessment["concern_level"] = "Moderate"
-                
-                if "Lnight" in env:
-                    col_assessment["Lnight"] = round(env["Lnight"], 1)
-                    # Check Lnight against sleep thresholds
-                    if env["Lnight"] > 45:
-                        col_assessment["health_impacts"].append({
-                            "threshold": "Sleep quality decline (45 dB Lnight)",
-                            "current_level": round(env["Lnight"], 1),
-                            "excess": round(env["Lnight"] - 45, 1),
-                            "effect": "Self-reported sleep quality begins to decline; increased awakenings likely"
-                        })
-                        if col_assessment["concern_level"] == "Low":
-                            col_assessment["concern_level"] = "Moderate"
-                    elif env["Lnight"] > 40:
-                        col_assessment["health_impacts"].append({
-                            "threshold": "Sleep LOAEL (40 dB Lnight)",
-                            "current_level": round(env["Lnight"], 1),
-                            "effect": "Increased body movements during sleep; subtle sleep architecture changes"
-                        })
-            else:
-                # Fallback to LAeq screening
-                if leq > 85:
-                    col_assessment["health_impacts"].append({
-                        "category": "Hearing damage risk (occupational)",
-                        "current_level": round(leq, 1),
-                        "effect": "Immediate permanent hearing damage risk; hearing protection mandatory"
-                    })
-                    col_assessment["concern_level"] = "Critical"
-                elif leq > 75:
-                    col_assessment["health_impacts"].append({
-                        "category": "Potential hearing damage",
-                        "current_level": round(leq, 1),
-                        "effect": "Long-term hearing damage risk; speech interference"
-                    })
-                    col_assessment["concern_level"] = "High"
-                elif leq > 65:
-                    col_assessment["health_impacts"].append({
-                        "category": "Significant annoyance & speech interference",
-                        "current_level": round(leq, 1),
-                        "effect": "Annoyance, sleep disturbance possible, speech unclear"
-                    })
-                    col_assessment["concern_level"] = "Moderate"
-                elif leq > 55:
-                    col_assessment["health_impacts"].append({
-                        "category": "Noticeable annoyance",
-                        "current_level": round(leq, 1),
-                        "effect": "Annoyance possible, conversation interference"
-                    })
-                    col_assessment["concern_level"] = "Low-Moderate"
-            
-            assessment["assessment_by_metric"][col] = col_assessment
-
-        # ── Top-level rollup for the primary LEQ column ──────────────────────
-        # The UI health cards and recommendations consume these flat fields.
-        primary_col = self._pick_primary_column(list(assessment["assessment_by_metric"].keys()))
-        if primary_col:
-            primary = assessment["assessment_by_metric"][primary_col]
-            assessment["primary_metric"] = primary_col
-            assessment["laeq"]   = primary.get("LAeq_overall")
-            assessment["lamax"]  = primary.get("LAmax")
-            assessment["lden"]   = primary.get("Lden")
-            assessment["lnight"] = primary.get("Lnight")
-            assessment["concern_level"]  = primary.get("concern_level", "Low")
-            assessment["health_impacts"] = primary.get("health_impacts", [])
-            assessment["recommendations"] = self._generate_health_recommendations(primary)
-
-        return assessment
+    def get_health_based_assessment(self, environment='outdoor'):
+        """One monitoring assessment reused by cards and reports; no clinical prediction."""
+        from analysis.assessment import concern_level, assessment_note
+        from analysis.compliance_matrix import primary_column
+        from analysis.timestamp_utils import resolve_time_column, parse_timestamps_robust, assess_timestamp_integrity
+        col = primary_column(self.noise_columns)
+        values = pd.to_numeric(self.df[col], errors='coerce') if col else pd.Series(dtype=float)
+        laeq = energetic_mean_db(values)
+        env = {}
+        tcol = resolve_time_column(self.df)
+        if tcol and assess_timestamp_integrity(self.df[tcol]).to_dict().get('time_metrics_valid'):
+            ts, _ = parse_timestamps_robust(self.df[tcol])
+            env = compute_ldn_lden(ts, values) or {}
+        lden, lnight = env.get('Lden'), env.get('Lnight')
+        if environment == 'indoor':
+            lden = lnight = None
+        note = assessment_note(lden, lnight)
+        if environment == 'indoor':
+            note = 'Outdoor transport references do not apply to indoor measurements. See the conditional bedroom references in the comparison matrix.'
+        level = concern_level(lden, lnight)
+        primary = {'LAeq_overall': laeq, 'Lden': lden, 'Lnight': lnight,
+                   'concern_level': level, 'health_impacts': []}
+        recommendations = [note, 'Confirm instrument calibration, source and representative coverage before interpreting a reference comparison.']
+        if level in ('MODERATE-HIGH', 'HIGH', 'SERIOUS'):
+            recommendations.append('Investigate the noise sources and consider a professional acoustic assessment before choosing mitigation.')
+        if laeq is not None and laeq >= 85:
+            recommendations.append('High sound levels warrant hearing precautions. NIOSH recommends 85 dBA over an eight-hour workday with a 3 dB exchange rate; this environmental record does not establish personal occupational dose.')
+        return dict(title='Monitoring-period reference assessment', primary_metric=col,
+                    laeq=laeq, lden=lden, lnight=lnight, concern_level=level,
+                    assessment_note=note, health_impacts=[], recommendations=recommendations,
+                    assessment_by_metric={col: primary} if col else {})
 
     @staticmethod
     def _pick_primary_column(cols: list[str]) -> str | None:
@@ -436,83 +324,6 @@ class StandardsAnalyzer:
                     if not any(k in c.lower() for k in ["max", "min", "peak"])]
         return non_peak[0] if non_peak else cols[0]
 
-    @staticmethod
-    def _generate_health_recommendations(col_assessment: dict) -> list[str]:
-        """Build WHO-grounded, actionable recommendations from a column assessment.
-
-        Template-based (no AI). Thresholds: WHO 2018 road-traffic Lden 53 dB(A),
-        Lnight 45 dB(A); LOAEL 40 dB(A) Lnight.
-        """
-        recs: list[str] = []
-        lden   = col_assessment.get("Lden")
-        lnight = col_assessment.get("Lnight")
-        laeq   = col_assessment.get("LAeq_overall")
-        concern = str(col_assessment.get("concern_level", "Low"))
-
-        def _num(v):
-            try:
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
-
-        lden_v, lnight_v, laeq_v = _num(lden), _num(lnight), _num(laeq)
-
-        # Daytime / Lden guidance (WHO road-traffic guideline = 53 dB Lden)
-        if lden_v is not None:
-            if lden_v > 53:
-                recs.append(
-                    f"Lden is {lden_v:.1f} dB(A), above the WHO 2018 road-traffic guideline of 53 dB(A). "
-                    "Consider source-directed mitigation (barriers, low-noise road surfaces, traffic calming, "
-                    "or setback distance) and prioritise façade insulation for exposed rooms."
-                )
-            else:
-                recs.append(
-                    f"Lden is {lden_v:.1f} dB(A), within the WHO 2018 road-traffic guideline of 53 dB(A). "
-                    "Maintain current conditions and re-monitor periodically."
-                )
-
-        # Nighttime / sleep guidance (WHO Lnight 45 dB; LOAEL 40 dB)
-        if lnight_v is not None:
-            if lnight_v > 45:
-                recs.append(
-                    f"Lnight is {lnight_v:.1f} dB(A), above the WHO sleep-protection guideline of 45 dB(A). "
-                    "Keep bedroom windows closed at night, position sleeping areas away from the noise source, "
-                    "and consider acoustic glazing — nighttime exposure at this level is linked to disrupted "
-                    "sleep architecture and cardiovascular strain."
-                )
-            elif lnight_v > 40:
-                recs.append(
-                    f"Lnight is {lnight_v:.1f} dB(A), between the WHO LOAEL (40 dB) and the 45 dB guideline. "
-                    "Subtle sleep effects may begin for sensitive residents; monitor and protect vulnerable "
-                    "occupants (children, elderly, shift workers)."
-                )
-            else:
-                recs.append(
-                    f"Lnight is {lnight_v:.1f} dB(A), below the WHO LOAEL of 40 dB(A). "
-                    "No nighttime sleep effects are expected at this level."
-                )
-
-        # Fallback when no timestamped Lden/Lnight could be computed
-        if lden_v is None and lnight_v is None and laeq_v is not None:
-            recs.append(
-                f"Overall LAeq is {laeq_v:.1f} dB(A). Timestamped Lden/Lnight could not be computed, so "
-                "day/night WHO comparisons are unavailable — ensure the dataset includes valid timestamps "
-                "for a full health assessment."
-            )
-
-        if concern in ("High", "Critical", "Moderate to High"):
-            recs.append(
-                "Given the elevated concern level, a professional acoustic assessment and a formal "
-                "noise-management plan are recommended."
-            )
-
-        # Universal protective guidance
-        recs.append(
-            "Protect sensitive groups (children, elderly, pregnant women, and people with "
-            "cardiovascular or respiratory conditions), who experience noise health effects at lower levels."
-        )
-        return recs
-    
     def get_occupational_assessment(self, exposure_hours: float | None = None):
         """Assess occupational exposure against NIOSH and OSHA criteria.
 

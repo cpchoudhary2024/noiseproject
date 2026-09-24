@@ -30,7 +30,7 @@ class RetentionPolicy:
 
 
 def _is_raw_upload(filename: str) -> bool:
-    return bool(re.match(r"^\d{8}_\d{6}_.+\.(csv|xlsx|xls)$", filename, re.IGNORECASE))
+    return bool(re.match(r"^(?:[0-9a-f]{32}_|MERGED_[0-9a-f]{32}|\d{8}_\d{6}_).+?\.(csv|xlsx|xls|wlg|parquet|pq)$", filename, re.IGNORECASE))
 
 
 def _is_chart_html(filename: str) -> bool:
@@ -38,7 +38,7 @@ def _is_chart_html(filename: str) -> bool:
 
 
 def _is_report_file(filename: str) -> bool:
-    return bool(re.match(r"^noise_analysis_.+_\d{8}_\d{6}\.(pdf|html)$", filename, re.IGNORECASE))
+    return bool(re.match(r"^(?:noise_analysis_|resident_noise_summary_|noise_comparison_).+\.(pdf|html|docx)$", filename, re.IGNORECASE))
 
 
 def _apply_retention(

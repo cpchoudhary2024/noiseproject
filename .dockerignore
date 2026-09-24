@@ -1,0 +1,12 @@
+# Explicit application-only build context; never package uploads or research files.
+**
+!Dockerfile
+!requirements.txt
+!requirements.lock
+!backend/
+!backend/**
+!frontend/
+!frontend/**
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/.env*

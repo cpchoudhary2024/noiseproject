@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Noise Analysis Platform | WHO Health-Based Assessment</title>
+    <title>Noise Analysis Platform | Environmental Noise Reference Assessment</title>
     <!-- Pinned. "plotly-latest" is an alias frozen at v1.58.5 (July 2021) and is
          never updated again, so the browser was rendering with a five-year-old
          library while the server generated PDF figures with Plotly 6.x. -->
@@ -20,7 +20,7 @@
                 <div class="logo-icon">🔊</div>
                 <div class="logo-text">
                     <h1>Noise Analysis</h1>
-                    <p>WHO Health-Based Assessment</p>
+                    <p>Environmental Noise Reference Assessment</p>
                 </div>
             </div>
             <div class="nav-links">
@@ -46,7 +46,7 @@
                 <div class="upload-card">
                     <div class="upload-header">
                         <h2>Upload Noise Data</h2>
-                        <p>Compatible with <strong>NSRTW MK4</strong> sound level meter &nbsp;·&nbsp; Accepted formats: CSV &nbsp;·&nbsp; XLSX &nbsp;·&nbsp; XLS &nbsp;·&nbsp; Parquet &nbsp;·&nbsp; WLG</p>
+                        <p>For A-weighted, equal-interval sound-level measurements &nbsp;·&nbsp; Accepted formats: CSV &nbsp;·&nbsp; XLSX &nbsp;·&nbsp; XLS &nbsp;·&nbsp; Parquet &nbsp;·&nbsp; WLG</p>
                     </div>
 
                     <!-- Drop zone (always visible, always clickable) -->
@@ -56,6 +56,8 @@
                         <p>CSV, XLSX, XLS, Parquet, WLG &nbsp;·&nbsp; You can also drag-and-drop multiple files at once<br><small>For records over ~500k rows, Parquet uploads about half the size and reads roughly 7x faster. Results are identical.</small></p>
                         <input type="file" id="fileInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.wlg" multiple style="display: none;">
                     </div>
+
+                    <p class="upload-policy">Maximum combined request: {{ upload_max_mb }} MB. Uploads are tied to this browser session and references expire after 24 hours. Files may be removed sooner by storage retention or a server restart. Download the results you need. Do not include personal identifiers.</p>
 
                     <!-- Staged file list — shown once ≥1 file is staged -->
                     <div class="staged-files-area" id="stagedFilesArea" style="display:none;">
@@ -88,7 +90,7 @@
                     <div class="info-card">
                         <div class="info-icon">📊</div>
                         <h3>Fast Processing</h3>
-                        <p>Analyzes your data instantly</p>
+                        <p>Processing time depends on record size</p>
                     </div>
                     <div class="info-card">
                         <div class="info-icon">🏥</div>
@@ -271,8 +273,55 @@
                 <!-- Active date-filter banner. Shown whenever the analysis ran on a
                      subset, so the filter's effect is visible rather than assumed. -->
                 <div id="filterActiveBanner" style="display:none;margin-bottom:16px;padding:12px 16px;border-radius:8px;border-left:5px solid #7c3aed;background:#faf5ff;color:#4c1d95;font-size:13px;line-height:1.6;">
-                    <i class="fas fa-filter"></i> <strong>Date filter applied.</strong>
+                    <i class="fas fa-filter"></i> <strong>Filter applied.</strong>
                     <span id="filterActiveText"></span>
+                </div>
+
+                <!-- Weather screening: removes rain / snow / thunder / wind periods using
+                     official station records. Fails closed: no screen without weather data. -->
+                <div class="filter-group wx-card" id="weatherScreenCard">
+                    <h3 class="filter-group-title">
+                        <i class="fas fa-cloud-rain"></i> Weather screening
+                        <span class="filter-optional">(rain, snow, thunder, wind)</span>
+                        <span class="wx-badge" id="wxBadge">Not applied</span>
+                    </h3>
+                    <p class="filter-desc">
+                        Removes readings taken while weather could have affected the microphone, using official
+                        records from the nearest NOAA/FAA airport weather station (ASOS): precipitation, thunder,
+                        snow on the ground, and observed station wind/gust or estimated microphone wind above 5 m/s (FHWA; ISO 1996-2; NSW Noise Policy
+                        for Industry, Fact Sheet A4; IOA Good Practice Guide 2013). Any period whose weather cannot
+                        be verified from available records is removed. Remote stations cannot certify conditions at the microphone. Your location is used only to find the station; it is
+                        not stored or printed in any report.
+                    </p>
+                    <div class="wx-inputs">
+                        <div class="filter-field">
+                            <label for="wxLocation">ZIP code or latitude, longitude</label>
+                            <input id="wxLocation" class="filter-input" placeholder="e.g. 21044 or 39.20, -76.86" autocomplete="off">
+                        </div>
+                        <div class="filter-field">
+                            <label for="wxMicHeight">Microphone height (m)</label>
+                            <input id="wxMicHeight" class="filter-input" type="number" min="0.5" max="30" step="0.1" value="1.5">
+                        </div>
+                        <div class="filter-field">
+                            <label for="wxClock">Logger clock</label>
+                            <select id="wxClock" class="filter-input">
+                                <option value="local_dst">Local time, with daylight saving</option>
+                                <option value="local_standard">Local standard time (no daylight saving)</option>
+                                <option value="utc">UTC</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="wx-actions">
+                        <button class="btn btn-outline" id="wxFindBtn" onclick="findWeatherStations()">
+                            <i class="fas fa-location-dot"></i> Find weather stations
+                        </button>
+                        <button class="btn btn-outline" id="wxRemoveBtn" style="display:none;" onclick="removeWeatherScreen()">
+                            <i class="fas fa-rotate-left"></i> Remove weather screening
+                        </button>
+                    </div>
+                    <div id="wxStations" class="wx-stations" style="display:none;"></div>
+                    <div id="wxMessage" class="wx-message" style="display:none;" role="status"></div>
+                    <div id="wxResult" class="wx-result" style="display:none;"></div>
                 </div>
 
                 <!-- Timestamp-integrity warning (shown when timestamps are unreadable) -->
@@ -630,7 +679,7 @@
                     <!-- Per-location status cards -->
                     <div class="compare-results-card">
                         <h3><i class="fas fa-location-dot" style="color:#3D5A80;"></i> Each location vs the WHO guidelines</h3>
-                        <p class="compare-results-note">Sorted loudest to quietest. Each location's overall day-and-night level (Lden) and night-time level (Lnight), with whether it is within the WHO health guidelines (53 dB day-night · 45 dB night).</p>
+                        <p class="compare-results-note">Sorted loudest to quietest. Each location's overall day-and-night level (Lden) and night-time level (Lnight), with how it compares with WHO road-traffic references (53 dB day-night · 45 dB night).</p>
                         <div id="compareStatusCards" class="compare-status-grid"></div>
                     </div>
 
@@ -644,7 +693,7 @@
                     <!-- Side-by-side summary table -->
                     <div class="compare-results-card">
                         <h3><i class="fas fa-table" style="color:#3D5A80;"></i> Side-by-side summary</h3>
-                        <p class="compare-results-note">WHO 2018 guidelines: Lden ≤ 53 dB(A) · Lnight ≤ 45 dB(A).</p>
+                        <p class="compare-results-note">WHO 2018 road-traffic references: Lden 53 dB(A) · Lnight 45 dB(A). Short-term mixed-source comparisons are indicative.</p>
                         <div class="compare-table-scroll" id="compareMetricsTable"></div>
                     </div>
 
@@ -680,7 +729,7 @@
             <span style="color:#64748b;"> · </span>
             <span style="color:#94a3b8;">Associate Professor, Johns Hopkins University</span>
         </div>
-        <p style="margin-top:8px;"><strong>WHO 2018 Environmental Noise Guidelines</strong> | Health-Based Assessment Platform</p>
+        <p style="margin-top:8px;"><strong>WHO 2018 Environmental Noise Guidelines</strong> | Environmental Noise Reference Platform</p>
         <p>For professional acoustic assessment, consult a certified acoustic engineer.</p>
 
         <!-- Disclaimer Section -->
@@ -693,7 +742,7 @@
                 </div>
                 <div class="disclaimer-item">
                     <span class="disclaimer-label">Health vs. Legal Limits</span>
-                    <p>This platform evaluates data against WHO 2018 biological health guidelines and local regulatory limits (e.g., Maryland COMAR). Passing local zoning limits does not guarantee absence of adverse health impacts.</p>
+                    <p>This platform evaluates data against WHO environmental noise guidelines and local regulatory limits (e.g., Maryland COMAR). Passing local zoning limits does not guarantee absence of adverse health impacts.</p>
                 </div>
                 <div class="disclaimer-item">
                     <span class="disclaimer-label">Equipment Calibration</span>

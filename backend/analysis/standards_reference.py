@@ -67,7 +67,7 @@ def who_2018_environmental_noise_guideline_levels() -> dict:
                 "recommendation_strength": "strong",
                 "metrics_db": {"Lden": 53, "Lnight": 45},
                 "notes": "Reduce road traffic noise below 53 dB Lden and 45 dB Lnight.",
-                "health_threshold": "Cardiovascular risk increases above 55 dB Lden; sleep effects begin above 40 dB Lnight",
+                "health_threshold": "Source-specific long-term guideline; not an individual risk prediction",
             },
             "railway": {
                 "recommendation_strength": "strong",
@@ -91,75 +91,23 @@ def who_2018_environmental_noise_guideline_levels() -> dict:
             },
             # Indoor spaces (from WHO 1999 Guidelines for Community Noise)
             "bedroom_sleep": {
-                "recommendation_strength": "strong",
+                "recommendation_strength": "WHO 1999 guidance",
                 "metrics_db": {"LAeq": 30, "LAmax": 45},
-                "notes": "Bedroom average: ≤30 dB LAeq protects sleep quality. Single loud events: ≤45 dB LAmax prevents awakening.",
-                "time_period": "Nighttime (11 PM - 7 AM)",
+                "notes": "Bedroom average: ≤30 dB LAeq protects sleep quality. Single-event reference: 45 dB LAFmax; not a guarantee against awakening.",
+                "time_period": "8-hour bedroom night; the application uses 23:00–07:00",
             },
             "living_room": {
-                "recommendation_strength": "strong",
+                "recommendation_strength": "WHO 1999 guidance",
                 "metrics_db": {"LAeq": 35},
                 "notes": "Living room: ≤35 dB LAeq allows comfortable conversation.",
             },
             "classroom": {
-                "recommendation_strength": "strong",
+                "recommendation_strength": "WHO 1999 guidance",
                 "metrics_db": {"LAeq": 35},
                 "notes": "Classroom: ≤35 dB LAeq allows effective learning and concentration.",
             },
-            # General outdoor safe limits
-            "outdoor_daytime": {
-                "recommendation_strength": "guidance",
-                "time_period": "7 AM - 7 PM (12 hours)",
-                "metrics_db": {"recommended": 55},
-                "notes": "General outdoor daytime guideline: below 55 dB recommended.",
-            },
-            "outdoor_evening": {
-                "recommendation_strength": "guidance",
-                "time_period": "7 PM - 11 PM (4 hours)",
-                "metrics_db": {"recommended": 50},
-                "notes": "General outdoor evening guideline: below 50 dB recommended.",
-            },
-            "outdoor_nighttime": {
-                "recommendation_strength": "guidance",
-                "time_period": "11 PM - 7 AM (8 hours)",
-                "metrics_db": {"recommended": 45},
-                "notes": "General outdoor nighttime guideline: below 45 dB recommended.",
-            },
         },
-        "health_thresholds": {
-            "sleep_effects_loael": {
-                "level": 40,
-                "metric": "Lnight (dB)",
-                "effect": "LOAEL - Lowest Observed Adverse Effect Level for sleep disturbance",
-                "description": "Body movements during sleep begin to increase above 40 dB Lnight",
-            },
-            "sleep_self_reported": {
-                "level": 45,
-                "metric": "Lnight (dB)",
-                "effect": "Self-reported sleep quality begins to decline",
-            },
-            "cardiovascular_threshold": {
-                "level": 55,
-                "metric": "Lden (dB)",
-                "effect": "Cardiovascular health risks begin to increase",
-                "risk_increase": "8% per 10 dB increase for heart disease above 55 dB Lden",
-            },
-            "hypertension_risk": {
-                "level": 55,
-                "metric": "Lden (dB)",
-                "effect": "High blood pressure risk: 5-7% per 10 dB increase above 55 dB Lden",
-            },
-            "stroke_risk": {
-                "level": 55,
-                "metric": "Lden (dB)",
-                "effect": "Stroke risk: 14% per 10 dB increase above 55 dB Lden",
-            },
-            "annoyance_onset": {
-                "level": 50,
-                "metric": "Lden (dB)",
-                "effect": "Noticeable annoyance begins; 6% of population highly annoyed by road traffic",
-            },
-        },
+        "health_thresholds": {},
         "definitions": {
             "Lden": (
                 "Day-Evening-Night level: 24-hour average with penalties to reflect greater impact during evening/night. "
@@ -177,7 +125,7 @@ def who_2018_environmental_noise_guideline_levels() -> dict:
             ),
             "LAmax": (
                 "Maximum A-weighted sound level recorded during measurement period. "
-                "Important for sleep disturbance (prevents awakening when ≤45 dB in bedroom)."
+                "The WHO 1999 bedroom event reference requires Fast time weighting."
             ),
             "LA90": (
                 "Background level: The sound level exceeded 90% of the time. "
@@ -194,7 +142,7 @@ def who_2018_environmental_noise_guideline_levels() -> dict:
             ),
             "LOAEL": (
                 "Lowest Observed Adverse Effect Level: The lowest exposure level at which adverse health effects "
-                "are observed in scientific studies. For sleep, this is 40 dB Lnight."
+                "are observed in a specified study; it is not a universal individual threshold."
             ),
             "Decibel_scale": (
                 "Logarithmic scale where +3 dB = energy doubles (just noticeable); +10 dB = sounds twice as loud. "

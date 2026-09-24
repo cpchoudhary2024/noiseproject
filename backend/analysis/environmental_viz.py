@@ -4,6 +4,7 @@ Enhanced Environmental Visualization Module
 Implements Phase 1 quick wins for advanced environmental analysis
 """
 
+from analysis.weather_screen import disclose_weather_screen
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -64,15 +65,15 @@ class EnvironmentalVisualizationEngine:
         Args:
             noise_col: Name of noise column to analyze
             standards: Dict with standard names and dB limits
-                      Default: {'Residential Day': 55, 'Residential Night': 45, 
-                               'Commercial': 65, 'Industrial': 75}
+                      Default: {'55 dB reference': 55, '45 dB reference': 45,
+                               '65 dB reference': 65, '75 dB reference': 75}
         """
         if standards is None:
             standards = {
-                'Residential Day': 55,
-                'Residential Night': 45,
-                'Commercial': 65,
-                'Industrial': 75
+                '55 dB reference': 55,
+                '45 dB reference': 45,
+                '65 dB reference': 65,
+                '75 dB reference': 75
             }
         
         if not self.time_col or noise_col not in self.df.columns:
@@ -83,6 +84,10 @@ class EnvironmentalVisualizationEngine:
         _grp = self.df.groupby(self.df[self.time_col].dt.floor('h'))[noise_col]
         hourly = _grp.agg(count='count', mean=_energy_mean_db, max='max').reset_index()
         hourly.columns = ['time', 'count', 'mean', 'max']
+        if not hourly.empty:
+            # Preserve missing hours: 12 retained bins need not span 12 hours.
+            hourly = hourly.set_index('time').reindex(pd.date_range(
+                hourly['time'].min(), hourly['time'].max(), freq='h')).rename_axis('time').reset_index()
         
         # Calculate exceedances for each standard
         fig = make_subplots(
@@ -94,7 +99,7 @@ class EnvironmentalVisualizationEngine:
                   'rgba(231, 76, 60, 0.8)', 'rgba(192, 57, 43, 0.8)']
         
         for (std_name, limit), color in zip(standards.items(), colors):
-            exceedances = (hourly['mean'] > limit).astype(int)
+            exceedances = (hourly['mean'] > limit).astype(float).where(hourly['mean'].notna())
             exceedance_count = exceedances.rolling(window=12).sum()  # 12-hour rolling
             
             fig.add_trace(
@@ -104,7 +109,7 @@ class EnvironmentalVisualizationEngine:
                     name=f"{std_name} ({limit} dB)",
                     fill='tozeroy',
                     line=dict(color=color.replace('0.7', '1'), width=2),
-                    hovertemplate='<b>%{fullData.name}</b><br>Time: %{x}<br>Exceedances: %{y}h<extra></extra>'
+                    hovertemplate='<b>%{fullData.name}</b><br>Time: %{x}<br>Hourly bins above reference: %{y}<extra></extra>'
                 ),
                 secondary_y=False
             )
@@ -122,17 +127,17 @@ class EnvironmentalVisualizationEngine:
         )
         
         fig.update_xaxes(title_text="Time")
-        fig.update_yaxes(title_text="Hours Exceeding Standard (12-hr window)", secondary_y=False)
+        fig.update_yaxes(title_text="Hourly LAeq bins above reference (rolling 12 bins)", secondary_y=False)
         fig.update_yaxes(title_text="Noise Level (dB)", secondary_y=True)
         
         fig.update_layout(
-            title="Exceedance Frequency Analysis",
+            title="Hourly reference exceedances — descriptive, not compliance",
             height=500,
             hovermode='x unified',
             template='plotly_white'
         )
         
-        return fig
+        return disclose_weather_screen(fig, self.df)
     
     def generate_enhanced_temporal_heatmap(self, noise_col, resolution='hourly'):
         """
@@ -252,7 +257,7 @@ class EnvironmentalVisualizationEngine:
             )
         fig.update_xaxes(tickangle=-45, automargin=True)
         
-        return fig
+        return disclose_weather_screen(fig, self.df)
 
     def generate_diurnal_box_whisker(self, noise_col):
         """Create a diurnal box-and-whisker chart showing hourly LEQ volatility."""
@@ -341,7 +346,7 @@ class EnvironmentalVisualizationEngine:
             paper_bgcolor='white',
             plot_bgcolor='white',
         )
-        return fig
+        return disclose_weather_screen(fig, self.df)
     
     def generate_violin_distribution(self, noise_col):
         """
@@ -421,7 +426,7 @@ class EnvironmentalVisualizationEngine:
             template='plotly_white'
         )
         
-        return fig
+        return disclose_weather_screen(fig, self.df)
     
     def generate_cumulative_distribution(self, noise_col):
         """
@@ -437,10 +442,10 @@ class EnvironmentalVisualizationEngine:
         cumsum = np.arange(1, len(data) + 1) / len(data) * 100
         
         standards = {
-            'Residential Day': 55,
-            'Residential Night': 45,
-            'Commercial': 65,
-            'Industrial': 75
+            '55 dB reference': 55,
+            '45 dB reference': 45,
+            '65 dB reference': 65,
+            '75 dB reference': 75
         }
         
         fig = go.Figure()
@@ -454,12 +459,12 @@ class EnvironmentalVisualizationEngine:
             line=dict(color='blue', width=3),
             fill='tozeroy',
             fillcolor='rgba(102, 126, 234, 0.2)',
-            hovertemplate='Level: %{x:.1f} dB<br>% of time ≤ this: %{y:.1f}%<extra></extra>'
+            hovertemplate='Level: %{x:.1f} dB<br>% of samples ≤ this: %{y:.1f}%<extra></extra>'
         ))
         
         # Add standard lines
-        colors = {'Residential Day': 'green', 'Residential Night': 'orange', 
-                  'Commercial': 'red', 'Industrial': 'darkred'}
+        colors = {'55 dB reference': 'green', '45 dB reference': 'orange',
+                  '65 dB reference': 'red', '75 dB reference': 'darkred'}
         
         for std_name, limit in standards.items():
             compliance_pct = (data <= limit).sum() / len(data) * 100
@@ -468,7 +473,7 @@ class EnvironmentalVisualizationEngine:
                          annotation_position="top")
         
         fig.update_xaxes(title_text="Noise Level (dB)")
-        fig.update_yaxes(title_text="Percentage of Time At or Below Level (%)")
+        fig.update_yaxes(title_text="Percentage of recorded samples at or below level (%)")
         
         fig.update_layout(
             title=f"Cumulative Distribution Function (CDF): {noise_col}",
@@ -477,131 +482,23 @@ class EnvironmentalVisualizationEngine:
             hovermode='x unified'
         )
         
-        return fig
+        return disclose_weather_screen(fig, self.df)
     
     def generate_compliance_dashboard(self, noise_col=None, analysis=None):
-        """
-        Create compliance status dashboard showing current status vs limits
-        
-        Args:
-            noise_col: Name of noise column (optional, for API compatibility)
-            analysis: Analysis results dict with compliance data
-        """
-        if analysis is None:
-            analysis = {}
-        
-        compliance = analysis.get('compliance', {})
-        if not compliance:
-            # Fallback: create simple dashboard with current data
-            if noise_col and noise_col in self.df.columns:
-                current_level = _energy_mean_db(self.df[noise_col])
-            else:
-                current_level = 67.0
-            current_level = float(current_level) if not pd.isna(current_level) else 67.0
-        else:
-            # Prefer the requested column (if provided) for correctness.
-            primary_col = None
-            if noise_col and noise_col in compliance:
-                primary_col = noise_col
-            elif compliance:
-                primary_col = list(compliance.keys())[0]
+        """Use the same metric-matched reference rows as the main dashboard."""
+        from analysis.compliance_matrix import matrix_from_analysis
+        from analysis.noise_analyzer import NoiseAnalyzer
+        rows = matrix_from_analysis(NoiseAnalyzer(self.df).comprehensive_analysis())
+        labels = [r['standard'] + ' — ' + r['metric'] for r in rows]
+        fig = go.Figure()
+        fig.add_bar(x=labels, y=[r['measured_db'] for r in rows], name='Measured index')
+        fig.add_bar(x=labels, y=[r['limit_db'] for r in rows], name='Reference')
+        fig.update_layout(title='Indicative monitoring-period reference comparisons',
+                          yaxis_title='dB(A)', barmode='group', height=600)
+        if not rows:
+            fig.add_annotation(text='No applicable metrics available', showarrow=False)
+        return disclose_weather_screen(fig, self.df)
 
-            if primary_col:
-                current_level = compliance.get(primary_col, {}).get('current_leq')
-                if current_level is None:
-                    # Fallback to raw column LAeq (energy average) if the key is missing.
-                    if primary_col in self.df.columns:
-                        current_level = float(_energy_mean_db(self.df[primary_col]))
-                    else:
-                        current_level = 67.0
-            else:
-                current_level = 67.0
-        
-        current_level = float(current_level)
-        
-        # Standard limits
-        standards = {
-            'Residential Day': 55,
-            'Residential Night': 45,
-            'Commercial': 65,
-            'Industrial': 75
-        }
-        
-        # Create individual gauges and combine into HTML
-        gauges = []
-        for std_name, limit in standards.items():
-            color = 'green' if current_level <= limit else 'red'
-            delta_val = current_level - limit
-            
-            fig = go.Figure(data=[
-                go.Indicator(
-                    mode="gauge+number+delta",
-                    value=current_level,
-                    title={'text': std_name},
-                    delta={'reference': limit, 'suffix': " dB", 'font': {'size': 14}},
-                    gauge={
-                        'axis': {'range': [40, 80], 'tickwidth': 1, 'tickcolor': '#999'},
-                        'bar': {'color': color, 'thickness': 0.2},
-                        'steps': [
-                            {'range': [40, limit], 'color': 'rgba(46, 204, 113, 0.3)'},
-                            {'range': [limit, 80], 'color': 'rgba(192, 57, 43, 0.3)'}
-                        ],
-                        'threshold': {
-                            'line': {'color': 'darkred', 'width': 2},
-                            'thickness': 0.75,
-                            'value': limit
-                        }
-                    },
-                    number={'suffix': " dB", 'font': {'size': 20, 'color': color}}
-                )
-            ])
-            
-            fig.update_layout(
-                height=300,
-                margin=dict(l=50, r=50, t=50, b=50),
-                font={'size': 12}
-            )
-            
-            gauges.append(fig)
-        
-        # Create combined figure using subplots with graph_objects
-        from plotly.subplots import make_subplots
-        
-        # Create 2x2 layout
-        fig = make_subplots(
-            rows=2, cols=2,
-            subplot_titles=list(standards.keys()),
-            specs=[[{"type": "indicator"}, {"type": "indicator"}],
-                   [{"type": "indicator"}, {"type": "indicator"}]],
-            vertical_spacing=0.25,
-            horizontal_spacing=0.15
-        )
-        
-        # Add indicators manually (workaround for gauge+subplots)
-        positions = [(1, 1), (1, 2), (2, 1), (2, 2)]
-        for (std_name, limit), (row, col) in zip(standards.items(), positions):
-            color = 'green' if current_level <= limit else 'red'
-            
-            fig.add_trace(
-                go.Indicator(
-                    mode="number+delta",
-                    value=current_level,
-                    title={'text': f"{std_name}<br>({limit} dB limit)"},
-                    delta={'reference': limit, 'suffix': " dB"},
-                    number={'suffix': " dB", 'font': {'size': 24, 'color': color}},
-                    domain={'x': [0, 1], 'y': [0, 1]}
-                ),
-                row=row, col=col
-            )
-        
-        fig.update_layout(
-            title_text="Compliance Status Dashboard",
-            height=600,
-            showlegend=False
-        )
-        
-        return fig
-    
     def generate_anomaly_detection(self, noise_col, threshold_std=2.5):
         """
         Create time series with detected anomalies highlighted
@@ -688,7 +585,7 @@ class EnvironmentalVisualizationEngine:
             hovermode='x unified'
         )
         
-        return fig
+        return disclose_weather_screen(fig, self.df)
 
 
 # Usage example (for reference)

@@ -1,5 +1,7 @@
 from flask import Flask, render_template, request, jsonify, send_file
-from flask_cors import CORS
+from flask import session
+from web_safety import StrictJSONProvider, reference, resolve, upload_path, owner
+import secrets
 import os
 import pandas as pd
 import numpy as np
@@ -19,12 +21,18 @@ from analysis.environmental_metrics import EnvironmentalMetricsCalculator
 from analysis.wlg_parser import parse_wlg_file, WLGParser
 from analysis.gap_detector import (detect_gaps, gap_report_to_dict, merge_dataframes,
                                    data_completeness_pct, _modal_interval_seconds)
-from analysis.compliance_matrix import evaluate_compliance
+from analysis.compliance_matrix import evaluate_compliance, matrix_from_analysis
 from analysis.acoustics import energetic_mean_db, compute_ldn_lden, energy_concentration
 from analysis.timestamp_utils import (assess_timestamp_integrity, primary_time_column,
                                       parse_timestamps_robust, resolve_time_column)
+from analysis.weather_screen import CLOCK_MODES, ScreenConfig
+from services.weather_sources import (LocationError, WeatherDataUnavailable,
+                                      nearest_stations, resolve_location)
+from services.weather_screening import (WeatherScreenError, apply_record, audit_csv_path,
+                                        build_screen, load_record, record_tz)
 import io
 import logging
+from zoneinfo import available_timezones
 import threading
 from collections import OrderedDict
 import math
@@ -45,7 +53,7 @@ def _set_progress(job_id: str, pct: int, msg: str):
     if not job_id:
         return
     with _progress_lock:
-        _progress_store[job_id] = {'pct': int(pct), 'msg': msg}
+        _progress_store[owner() + ':' + job_id] = {'pct': int(pct), 'msg': msg}
         if len(_progress_store) > 200:
             oldest = list(_progress_store.keys())[:-100]
             for k in oldest:
@@ -80,7 +88,36 @@ root_dir = os.path.dirname(backend_dir)
 app = Flask(__name__,
             template_folder=os.path.join(root_dir, 'frontend', 'templates'),
             static_folder=os.path.join(root_dir, 'frontend', 'static'))
-CORS(app)
+app.json = StrictJSONProvider(app)
+app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
+                  SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE', '0') == '1',
+                  UPLOAD_TTL_SECONDS=24 * 3600)
+
+@app.before_request
+def validate_browser_references():
+    # Establish ownership before any upload or parallel browser API calls.
+    owner()
+    if request.path.startswith('/api/') and request.method == 'POST':
+        payload = request.get_json(silent=True) or request.form
+        for key in ('filepath', 'existing_filepath'):
+            if payload.get(key):
+                try:
+                    upload_path(payload[key])
+                except ValueError as exc:
+                    return jsonify({'error': str(exc)}), 404
+
+@app.after_request
+def protect_api_response(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'same-origin'
+    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    if request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store'
+    if response.status_code >= 500 and response.is_json:
+        logger.error('API failure: %s', response.get_json())
+        response.set_data(app.json.dumps({'error': 'The request could not be completed. Check the input and try again.'}))
+    return response
 
 # Configuration
 # Use normalized absolute paths to avoid issues like backend/../uploads in responses.
@@ -92,6 +129,8 @@ RAW_UPLOAD_FOLDER = os.path.join(UPLOAD_FOLDER, 'raw')
 ARTIFACTS_DIR = os.environ.get('ARTIFACTS_DIR') or _default_artifacts
 ARTIFACTS_REPORTS_DIR = os.path.join(ARTIFACTS_DIR, 'reports')
 ARTIFACTS_CHARTS_DIR = os.path.join(ARTIFACTS_DIR, 'charts')
+WEATHER_CACHE_DIR = os.path.join(ARTIFACTS_DIR, 'weather_cache')
+WEATHER_SCREENS_DIR = os.path.join(ARTIFACTS_DIR, 'weather_screens')
 ALLOWED_EXTENSIONS = {'csv', 'xlsx', 'xls', 'wlg', 'parquet', 'pq'}
 MAX_UPLOAD_MB = int(os.environ.get('UPLOAD_MAX_MB', '200'))
 MAX_FILE_SIZE = MAX_UPLOAD_MB * 1024 * 1024
@@ -252,7 +291,7 @@ def _filters_requested(filters: dict | None) -> bool:
     if not filters:
         return False
     return bool(filters.get('bound_start') or filters.get('bound_end')
-                or filters.get('exclusions'))
+                or filters.get('exclusions') or filters.get('weather_screen_id'))
 
 
 def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFrame:
@@ -328,7 +367,18 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
             ) from exc
         keep &= ~((ts >= es) & (ts <= ee))
 
+    weather_info = None
+    if filters.get('weather_screen_id'):
+        weather_info, w_keep = _weather_screen_mask(ts, keep, filters['weather_screen_id'])
+        keep &= w_keep
+
     clean_df = df[keep].copy()
+    if clean_df.empty and weather_info:
+        raise TemporalFilterError(
+            "No readings remain after weather screening combined with the selected dates. "
+            "Every remaining period was affected by weather or could not be verified. "
+            "Remove the weather screen or widen the date range."
+        )
     if clean_df.empty:
         span = ''
         if valid_ts.any():
@@ -342,7 +392,43 @@ def _apply_temporal_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFr
         "[FILTER] %s rows in, %s retained, %s dropped (%s had unreadable timestamps)",
         len(df), len(clean_df), len(df) - len(clean_df), unreadable
     )
+    if weather_info:
+        clean_df.attrs = {**clean_df.attrs, 'weather_screen': weather_info}
     return clean_df
+
+
+def _weather_screen_mask(ts: pd.Series, keep: pd.Series, screen_id: str) -> tuple[dict, pd.Series]:
+    """Keep-mask of a saved weather screen, plus the disclosure for results and reports.
+
+    ``ts`` must be the full file's parsed timestamps: the screen is bound to
+    that record and refuses any other.
+    """
+    try:
+        rec = load_record(WEATHER_SCREENS_DIR, resolve(screen_id, 'weather'))
+        w_keep, w_reason = apply_record(ts, rec)
+    except (WeatherScreenError, ValueError) as exc:
+        raise TemporalFilterError(str(exc)) from exc
+    w_keep = pd.Series(w_keep, index=keep.index)
+    removed = keep & ~w_keep
+    by_reason = w_reason[removed.to_numpy()].value_counts().to_dict()
+    info = {
+        'screen_id': rec['screen_id'],
+        'created_utc': rec['created_utc'],
+        'station': rec['station'],
+        'location_basis': rec['location_basis'],
+        'snow_source': rec.get('snow_source', {'mode': 'depth'}),
+        'identifier_quality': rec.get('identifier_quality', {}),
+        'tz': record_tz(rec),
+        'clock': rec['clock'],
+        'config': rec['config'],
+        'wind_height_factor': rec['wind_height_factor'],
+        'sources': rec['sources'],
+        'summary': rec['summary'],
+        'rows_considered': int(keep.sum()),
+        'rows_removed': int(removed.sum()),
+        'rows_removed_by_reason': {str(k): int(v) for k, v in by_reason.items()},
+    }
+    return info, w_keep
 
 
 
@@ -364,47 +450,12 @@ def _filtered_or_400(df, filters, tag: str):
     return out, None
 
 
+def _upload_reference(filepath):
+    return reference(os.path.basename(filepath))
+
+
 def _resolve_uploaded_filepath(filepath: str) -> str:
-    """Resolve a client-provided filepath, constrained to server-managed folders.
-
-    Security: the client only ever supplies paths the server itself handed out
-    (under uploads/ or artifacts/). A bare basename is looked up inside the
-    upload folders; a full path is honoured ONLY if it normalises to a location
-    inside an allowed root. Anything else (``/etc/passwd``, ``../../secret``) is
-    rejected by falling back to a basename lookup in uploads/raw, which will not
-    exist and yields a clean 404 — preventing arbitrary file read / path traversal.
-    """
-    filepath = str(filepath or '')
-
-    # Roots the client is permitted to reference.
-    allowed_roots = [
-        os.path.abspath(app.config['RAW_UPLOAD_FOLDER']),
-        os.path.abspath(app.config['UPLOAD_FOLDER']),
-        os.path.abspath(ARTIFACTS_REPORTS_DIR),
-        os.path.abspath(ARTIFACTS_CHARTS_DIR),
-    ]
-
-    def _within_allowed(p: str) -> bool:
-        # realpath, not abspath: abspath normalises '..' but does not follow
-        # symlinks, so a symlink planted inside uploads/ could still point at an
-        # arbitrary file outside the allowed roots.
-        ap = os.path.realpath(p)
-        return any(ap == os.path.realpath(root) or ap.startswith(os.path.realpath(root) + os.sep)
-                   for root in allowed_roots)
-
-    # Bare basename → look up inside the upload folders only.
-    if os.path.basename(filepath) == filepath:
-        raw_candidate = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], filepath))
-        if os.path.exists(raw_candidate):
-            return raw_candidate
-        return os.path.abspath(os.path.join(app.config['UPLOAD_FOLDER'], filepath))
-
-    # Full/relative path → honour only if it resolves inside an allowed root.
-    if _within_allowed(filepath):
-        return os.path.abspath(filepath)
-
-    # Reject traversal: treat as a basename inside uploads/raw (non-existent → 404).
-    return os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], os.path.basename(filepath)))
+    return upload_path(filepath)
 
 
 def _run_retention_cleanup(*, keep_paths=()):
@@ -422,7 +473,7 @@ def _run_retention_cleanup(*, keep_paths=()):
         )
         retention.enforce_retention(
             uploads_dir=UPLOAD_FOLDER,
-            root_dir=root_dir,
+            root_dir=None,
             raw_uploads_dir=RAW_UPLOAD_FOLDER,
             artifacts_reports_dir=ARTIFACTS_REPORTS_DIR,
             artifacts_charts_dir=ARTIFACTS_CHARTS_DIR,
@@ -1010,7 +1061,7 @@ def read_csv_file(filepath: str) -> pd.DataFrame:
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template('index.html', upload_max_mb=MAX_UPLOAD_MB)
 
 
 # ── Fast-upload helpers ───────────────────────────────────────────────────────
@@ -1093,7 +1144,7 @@ def upload_file():
             return jsonify({'error': 'Only CSV, Excel, and WLG (Larson Davis) files are allowed'}), 400
         
         # Save file
-        filename = secure_filename(datetime.now().strftime("%Y%m%d_%H%M%S_") + file.filename)
+        filename = uuid.uuid4().hex + '_' + secure_filename(file.filename)
         filepath = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], filename))
         file.save(filepath)
         
@@ -1128,7 +1179,7 @@ def upload_file():
         return jsonify({
             'success': True,
             'filename': filename,
-            'filepath': filepath,
+            'filepath': _upload_reference(filepath),
             'rows': len(df),
             'columns': df.columns.tolist(),
             'preview': df.head(10).to_dict(orient='records'),
@@ -1157,7 +1208,7 @@ def analyze_data():
         if not os.path.exists(filepath):
             return jsonify({
                 'error': 'File not found',
-                'filepath': filepath,
+                'filepath': _upload_reference(filepath),
                 'hint': 'Re-upload the file and try again. If the server was restarted, the previous filepath may no longer exist.'
             }), 404
 
@@ -1185,6 +1236,7 @@ def analyze_data():
                 'rows_after': len(df),
                 'range_start': _fts.min().isoformat() if not _fts.empty else None,
                 'range_end': _fts.max().isoformat() if not _fts.empty else None,
+                'weather_screen': df.attrs.get('weather_screen'),
             }
 
         # Check if analysis is already cached (only when no filters applied)
@@ -1276,40 +1328,7 @@ def analyze_data():
         _set_progress(job_id, 75, 'Evaluating compliance…')
         compliance_matrix: list[dict] = []
         try:
-            env = analysis_results.get('environmental_metrics', {})
-            first_col = next(iter(env), None) if env else None
-            env_first = env.get(first_col, {}) if first_col else {}
-            stats     = analysis_results.get('statistics', {})
-            stat_first = stats.get(first_col or next(iter(stats), ''), {}) or {}
-
-            # COMAR rows are defined on 07:00-22:00 and 22:00-07:00. Use the Ldn
-            # windows explicitly rather than the generic aliases, so the metric
-            # always matches the averaging period the legal limit specifies.
-            laeq_day   = env_first.get('LAeq_day_ldn', env_first.get('LAeq_day'))
-            laeq_night = env_first.get('LAeq_night_ldn', env_first.get('LAeq_night'))
-
-            # LAmax must come from the L-Max stream. Taking max() of the LEQ
-            # column understates the true peak, since LEQ is already averaged
-            # over each logging interval.
-            lamax_val = None
-            _lmax_col = next(
-                (c for c in stats
-                 if 'lmax' in ''.join(ch for ch in str(c).lower() if ch.isalnum())),
-                None
-            )
-            if _lmax_col:
-                lamax_val = float(stats.get(_lmax_col, {}).get('max') or 0) or None
-
-            compliance_matrix = evaluate_compliance(
-                lden        = env_first.get('Lden'),
-                lnight      = env_first.get('Lnight'),
-                ldn         = env_first.get('Ldn'),
-                laeq        = float(stat_first.get('laeq_db') or stat_first.get('mean') or 0) or None,
-                laeq_day    = laeq_day,
-                laeq_night  = laeq_night,
-                lamax       = lamax_val,
-                environment = environment,
-            )
+            compliance_matrix = matrix_from_analysis(analysis_results, environment)
         except Exception as cm_err:
             logger.warning(f"[ANALYZE] Compliance matrix skipped: {cm_err}")
 
@@ -1463,6 +1482,7 @@ def analyze_data():
             logger.warning(f"[ANALYZE] Plain-English summary failed: {_pe_err}")
 
         _set_progress(job_id, 100, 'Complete')
+        analysis_results['health_assessment'] = StandardsAnalyzer(df).get_health_based_assessment(environment)
         return jsonify({
             'success': True,
             'analysis': analysis_results,
@@ -1474,7 +1494,7 @@ def analyze_data():
             'filter_summary': filter_summary,
             'ingest_warnings': ingest_warnings,
             'key_findings': key_findings,
-            'filepath': filepath
+            'filepath': _upload_reference(filepath)
         })
 
     except Exception as e:
@@ -1536,7 +1556,7 @@ def upload_multi():
             if not allowed_file(f.filename):
                 return jsonify({'error': f'Unsupported file type: {f.filename}. Only CSV, Excel, WLG are allowed.'}), 400
 
-            fname = secure_filename(datetime.now().strftime("%Y%m%d_%H%M%S_") + f.filename)
+            fname = uuid.uuid4().hex + '_' + secure_filename(f.filename)
             fpath = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], fname))
             f.save(fpath)
 
@@ -1559,7 +1579,7 @@ def upload_multi():
             return jsonify({'error': 'Merged dataset is empty.'}), 400
 
         # Save merged file
-        merged_name = f"MERGED_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        merged_name = f"MERGED_{uuid.uuid4().hex}.csv"
         merged_path = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], merged_name))
         merged_df.to_csv(merged_path, index=False)
 
@@ -1586,7 +1606,7 @@ def upload_multi():
 
         return jsonify({
             'success': True,
-            'filepath': merged_path,
+            'filepath': _upload_reference(merged_path),
             'merged_filename': merged_name,
             'source_files': filenames,
             'file_count': len(dfs),
@@ -1621,25 +1641,13 @@ def compliance_check():
             return jsonify({'error': 'File not found'}), 404
 
         df = _get_cached_df(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'API')
+        if err:
+            return err
         analyzer = NoiseAnalyzer(df)
         analysis = analyzer.comprehensive_analysis()
 
-        env    = analysis.get('environmental_metrics', {})
-        stats  = analysis.get('statistics', {})
-        first  = next(iter(env), None) if env else None
-        env_f  = env.get(first, {}) if first else {}
-        stat_f = stats.get(first or next(iter(stats), ''), {}) or {}
-
-        matrix = evaluate_compliance(
-            lden       = env_f.get('Lden'),
-            lnight     = env_f.get('Lnight'),
-            ldn        = env_f.get('Ldn'),
-            laeq       = float(stat_f.get('laeq_db') or stat_f.get('mean') or 0) or None,
-            laeq_day   = env_f.get('LAeq_day'),
-            laeq_night = env_f.get('LAeq_night') or env_f.get('Lnight'),
-            lamax      = float(stat_f.get('max') or 0) or None,
-            environment = environment,
-        )
+        matrix = matrix_from_analysis(analysis, environment)
 
         return jsonify({'success': True, 'compliance_matrix': matrix})
 
@@ -1660,19 +1668,22 @@ def get_health_assessment():
         filepath = _resolve_uploaded_filepath(filepath)
         
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
         
         # Read data (cached)
         df = _get_cached_df(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'API')
+        if err:
+            return err
         
         # Get health-based assessment
         standards_analyzer = StandardsAnalyzer(df)
-        health_assessment = standards_analyzer.get_health_based_assessment()
+        health_assessment = standards_analyzer.get_health_based_assessment((data or {}).get('environment', 'outdoor'))
         
         return jsonify({
             'success': True,
             'health_assessment': health_assessment,
-            'filepath': filepath
+            'filepath': _upload_reference(filepath)
         })
     
     except Exception as e:
@@ -1692,10 +1703,13 @@ def get_occupational_assessment():
         filepath = _resolve_uploaded_filepath(filepath)
         
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
         
         # Read data (cached)
         df = _get_cached_df(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'API')
+        if err:
+            return err
         
         # Get occupational assessment
         standards_analyzer = StandardsAnalyzer(df)
@@ -1704,7 +1718,7 @@ def get_occupational_assessment():
         return jsonify({
             'success': True,
             'occupational_assessment': occupational_assessment,
-            'filepath': filepath
+            'filepath': _upload_reference(filepath)
         })
     
     except Exception as e:
@@ -1741,6 +1755,8 @@ def generate_report():
         report_type   = (data or {}).get('report_type') or (data or {}).get('type') or 'comprehensive'
         report_format = ((data or {}).get('format') or 'pdf').lower()
         job_id        = str((data or {}).get('job_id', '') or '')
+        if report_format not in {'pdf', 'docx', 'html', 'htm'} or report_type not in {'comprehensive', 'resident', 'summary', 'detailed'}:
+            return jsonify({'error': 'Unsupported report type or format.'}), 400
 
         _set_progress(job_id, 5, 'Resolving file…')
 
@@ -1752,7 +1768,7 @@ def generate_report():
         if not os.path.exists(filepath):
             return jsonify({
                 'error': 'File not found',
-                'filepath': filepath,
+                'filepath': _upload_reference(filepath),
                 'hint': 'Re-upload the file and try again. If the server was restarted, the previous filepath may no longer exist.'
             }), 404
 
@@ -1763,12 +1779,12 @@ def generate_report():
         df, err = _filtered_or_400(df, filters, 'REPORT')
         if err:
             return err
-
+        weather_screen = df.attrs.get('weather_screen')
         entry = _get_cache_entry(filepath) or {}
         analysis_cached = entry.get('analysis')
         standards_cached = entry.get('standards')
-        daily_cached = entry.get('daily_summary')
-        hourly_cached = entry.get('hourly_summary')
+        daily_cached = None if filters else entry.get('daily_summary')
+        hourly_cached = None if filters else entry.get('hourly_summary')
 
         if filters or analysis_cached is None or standards_cached is None:
             _set_progress(job_id, 30, 'Computing statistics…')
@@ -1820,6 +1836,7 @@ def generate_report():
                 custom_section_heading=custom_section_heading,
                 custom_section_body=custom_section_body,
                 environment=environment,
+                weather_screen=weather_screen,
             )
 
         _set_progress(job_id, 60, 'Generating document…')
@@ -1846,10 +1863,7 @@ def generate_report():
             mimetype = DOCX_MIME
         elif report_format in {'html', 'htm'}:
             generator = _make_generator()
-            report_path = generator.generate_html_report(report_type, output_dir=app.config['ARTIFACTS_REPORTS_DIR']) if hasattr(generator, 'generate_html_report') else None
-            if report_path is None:
-                generator_old = ReportGenerator(df, filepath, analysis=analysis_cached, standards=standards_cached)
-                report_path = generator_old.generate_html_report(report_type, output_dir=app.config['ARTIFACTS_REPORTS_DIR'])
+            report_path = generator.generate_html_report(report_type, output_dir=app.config['ARTIFACTS_REPORTS_DIR'])
             mimetype = 'text/html'
         else:  # Default to PDF
             generator = _make_generator()
@@ -1883,7 +1897,7 @@ def get_computed_summaries():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
         
         filters = (data or {}).get('filters')
         cache_entry = _get_cache_entry(filepath) or {}
@@ -1953,10 +1967,13 @@ def export_data():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
         
         # Read data
         df = read_input_file(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT')
+        if err:
+            return err
         
         # Run analysis
         analyzer = NoiseAnalyzer(df)
@@ -1965,7 +1982,10 @@ def export_data():
         # Create Excel with multiple sheets
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Raw Data', index=False)
+            df.to_excel(writer, sheet_name='Selected Data', index=False)
+            if df.attrs.get('weather_screen'):
+                pd.DataFrame([{'weather_screen': json.dumps(df.attrs['weather_screen'])}]).to_excel(
+                    writer, sheet_name='Weather Screening', index=False)
             
             # Statistics sheet
             stats_df = pd.DataFrame(analysis_results['statistics'])
@@ -1995,10 +2015,13 @@ def export_daily_summary():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
         
         # Read data
         df = read_input_file(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT')
+        if err:
+            return err
         
         # Generate daily summary (Excel)
         summarizer = DataSummarizer(df)
@@ -2029,10 +2052,13 @@ def export_hourly_summary():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
         
         # Read data
         df = read_input_file(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT')
+        if err:
+            return err
         
         # Generate hourly summary (Excel)
         summarizer = DataSummarizer(df)
@@ -2160,9 +2186,12 @@ def export_daily_summary_csv():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
 
         df = read_input_file(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT')
+        if err:
+            return err
         prepared, time_col = _get_datetime_series(df)
         if prepared is None:
             return jsonify({'error': 'Daily summary requires time-series data (a usable date/time column)'}), 400
@@ -2216,9 +2245,12 @@ def export_hourly_summary_csv():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
 
         df = read_input_file(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT')
+        if err:
+            return err
         prepared, time_col = _get_datetime_series(df)
         if prepared is None:
             return jsonify({'error': 'Hourly summary requires time-series data (a usable date/time column)'}), 400
@@ -2272,10 +2304,13 @@ def export_weekly_summary():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
         
         # Read data
         df = read_input_file(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT')
+        if err:
+            return err
         
         # Generate weekly summary
         summarizer = DataSummarizer(df)
@@ -2302,10 +2337,13 @@ def generate_advanced_charts():
         filepath = _resolve_uploaded_filepath(filepath)
 
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
         
         # Read data
         df = read_input_file(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'EXPORT')
+        if err:
+            return err
         
         # Generate advanced charts
         chart_gen = AdvancedChartGenerator(df)
@@ -2349,6 +2387,9 @@ def get_environmental_metrics():
         
         # Read data
         df = _get_cached_df(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'API')
+        if err:
+            return err
         
         noise_col = _resolve_noise_column(df, noise_col)
         if not noise_col:
@@ -2385,6 +2426,9 @@ def get_exceedance_analysis():
             return jsonify({'error': 'File not found'}), 404
         
         df = _get_cached_df(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'API')
+        if err:
+            return err
         
         noise_col = _resolve_noise_column(df, noise_col)
         if not noise_col:
@@ -2510,6 +2554,9 @@ def get_distribution_analysis():
             return jsonify({'error': 'File not found'}), 404
         
         df = _get_cached_df(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'API')
+        if err:
+            return err
         
         # Generate violin plot
         noise_col = _resolve_noise_column(df, noise_col)
@@ -2548,10 +2595,13 @@ def get_compliance_dashboard():
             return jsonify({'error': 'File not found'}), 404
         
         df = _get_cached_df(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'API')
+        if err:
+            return err
         
         # Run analysis
         cache_entry = _get_cache_entry(filepath)
-        if cache_entry and cache_entry.get('analysis'):
+        if not (data or {}).get('filters') and cache_entry and cache_entry.get('analysis'):
             analysis = cache_entry['analysis']
         else:
             analyzer = NoiseAnalyzer(df)
@@ -2595,6 +2645,9 @@ def get_anomaly_detection():
             return jsonify({'error': 'File not found'}), 404
         
         df = _get_cached_df(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'API')
+        if err:
+            return err
         
         # Generate anomaly detection
         noise_col = _resolve_noise_column(df, noise_col)
@@ -2633,6 +2686,9 @@ def get_cumulative_distribution():
             return jsonify({'error': 'File not found'}), 404
         
         df = _get_cached_df(filepath)
+        df, err = _filtered_or_400(df, (data or {}).get('filters'), 'API')
+        if err:
+            return err
         
         # Generate CDF
         noise_col = _resolve_noise_column(df, noise_col)
@@ -2665,7 +2721,7 @@ def get_data_date_range():
 
         filepath = _resolve_uploaded_filepath(filepath)
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
 
         df = _get_cached_df(filepath)
         _tc = resolve_time_column(df)
@@ -2701,7 +2757,7 @@ def validate_filters():
 
         filepath = _resolve_uploaded_filepath(filepath)
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found', 'filepath': filepath}), 404
+            return jsonify({'error': 'File not found', 'filepath': _upload_reference(filepath)}), 404
 
         df = _get_cached_df(filepath)
         total_rows = len(df)
@@ -2971,7 +3027,7 @@ def compare_files():
                 continue
             if not allowed_file(file.filename):
                 return jsonify({'error': f'Unsupported file type: {file.filename}. Use CSV, XLSX, or WLG.'}), 400
-            filename = secure_filename(datetime.now().strftime("%Y%m%d_%H%M%S_") + file.filename)
+            filename = uuid.uuid4().hex + '_' + secure_filename(file.filename)
             filepath = os.path.abspath(os.path.join(app.config['RAW_UPLOAD_FOLDER'], filename))
             file.save(filepath)
             saved_paths.append(filepath)
@@ -2992,7 +3048,8 @@ def compare_files():
 
         _run_retention_cleanup(keep_paths=tuple(saved_paths))
         return jsonify({'success': True, 'datasets': datasets,
-                        'comparison_summary': _comparison_summary(datasets)})
+                        'comparison_summary': _comparison_summary(datasets),
+                        'comparison_token': reference(datasets, 'comparison')})
 
     except Exception as e:
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
@@ -3010,11 +3067,14 @@ def compare_report():
         import plotly.graph_objects as go
 
         data = request.json or {}
-        datasets = data.get('datasets', [])
+        try:
+            datasets = resolve(data.get('comparison_token'), 'comparison')
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
         if len(datasets) < 2:
             return jsonify({'error': 'At least 2 datasets required.'}), 400
 
-        report_filename = f"noise_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        report_filename = f"noise_comparison_{uuid.uuid4().hex}.pdf"
         report_path = os.path.join(ARTIFACTS_REPORTS_DIR, report_filename)
         os.makedirs(ARTIFACTS_REPORTS_DIR, exist_ok=True)
 
@@ -3195,10 +3255,126 @@ def compare_report():
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
+# ── Weather screening ─────────────────────────────────────────────────────────
+
+@app.route('/api/weather/stations', methods=['POST'])
+def weather_stations():
+    """Nearest ASOS stations to a ZIP code or coordinates.
+
+    The location is used for ranking only; it is not stored or echoed back.
+    """
+    try:
+        data = request.json or {}
+        lat, lon, basis = resolve_location(data.get('location'), WEATHER_CACHE_DIR)
+        stations = nearest_stations(lat, lon, WEATHER_CACHE_DIR, n=3)
+        return jsonify({'success': True, 'location_basis': basis, 'stations': [
+            {k: s[k] for k in ('station_id', 'name', 'distance_km', 'tz', 'ghcnd_id', 'has_1min')}
+            for s in stations]})
+    except LocationError as exc:
+        return jsonify({'success': False, 'error': str(exc), 'error_kind': 'location'}), 400
+    except WeatherDataUnavailable as exc:
+        return jsonify({'success': False, 'error': str(exc), 'error_kind': 'weather_unavailable'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/weather/screen', methods=['POST'])
+def weather_screen():
+    """Fetch station weather for the uploaded record and build a screen.
+
+    The station is re-derived from the location on the server; the browser
+    names one of the returned stations but cannot supply station metadata.
+    Any failure to obtain or verify weather returns an error and no screen.
+    """
+    try:
+        data = request.json or {}
+        job_id = str(data.get('job_id', '') or '')
+        filepath = data.get('filepath')
+        if not filepath:
+            return jsonify({'error': 'No filepath provided'}), 400
+        filepath = _resolve_uploaded_filepath(filepath)
+        if not os.path.exists(filepath):
+            return jsonify({'error': 'File not found'}), 404
+
+        clock = str(data.get('clock') or 'local_dst')
+        if clock not in CLOCK_MODES:
+            return jsonify({'success': False, 'error': 'Unknown logger clock setting.'}), 400
+        try:
+            cfg = ScreenConfig(mic_height_m=float(data.get('mic_height_m', 1.5))).validate()
+        except (TypeError, ValueError) as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+
+        _set_progress(job_id, 5, 'Finding weather station…')
+        lat, lon, basis = resolve_location(data.get('location'), WEATHER_CACHE_DIR)
+        stations = nearest_stations(lat, lon, WEATHER_CACHE_DIR, n=3)
+        station = next((s for s in stations if s['station_id'] == data.get('station_id')), None)
+        if station is None:
+            return jsonify({'success': False, 'error': 'Choose one of the listed weather stations.'}), 400
+
+        # The logger clock belongs to the monitoring site, which can sit in a
+        # different zone from the station it is screened against.
+        site_tz = str(data.get('tz') or station['tz'])
+        if site_tz not in available_timezones():
+            return jsonify({'success': False, 'error': f"'{site_tz}' is not a known time zone."}), 400
+
+        df = _get_cached_df(filepath)
+        tcol = resolve_time_column(df)
+        if not tcol:
+            return jsonify({'success': False, 'error': 'This file has no time column, so it cannot be matched to weather.'}), 400
+        ts, _ = parse_timestamps_robust(df[tcol])
+        integrity = assess_timestamp_integrity(df[tcol]).to_dict()
+        if not integrity.get('time_metrics_valid', True):
+            return jsonify({'success': False, 'error': 'The timestamps in this file are not reliable, '
+                            'so readings cannot be matched to weather.'}), 400
+
+        rec = build_screen(ts, station, cfg, clock, cache_dir=WEATHER_CACHE_DIR,
+                           store_dir=WEATHER_SCREENS_DIR, location_basis=basis, tz=site_tz,
+                           site=(lat, lon),
+                           progress=lambda pct, msg: _set_progress(job_id, pct, msg))
+        return jsonify({
+            'success': True,
+            'usable': rec['usable'],
+            'screen_id': reference(rec['screen_id'], 'weather') if rec['usable'] else None,
+            'station': rec['station'],
+            'snow_source': rec['snow_source'],
+            'identifier_quality': rec['identifier_quality'],
+            'tz': record_tz(rec),
+            'clock': rec['clock'],
+            'config': rec['config'],
+            'wind_height_factor': rec['wind_height_factor'],
+            'summary': rec['summary'],
+            'sources': rec['sources'],
+            'message': None if rec['usable'] else (
+                'Every reading in this file falls in a period affected by weather or without '
+                'verifiable weather data. No screened analysis is possible.'),
+        })
+    except LocationError as exc:
+        return jsonify({'success': False, 'error': str(exc), 'error_kind': 'location'}), 400
+    except WeatherDataUnavailable as exc:
+        return jsonify({'success': False, 'error': str(exc), 'error_kind': 'weather_unavailable'}), 503
+    except (WeatherScreenError, ValueError) as exc:
+        return jsonify({'success': False, 'error': str(exc), 'error_kind': 'weather_screen'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/weather/screen/<screen_id>/audit.csv', methods=['GET'])
+def weather_screen_audit(screen_id):
+    """Block-by-block audit trail of a screen."""
+    try:
+        path = audit_csv_path(WEATHER_SCREENS_DIR, resolve(screen_id, 'weather'))
+    except (WeatherScreenError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    if not os.path.exists(path):
+        return jsonify({'error': 'Audit file not found. Run weather screening again.'}), 404
+    return send_file(path, as_attachment=True, mimetype='text/csv',
+                     download_name=f'weather_screen_{screen_id}_blocks.csv')
+
+
 @app.route('/api/progress/<job_id>', methods=['GET'])
 def get_progress(job_id):
     with _progress_lock:
-        p = _progress_store.get(job_id, {'pct': 0, 'msg': 'Starting…'})
+        p = _progress_store.get(owner() + ':' + job_id, {'pct': 0, 'msg': 'Starting…'})
     return jsonify(p)
 
 

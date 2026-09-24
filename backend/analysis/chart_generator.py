@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Chandra Prakash Choudhary. All rights reserved.
+from analysis.weather_screen import disclose_weather_screen
 import pandas as pd
 import numpy as np
 import re
@@ -217,7 +218,7 @@ class AdvancedChartGenerator:
             ),
         )
 
-        return fig
+        return disclose_weather_screen(fig, self.df)
     
     def generate_heatmap_hourly(self, noise_col=None):
         """Generate date-hour heatmap for the most recent 7 days.
@@ -324,7 +325,7 @@ class AdvancedChartGenerator:
             showlegend=True
         )
         
-        return fig
+        return disclose_weather_screen(fig, self.df)
     
     def generate_multi_radar_chart(self):
         """Generate radar chart comparing all noise columns"""
@@ -371,7 +372,7 @@ class AdvancedChartGenerator:
             showlegend=True
         )
         
-        return fig
+        return disclose_weather_screen(fig, self.df)
     
     def generate_time_series_heatmap(self, noise_col=None):
         """Generate time series with background heatmap effect"""
@@ -400,7 +401,7 @@ class AdvancedChartGenerator:
         fig.add_trace(go.Scatter(
             x=df[self.time_col],
             y=df[noise_col],
-            mode='lines+markers',
+            mode='markers' if self.df.attrs.get('weather_screen') else 'lines+markers',
             name=noise_col,
             line=dict(color='rgba(102, 126, 234, 0.8)', width=2),
             marker=dict(size=4, color=colors, opacity=0.8)
@@ -408,14 +409,14 @@ class AdvancedChartGenerator:
         
         # Add standard level lines
         fig.add_hline(y=55, line_dash="dash", line_color="green", 
-                      annotation_text="Residential Limit (55 dB)")
+                      annotation_text="55 dB reference (descriptive)")
         fig.add_hline(y=70, line_dash="dash", line_color="orange", 
-                      annotation_text="Alert Level (70 dB)")
+                      annotation_text="70 dB reference (descriptive)")
         fig.add_hline(y=80, line_dash="dash", line_color="red", 
-                      annotation_text="Danger Level (80 dB)")
+                      annotation_text="80 dB reference (descriptive)")
         
         fig.update_layout(
-            title=f'Time Series with Compliance Zones - {noise_col}',
+            title=f'Time Series with Descriptive Reference Levels - {noise_col}',
             xaxis_title='Time',
             yaxis_title='Noise Level (dB)',
             width=1200,
@@ -424,7 +425,7 @@ class AdvancedChartGenerator:
             plot_bgcolor='rgba(240, 240, 240, 0.5)'
         )
         
-        return fig
+        return disclose_weather_screen(fig, self.df)
     
     def generate_distribution_heatmap(self, noise_col=None):
         """Generate 2D histogram/heatmap of noise distribution"""
@@ -458,7 +459,7 @@ class AdvancedChartGenerator:
             height=600
         )
         
-        return fig
+        return disclose_weather_screen(fig, self.df)
     
     def generate_diurnal_box_whisker_chart(self, noise_col=None):
         """Generate a diurnal box-and-whisker chart for hourly LEQ volatility."""
@@ -527,7 +528,7 @@ class AdvancedChartGenerator:
             font=dict(family='Arial, sans-serif', size=12, color='#333333')
         )
 
-        return fig
+        return disclose_weather_screen(fig, self.df)
 
     def generate_polar_24hour_chart(self, noise_col=None):
         """Produce a 24-hour polar/radar chart showing mean LEQ per hour.
@@ -567,7 +568,7 @@ class AdvancedChartGenerator:
         fig = go.Figure(data=go.Scatterpolar(
             r=r,
             theta=theta,
-            mode='lines+markers',
+            mode='markers' if self.df.attrs.get('weather_screen') else 'lines+markers',
             fill='toself',
             name=noise_col,
             line_color='rgba(102, 126, 234, 1)',
@@ -584,7 +585,7 @@ class AdvancedChartGenerator:
             height=700,
         )
 
-        return fig
+        return disclose_weather_screen(fig, self.df)
     
     def generate_all_charts_html(self):
         """Generate HTML with all charts embedded"""
@@ -766,7 +767,7 @@ class AdvancedChartGenerator:
                         <li><strong>Heatmap (All Dates):</strong> Same layout across the full date range in the file</li>
                         <li><strong>Radar Chart:</strong> Visualizes key noise metrics in a polar plot</li>
                         <li><strong>Multi-Column Radar:</strong> Compares all measurement columns</li>
-                        <li><strong>Time Series Heatmap:</strong> Shows full time series with compliance zones</li>
+                        <li><strong>Time Series Heatmap:</strong> Shows full time series with descriptive reference levels</li>
                         <li><strong>Distribution Heatmap:</strong> 2D histogram of noise distribution over time</li>
                     </ul>
                 </div>
