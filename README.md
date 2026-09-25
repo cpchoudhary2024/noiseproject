@@ -15,7 +15,7 @@ noise-exposure reports evaluated against WHO, ISO, and jurisdictional criteria. 
 continuous use on an ongoing residential monitoring study: **39.5 million 1-second
 A-weighted measurements across four sites**, and growing.
 
-**Live:** https://cpchoudhary2024-noise-analysis-platform.hf.space
+**Live:** https://noise-analysis-platform-ga5lsxtezq-uc.a.run.app/
 
 ---
 
