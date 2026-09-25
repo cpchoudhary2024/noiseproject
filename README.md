@@ -278,6 +278,61 @@ clipping produces exactly one enormous reading. Whether an event is genuine or s
 cannot be settled from level data alone, so the platform's obligation is to surface the
 dependency, not resolve it silently.
 
+### Logger clock and time zone
+
+Every period metric is defined on local clock time, so the clock a record is read in
+decides which readings fall in which period. The clock the logger was set to and the clock
+results are reported in are both selected explicitly; conversion goes through UTC on the
+IANA rules, so daylight-saving dates apply exactly. A spring-forward jump is a clock
+change, not a data gap. The repeated autumn hour is identified from the recorded order and
+kept as two distinct passes rather than merged or de-duplicated.
+
+### Meteorological screening (rain, snow, thunder, wind)
+
+Sound-level data alone cannot identify weather: a broadband A-weighted level carries no
+signature separating rain from traffic. Screening therefore uses independent observations
+from the nearest NOAA/FAA airport weather station (ASOS): 1-minute observations, with the
+same station's 5-minute METAR reports filling the archive's gaps, and NOAA GHCN-Daily snow
+depth from the nearest station that reports it.
+
+The record is divided into 15-minute periods, and a period is removed when:
+
+| Rule | Source |
+|---|---|
+| Precipitation of any kind, or any measured rainfall | ISO 1996-2:2017; NSW Noise Policy for Industry (2017) Fact Sheet A4 |
+| The period before and after precipitation (gauge latency, wet windscreen) | IOA Good Practice Guide (2013) §3.1.9; ISO 1996-2 |
+| Thunder reported at or near the station | platform rule |
+| Mean wind above 5 m/s at microphone height | NSW NPfI Fact Sheet A4 |
+| Snow on the ground at or above 1 inch (25.4 mm), and the day either side | IOA GPG (2013) §2.7.3 |
+
+Station wind at 10 m is converted to microphone height with the logarithmic wind profile,
+v(h) = v(h_ref)·ln(h/z₀)/ln(h_ref/z₀), z₀ = 0.05 m (IEC 61400-11 reference roughness).
+That is a model estimate, not a site measurement; the station's own wind and gust maxima
+are reported in the audit trail, and screening on them as well is an option rather than
+the default, because the published limit is an average at microphone height.
+
+**A period whose weather cannot be verified is removed, never kept.** A period without an
+observation in every 5-minute interval, its immediate neighbours, and days whose snow
+cover cannot be established are all treated as affected. Where no weather data exists at
+all, the platform refuses to screen instead of substituting anything.
+
+Two station-quality guards apply, both from observed failures: a snow code reported well
+above freezing is treated as sensor error, not weather (one subtropical station reported
+light snow for 13,386 minutes of June, which would have discarded 91% of a record), and a
+1-minute precipitation identifier that contradicts its own station's METARs beyond a stated
+share is ignored in favour of those reports.
+
+Screened periods are recorded as analyst exclusions, so the excluded time is removed from
+the expected span rather than counted as missing data, every figure caption states the
+share removed, and the reports carry the method, the station, the distance and the
+retention shares. A per-period CSV audit trail is downloadable for any screen.
+
+Limits worth stating plainly: a station kilometres away can miss a local shower; retention
+percentages count samples, not elapsed time, so a screened result describes the retained
+subset and may be selection-biased; and wet-road tyre noise after rain is not screened.
+Nationwide station lookup is supported, but usable observations are not guaranteed for
+every location and date.
+
 ### Model limitations and physical assumptions
 
 - **Samples are assumed equally weighted in time.** Variable integration times are not
@@ -440,11 +495,22 @@ python tools/convert_to_parquet.py DIR # ~7x faster reads, half the size
 | `/api/upload` | POST | Single-file ingest |
 | `/api/upload-multi` | POST | Multi-site ingest |
 | `/api/analyze` | POST | Run the analysis pipeline |
+| `/api/validate-filters` | POST | Row count a filter would retain |
+| `/api/get-data-date-range` | POST | Extent of the uploaded record |
+| `/api/clock-options` | GET | Time zones offered for the logger and report clocks |
 | `/api/compliance-check` | POST | Jurisdictional compliance matrix |
-| `/api/health-assessment` | POST | WHO-referenced health assessment |
-| `/api/standards-reference` | GET | Applied criteria and citations |
-| `/api/generate-report` | POST | Render PDF / HTML / DOCX deliverables |
-| `/api/export-daily-summary` | POST | Daily aggregate export |
+| `/api/get-computed-summaries` | POST | Daily and hourly summaries |
+| `/api/temporal-heatmap`, `/api/diurnal-boxplot` | POST | Figure data |
+| `/api/weather/stations` | POST | Nearest ASOS stations to a ZIP code or coordinates |
+| `/api/weather/screen` | POST | Build a weather screen for the uploaded record |
+| `/api/weather/screen/<id>/audit.csv` | GET | Period-by-period record of a screen |
+| `/api/generate-report` | POST | Render PDF / Word / HTML deliverables |
+| `/api/export-data`, `/api/export-daily-summary-csv`, `/api/export-hourly-summary-csv` | POST | Data exports |
+| `/api/compare`, `/api/compare-report` | POST | Multi-record comparison |
+
+Uploaded files are referenced by a signed token bound to the browser session that
+uploaded them, and expire after 24 hours. A reference from another session, a tampered
+one and an expired one are all refused.
 
 ### Container
 
@@ -465,7 +531,8 @@ by an explicit exclusion block and are not published.
 ## Repository layout
 
 ```
-backend/analysis/       acoustics, compliance matrix, standards reference, parsers
+backend/analysis/       acoustics, clock and periods, compliance matrix, weather screening, parsers
+backend/services/       retrieval of NOAA/FAA weather observations
 backend/app.py          Flask API
 frontend/               interface templates and static assets
 tools/                  analysis CLI utilities (Leq, exceedance, day/night, reporting)
@@ -476,7 +543,7 @@ docs/                   methodology and structure notes
 ## Stack
 
 Python · Flask · pandas · NumPy · SciPy · Plotly · ReportLab · python-docx · PyArrow ·
-Docker · Hugging Face Spaces
+Docker · Google Cloud Run
 
 Every sentence in a generated report is templated from a computed value. There is no
 language model in the reporting path.
