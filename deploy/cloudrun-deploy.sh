@@ -42,6 +42,19 @@ fi
 
 command -v gcloud >/dev/null || { echo "ERROR: gcloud not installed. See deploy/CLOUD-RUN-SETUP.md step 3." >&2; exit 1; }
 
+# Upload references are signed with SECRET_KEY and checked on every request. A
+# per-instance random key would reject a reference minted by another instance,
+# so the key is set once for the service and reused across revisions.
+if [[ -z "${SECRET_KEY:-}" ]]; then
+  SECRET_KEY=$(gcloud run services describe "$SERVICE" --region "$REGION" \
+                 --format='value(spec.template.spec.containers[0].env.filter("name:SECRET_KEY").extract("value"))' \
+                 2>/dev/null | tr -d "[]'" || true)
+fi
+if [[ -z "${SECRET_KEY:-}" ]]; then
+  SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+  echo "==> Generated a new SECRET_KEY for this service (uploads from older revisions will need re-uploading)."
+fi
+
 echo "==> Project : $PROJECT_ID"
 echo "==> Service : $SERVICE  ($REGION)"
 echo "==> Shape   : ${CPU} vCPU / ${MEMORY} / concurrency ${CONCURRENCY} / max ${MAX_INSTANCES} instances"
@@ -73,7 +86,7 @@ gcloud run deploy "$SERVICE" \
   --concurrency "$CONCURRENCY" \
   --max-instances "$MAX_INSTANCES" \
   --min-instances "$MIN_INSTANCES" \
-  --set-env-vars "UPLOAD_FOLDER=/tmp/uploads,ARTIFACTS_DIR=/tmp/artifacts" \
+  --set-env-vars "UPLOAD_FOLDER=/tmp/uploads,ARTIFACTS_DIR=/tmp/artifacts,SECRET_KEY=$SECRET_KEY" \
   --quiet
 
 URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')
