@@ -1,0 +1,162 @@
+import os
+import re
+import time
+from dataclasses import dataclass
+
+
+_TIMESTAMP_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})")
+
+
+def _safe_listdir(directory):
+    try:
+        return os.listdir(directory)
+    except FileNotFoundError:
+        return []
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    keep_raw_uploads: int = 15
+    keep_charts_html: int = 15
+    keep_reports: int = 15
+    # Uploads older than this are deleted whatever the counts; 0 disables.
+    max_age_hours: float = 2.0
+    enabled: bool = True
+
+
+def _is_raw_upload(filename):
+    return bool(re.match(r"^\d{8}_\d{6}_.+\.(csv|xlsx|xls|parquet|pq|cil|wlg)$", filename, re.IGNORECASE))
+
+
+def _is_chart_html(filename):
+    return bool(re.match(r"^charts_\d{8}_\d{6}\.html$", filename, re.IGNORECASE))
+
+
+def _is_report_file(filename):
+    return bool(re.match(r"^noise_analysis_.+_\d{8}_\d{6}\.(pdf|html)$", filename, re.IGNORECASE))
+
+
+def _apply_retention(
+    directory,
+    predicate,
+    keep,
+    keep_paths,
+    max_age_s=0.0,
+):
+    """Delete matching files beyond the newest ``keep``, and any older than ``max_age_s``."""
+    if keep < 0:
+        keep = 0
+
+    candidates = []
+    for name in _safe_listdir(directory):
+        if not predicate(name):
+            continue
+        path = os.path.abspath(os.path.join(directory, name))
+        if path in keep_paths:
+            continue
+        candidates.append((_mtime(path), path))
+
+    # Newest first
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    kept = candidates[:keep]
+    to_delete = candidates[keep:]
+    if max_age_s > 0:
+        cutoff = time.time() - max_age_s
+        to_delete += [c for c in kept if c[0] < cutoff]
+        kept = [c for c in kept if c[0] >= cutoff]
+
+    deleted_count = 0
+    for _, path in to_delete:
+        try:
+            os.remove(path)
+            deleted_count += 1
+        except OSError:
+            # Best-effort deletion: never break app behavior.
+            continue
+
+    return deleted_count, len(kept)
+
+
+def enforce_retention(
+    uploads_dir,
+    root_dir=None,
+    raw_uploads_dir=None,
+    artifacts_reports_dir=None,
+    artifacts_charts_dir=None,
+    policy=None,
+    keep_paths=(),
+):
+    """Enforce retention for generated artifacts."""
+
+    policy = policy or RetentionPolicy()
+    if not policy.enabled:
+        return {"enabled": False}
+
+    uploads_dir = os.path.abspath(uploads_dir)
+    root_dir = os.path.abspath(root_dir) if root_dir else None
+
+    raw_uploads_dir = os.path.abspath(raw_uploads_dir) if raw_uploads_dir else None
+    artifacts_reports_dir = os.path.abspath(artifacts_reports_dir) if artifacts_reports_dir else None
+    artifacts_charts_dir = os.path.abspath(artifacts_charts_dir) if artifacts_charts_dir else None
+
+    keep_set = {os.path.abspath(p) for p in keep_paths if p}
+
+    os.makedirs(uploads_dir, exist_ok=True)
+
+    raw_dir = raw_uploads_dir or uploads_dir
+    charts_dir = artifacts_charts_dir or uploads_dir
+    reports_dir = artifacts_reports_dir or uploads_dir
+
+    if raw_dir:
+        os.makedirs(raw_dir, exist_ok=True)
+    if charts_dir:
+        os.makedirs(charts_dir, exist_ok=True)
+    if reports_dir:
+        os.makedirs(reports_dir, exist_ok=True)
+
+    deleted_raw, kept_raw = _apply_retention(raw_dir, _is_raw_upload, policy.keep_raw_uploads, keep_set,
+                                             max_age_s=policy.max_age_hours * 3600.0)
+    deleted_charts, kept_charts = _apply_retention(charts_dir, _is_chart_html, policy.keep_charts_html, keep_set)
+    deleted_reports, kept_reports = _apply_retention(reports_dir, _is_report_file, policy.keep_reports, keep_set)
+
+    deleted_root_reports = 0
+    kept_root_reports = 0
+    if root_dir and os.path.isdir(root_dir):
+        dr, kr = _apply_retention(root_dir, _is_report_file, policy.keep_reports, keep_set)
+        dc, kc = _apply_retention(root_dir, _is_chart_html, policy.keep_charts_html, keep_set)
+        deleted_root_reports = dr + dc
+        kept_root_reports = kr + kc
+
+    return {
+        "enabled": True,
+        "uploads_dir": uploads_dir,
+        "root_dir": root_dir,
+        "raw_uploads_dir": raw_dir,
+        "artifacts_reports_dir": reports_dir,
+        "artifacts_charts_dir": charts_dir,
+        "policy": {
+            "keep_raw_uploads": policy.keep_raw_uploads,
+            "keep_charts_html": policy.keep_charts_html,
+            "keep_reports": policy.keep_reports,
+        },
+        "deleted": {
+            "uploads_raw": deleted_raw,
+            "uploads_charts": deleted_charts,
+            "uploads_reports": deleted_reports,
+            "root_generated": deleted_root_reports,
+        },
+        "kept": {
+            "uploads_raw": kept_raw,
+            "uploads_charts": kept_charts,
+            "uploads_reports": kept_reports,
+            "root_generated": kept_root_reports,
+        },
+    }

@@ -1,0 +1,19 @@
+# ranges stay on the major version tested (Python 3.11 in the image, 3.14 locally)
+Flask>=3.0.0,<4
+Flask-CORS>=4.0.0,<7
+# tested on pandas 3.0
+pandas>=3.0.0,<4
+numpy>=1.26.0,<3
+openpyxl>=3.1.2,<4
+# parquet reads much faster than xlsx for multi-million-row exports
+pyarrow>=15.0.0,<26
+xlrd>=2.0.1,<3
+# plotly 7 needs kaleido 1, which needs a separate Chrome, so stay below 7
+plotly>=5.18.0,<7
+scipy>=1.12.0,<2
+reportlab>=4.1.0,<6
+Pillow>=10.1.0,<13
+Werkzeug>=3.0.0,<4
+kaleido==0.2.1
+python-docx>=0.8.11,<2
+gunicorn>=21.2.0,<27

@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Noise Analysis Platform</title>
+    <link rel="icon" href="data:,">
+    <!-- pinned: "plotly-latest" is stuck at 1.58.5 -->
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <header class="navbar">
+        <div class="nav-container">
+            <div class="logo-section">
+                <div class="logo-text">
+                    <h1>Noise Analysis Platform</h1>
+                    <p>Community noise monitoring · WHO 2018 and Maryland COMAR 26.02.03</p>
+                </div>
+            </div>
+            <nav class="nav-links">
+                <button class="nav-link-btn" id="navAnalyzeBtn" onclick="showSection('upload-section')">Analyze</button>
+                <button class="nav-link-btn" id="navCompareBtn" onclick="showCompareSection()">Compare</button>
+            </nav>
+            <div class="nav-status">
+                <span class="status-dot" id="status-indicator"></span>
+                <span id="status-text">Ready</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <!-- Upload -->
+        <section id="upload-section" class="section section-active">
+            <div class="content-wrapper">
+                <div class="page-intro">
+                    <h2>Analyze a monitoring record</h2>
+                    <p>Computes LAeq, Lden, Lnight, Ldn and percentile levels (L5–L95) from sound level logger
+                    exports and compares them with the WHO Environmental Noise Guidelines (2018) and
+                    Maryland COMAR 26.02.03.</p>
+                </div>
+
+                <div class="upload-layout">
+                <div class="upload-card">
+                    <div class="upload-zone" id="dropzone">
+                        <h3>Drop logger files here, or click to select</h3>
+                        <p>CSV, XLSX, XLS, Parquet or CIL. Select several files to merge consecutive deployments into one record.</p>
+                        <span class="btn btn-primary upload-button">Select files</span>
+                        <p class="upload-hint">Tested with NSRT_W mk4 exports. The hosted site accepts up to 32 MB per upload, counting all files selected together; for records over about 500,000 rows, Parquet uploads at roughly half the size of XLSX with identical results.</p>
+                        <p class="upload-hint">Uploaded files are stored on the server only for the analysis. Each is given a random reference known only to your browser, and is deleted automatically after two hours, or sooner when newer uploads replace it.</p>
+                        <input type="file" id="fileInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.cil" multiple hidden>
+                    </div>
+
+                    <div class="staged-files-area" id="stagedFilesArea" style="display:none;">
+                        <div class="staged-files-header">
+                            <span class="staged-files-title">Files to merge <span class="staged-count-badge" id="stagedCountBadge">0</span></span>
+                            <button class="btn-add-more" id="addMoreBtn" onclick="document.getElementById('fileInput').click()">Add files</button>
+                        </div>
+                        <ul class="staged-file-list" id="stagedFileList"></ul>
+                        <div class="staged-files-footer">
+                            <button class="btn btn-secondary btn-sm" onclick="clearStagedFiles()">Clear</button>
+                            <button class="btn btn-primary" id="uploadStagedBtn" onclick="uploadStagedFiles()">
+                                <span id="uploadStagedLabel">Upload</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div id="error-message" class="alert alert-error" style="display: none;"></div>
+                </div>
+
+                <aside class="panel method-panel">
+                    <h3 class="panel-title">Method</h3>
+                    <ol class="method-steps">
+                        <li><strong>Upload</strong>One logger export, or several consecutive deployments to merge.</li>
+                        <li><strong>Analysis period</strong>Optionally restrict dates or exclude invalid windows.</li>
+                        <li><strong>Results</strong>Period levels, guideline comparison, figures, PDF/Word report and data exports.</li>
+                    </ol>
+                    <dl class="metric-defs">
+                        <dt>LAeq</dt><dd>Energy-average A-weighted level over a period</dd>
+                        <dt>Lden</dt><dd>24 h level, +5 dB evening and +10 dB night</dd>
+                        <dt>Lnight</dt><dd>LAeq over 23:00–07:00</dd>
+                        <dt>Ldn</dt><dd>24 h level, +10 dB over 22:00–07:00</dd>
+                        <dt>L10, L90</dt><dd>Levels exceeded 10% and 90% of the time</dd>
+                    </dl>
+                </aside>
+                </div>
+            </div>
+        </section>
+
+        <!-- Preview -->
+        <section id="preview-section" class="section section-hidden">
+            <div class="content-wrapper">
+                <div class="preview-header">
+                    <h2>Data preview</h2>
+                    <dl class="preview-stats">
+                        <div class="stat"><dt class="stat-label">Records</dt><dd class="stat-value" id="preview-rows">0</dd></div>
+                        <div class="stat"><dt class="stat-label">Columns</dt><dd class="stat-value" id="preview-cols">0</dd></div>
+                    </dl>
+                </div>
+                <p class="section-note">First 10 rows as read from the file. Times are the logger's local clock time.</p>
+                <div id="previewTable" class="table-container" style="display: none;">
+                    <table id="dataPreviewTable" class="data-table"></table>
+                </div>
+
+                <div class="batch-files-panel" id="batchFilesPanel" style="display:none;">
+                    <div class="batch-files-header">
+                        <span>Files in this record</span>
+                        <span class="batch-total-badge" id="batchTotalBadge"></span>
+                    </div>
+                    <div id="batchFilesList"></div>
+                    <input type="file" id="addMoreInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.cil" multiple hidden>
+                </div>
+
+                <div class="button-group">
+                    <button id="proceedBtn" class="btn btn-primary">Continue to analysis</button>
+                    <button class="btn btn-secondary" onclick="addMoreFiles()" style="display:none;" id="previewAddMoreBtn">Add files to this record</button>
+                    <button id="uploadAnotherBtn" class="btn btn-tertiary">Start over</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Filters -->
+        <section id="filter-section" class="section section-hidden">
+            <div class="content-wrapper">
+                <div class="filter-card">
+                    <div class="filter-header">
+                        <h2>Analysis period</h2>
+                        <p>Optionally restrict the period analysed or exclude windows of invalid data. Every result, chart, report and export uses the filtered record.</p>
+                    </div>
+
+                    <div class="filter-info-bar" id="filterInfoBar" style="display:none;">
+                        <span id="filterInfoText"></span>
+                        <span class="filter-info-rows" id="filterInfoRows"></span>
+                    </div>
+
+                    <div class="filter-group">
+                        <h3 class="filter-group-title">Time zone</h3>
+                        <p class="filter-desc">Every period (day, evening, night, hourly and daily values) is taken on the report clock. Readings are converted from the logger clock through UTC using the official daylight-saving dates.</p>
+                        <div class="filter-date-row">
+                            <div class="filter-field">
+                                <label for="clock-source">Logger clock was set to</label>
+                                <select id="clock-source" class="filter-input" onchange="onClockChange()"></select>
+                            </div>
+                            <div class="filter-field">
+                                <label for="clock-target">Report results in</label>
+                                <select id="clock-target" class="filter-input" onchange="onClockChange()"></select>
+                            </div>
+                        </div>
+                        <p class="clock-evidence" id="clockEvidence"></p>
+                    </div>
+
+                    <div class="filter-group">
+                        <h3 class="filter-group-title">Date range <span class="filter-optional">optional</span></h3>
+                        <p class="filter-desc">Pre-filled with the full extent of the record. Leave unchanged to analyse all of it.</p>
+                        <div class="filter-date-row">
+                            <div class="filter-field">
+                                <label for="filter-bound-start">Start</label>
+                                <input type="datetime-local" id="filter-bound-start" class="filter-input" step="1">
+                            </div>
+                            <div class="filter-field">
+                                <label for="filter-bound-end">End</label>
+                                <input type="datetime-local" id="filter-bound-end" class="filter-input" step="1">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="filter-group">
+                        <h3 class="filter-group-title">Excluded windows <span class="filter-optional">optional</span></h3>
+                        <p class="filter-desc">One row per window to remove, for example a period when the microphone was disturbed. Excluded readings are removed before any calculation.</p>
+                        <div id="exclusionList"></div>
+                        <button class="btn btn-secondary btn-sm" id="addExclusionBtn" onclick="addExclusionRow()">Add window</button>
+                    </div>
+
+                    <div class="filter-group" id="weatherScreenCard">
+                        <h3 class="filter-group-title">Weather screening <span class="filter-optional">optional</span></h3>
+                        <p class="filter-desc">Removes readings taken while weather could have affected the microphone, using
+                        official records from the nearest NOAA/FAA airport weather station (ASOS): precipitation, thunder, snow
+                        on the ground, and wind above the limit at microphone height (ISO 1996-2; NSW Noise Policy for Industry,
+                        Fact Sheet A4; IOA Good Practice Guide 2013). A period whose weather cannot be confirmed is removed, never
+                        kept. Readings are matched to the weather on the logger clock set above. Your location is used only to find
+                        the station; it is not stored and never appears in a report.</p>
+                        <div class="filter-date-row">
+                            <div class="filter-field">
+                                <label for="wxLocation">ZIP code or latitude, longitude</label>
+                                <input id="wxLocation" class="filter-input" placeholder="e.g. 21044 or 39.20, -76.86" autocomplete="off">
+                            </div>
+                            <div class="filter-field">
+                                <label for="wxMicHeight">Microphone height (m)</label>
+                                <input id="wxMicHeight" class="filter-input" type="number" min="0.5" max="30" step="0.1" value="1.5">
+                            </div>
+                        </div>
+                        <div class="wx-actions">
+                            <button class="btn btn-secondary btn-sm" id="wxFindBtn" onclick="findWeatherStations()">Find weather stations</button>
+                            <button class="btn btn-secondary btn-sm" id="wxRemoveBtn" style="display:none;" onclick="removeWeatherScreen()">Remove weather screening</button>
+                        </div>
+                        <div id="wxStations" class="wx-stations" style="display:none;"></div>
+                        <div id="wxMessage" class="wx-message" style="display:none;" role="status"></div>
+                        <div id="wxResult" class="wx-result" style="display:none;"></div>
+                    </div>
+
+                    <div class="filter-preview-bar" id="filterPreviewBar" style="display:none;">
+                        <span id="filterPreviewText"></span>
+                    </div>
+
+                    <div class="filter-actions">
+                        <button class="btn btn-tertiary" onclick="skipFilters()">Use all data</button>
+                        <button class="btn btn-secondary" id="previewFilterBtn" onclick="previewFilters()">Count retained rows</button>
+                        <button class="btn btn-primary" id="applyFiltersBtn" onclick="applyFiltersAndAnalyze()">Run analysis</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Loading -->
+        <section id="analysis-section" class="section section-hidden">
+            <div class="content-wrapper">
+                <div class="loading-container">
+                    <div class="loading-spinner"></div>
+                    <h2 id="analysis-status">Running analysis</h2>
+                    <p>Computing energy averages, period levels and percentiles.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Results -->
+        <section id="results-section" class="section section-hidden">
+            <div class="content-wrapper">
+
+                <div class="device-id-bar">
+                    <div class="device-id-inner">
+                        <label class="device-id-label" for="deviceIdInput">Location ID</label>
+                        <input type="text" id="deviceIdInput" class="device-id-input"
+                               placeholder="e.g. Home A" maxlength="80">
+                        <span class="device-id-hint">Printed on the PDF and Word reports and in chart titles.</span>
+                    </div>
+                    <div class="device-id-inner">
+                        <label class="device-id-label" for="instrumentInput">Instrument</label>
+                        <input type="text" id="instrumentInput" class="device-id-input instrument-input"
+                               placeholder="e.g. model, serial, calibration date" maxlength="300">
+                        <span class="device-id-hint">Optional. Reports state "not provided" when blank.</span>
+                    </div>
+                    <div class="device-env-inner">
+                        <span class="device-id-label">Microphone</span>
+                        <div class="env-toggle" id="envToggle" role="group" aria-label="Microphone placement">
+                            <button type="button" class="env-toggle-btn active" data-env="outdoor"
+                                    onclick="setDeploymentEnvironment('outdoor')">Outdoor</button>
+                            <button type="button" class="env-toggle-btn" data-env="indoor"
+                                    onclick="setDeploymentEnvironment('indoor')">Indoor</button>
+                        </div>
+                        <span class="device-id-hint" id="envHint">Outdoor: WHO indoor bedroom values are not evaluated.</span>
+                    </div>
+                    <div class="device-env-inner">
+                        <span class="device-id-label">Times</span>
+                        <span class="time-basis" id="timeBasisText"></span>
+                    </div>
+                </div>
+
+                <div id="filterActiveBanner" class="notice notice-info" style="display:none;">
+                    <strong>Analysis settings applied.</strong>
+                    <span id="filterActiveText"></span>
+                </div>
+
+                <div id="fileNotes" class="ts-warning ts-warning-soft" style="display:none;" role="status">
+                    <div class="ts-warning-body">
+                        <strong>Notes on this file</strong>
+                        <ul id="fileNotesList"></ul>
+                    </div>
+                </div>
+
+                <div id="timestampWarning" class="ts-warning" style="display:none;" role="alert">
+                    <div class="ts-warning-body">
+                        <strong>Timestamps could not be read reliably</strong>
+                        <p id="timestampWarningText"></p>
+                    </div>
+                </div>
+
+                <div class="results-overview">
+                    <section class="panel" id="plainEnglishSummaryCard" style="display:none;">
+                        <h3 class="panel-title">Summary</h3>
+                        <div id="plainEnglishSummaryText" class="summary-text"></div>
+                    </section>
+
+                    <section class="panel metrics-panel">
+                        <h3 class="panel-title">Headline values</h3>
+                        <div id="metricsGrid"></div>
+                    </section>
+                </div>
+
+                <section class="panel gap-log-section" id="gapLogSection" style="display:none;">
+                    <h3 class="panel-title">Data continuity</h3>
+                    <div id="gapLogContent"></div>
+                </section>
+
+                <div class="results-tabs">
+                    <div class="tab-header" role="tablist">
+                        <button class="tab-btn active" data-tab="health-assessment">Period levels</button>
+                        <button class="tab-btn" data-tab="compliance">Guideline comparison</button>
+                        <button class="tab-btn" data-tab="visualizations">Charts</button>
+                        <button class="tab-btn" data-tab="statistics">Statistics</button>
+                        <button class="tab-btn" data-tab="standards-comparison">Standards reference</button>
+                    </div>
+
+                    <div id="health-assessment" class="tab-content active">
+                        <div id="healthAssessmentContainer"></div>
+                    </div>
+
+                    <div id="compliance" class="tab-content">
+                        <p class="section-note">
+                            WHO Environmental Noise Guidelines (2018), WHO Guidelines for Community Noise (1999) and
+                            Maryland COMAR 26.02.03. Occupational limits (OSHA, NIOSH) do not apply to community
+                            monitoring and are listed only in the Standards reference.
+                            Each row compares the total measured level with a guideline or limit value; it is not a
+                            determination of compliance. Δ = measured − value.
+                        </p>
+                        <div id="complianceContainer">
+                            <p class="empty-note">Run an analysis to see the comparison.</p>
+                        </div>
+                    </div>
+
+                    <div id="visualizations" class="tab-content">
+                        <div id="analysisFileNote" class="file-note"></div>
+
+                        <figure class="chart-section">
+                            <div class="chart-section-header">
+                                <h4>Figure 1. Hourly LAeq by hour of day</h4>
+                                <button class="btn-chart-dl" onclick="downloadChartImage('rollingMedianChart', 'Figure1_Hourly_LAeq_by_hour')">PNG</button>
+                            </div>
+                            <div id="rollingMedianChart" class="chart-box" style="min-height: 420px;"></div>
+                            <figcaption class="chart-explainer">
+                                Energy-average level (LAeq) for each clock hour, pooled across all days in the record.
+                                The shaded band is the WHO night period (23:00–07:00). The 53 and 45 dB(A) lines are the WHO 2018
+                                road-traffic Lden and Lnight guideline values, drawn for reference: those guidelines apply to
+                                penalty-weighted long-term averages, not to a single hour.
+                            </figcaption>
+                        </figure>
+
+                        <figure class="chart-section">
+                            <div class="chart-section-header">
+                                <h4>Figure 2. Distribution of readings by hour of day</h4>
+                                <button class="btn-chart-dl" onclick="downloadChartImage('boxWhiskerChart', 'Figure2_Hourly_distribution')">PNG</button>
+                            </div>
+                            <div id="boxWhiskerChart" class="chart-box" style="min-height: 440px;"></div>
+                            <figcaption class="chart-explainer">
+                                Box plot of the individual LEQ readings in each clock hour, pooled across all days. The box
+                                spans the interquartile range (IQR, 25th–75th percentile); the solid line is the median and the
+                                dashed line the energy average (LAeq) of the hour. Whiskers extend to the most extreme reading
+                                within 1.5 × IQR of the box. Readings beyond the whiskers are plotted as points, up to the
+                                40 most extreme per hour.
+                            </figcaption>
+                        </figure>
+
+                        <figure class="chart-section">
+                            <div class="chart-section-header">
+                                <h4>Figure 3. Hourly LAeq by date and hour</h4>
+                                <button class="btn-chart-dl" onclick="downloadChartImage('heatmapChart', 'Figure3_Date_by_hour')">PNG</button>
+                            </div>
+                            <div id="heatmapChart" class="chart-box" style="min-height: 500px;"></div>
+                            <figcaption class="chart-explainer">
+                                Each cell is the energy-average level (LAeq) of one clock hour on one date. Columns are dates;
+                                rows are hours of the day. Blank cells have no readings.
+                            </figcaption>
+                        </figure>
+
+                        <figure class="chart-section">
+                            <div class="chart-section-header">
+                                <h4>Figure 4. Daily LAeq and night-time LAeq</h4>
+                                <button class="btn-chart-dl" onclick="downloadChartImage('timeSeriesChart', 'Figure4_Daily_LAeq')">PNG</button>
+                            </div>
+                            <div id="timeSeriesChart" class="chart-box" style="min-height: 420px;"></div>
+                            <figcaption class="chart-explainer">
+                                Energy-average level (LAeq) for each calendar day (00:00–24:00), and for the night beginning on the evening of that date (22:00 to 07:00 the next morning). Hollow markers are days or nights with less than 99.5% of the period measured; hover for coverage. The 53 and 45 dB(A) lines are reference values only: the WHO guidelines
+                                they correspond to are compared on Lden and Lnight in the Guideline comparison tab.
+                            </figcaption>
+                        </figure>
+                    </div>
+
+                    <div id="statistics" class="tab-content">
+                        <div id="statisticsContainer"></div>
+                    </div>
+
+                    <div id="standards-comparison" class="tab-content">
+                        <div id="standardsComparisonContainer"></div>
+                    </div>
+                </div>
+
+                <section class="panel download-export-section">
+                    <h3 class="panel-title">Reports and data</h3>
+
+                    <div class="download-group">
+                        <h4>Reports</h4>
+                        <div class="download-buttons-grid">
+                            <button class="btn btn-primary" onclick="openReportFormatModal('comprehensive')">Technical report</button>
+                            <button class="btn btn-secondary" onclick="openReportFormatModal('resident')">Resident summary</button>
+                        </div>
+                        <p class="section-note">
+                            The technical report contains every result on this page with methods and sources. The resident
+                            summary is two pages: headline values, the time series, the hourly box plot and the date × hour
+                            chart. Both are available as PDF or as an editable Word document with identical content.
+                        </p>
+
+                        <details class="custom-notes">
+                            <summary>Add a section to the technical report</summary>
+                            <p class="section-note">Printed after Section 4. Leave blank to omit.</p>
+                            <input type="text" id="customSectionHeading" class="text-input"
+                                   placeholder="Heading, e.g. Site description" maxlength="120">
+                            <textarea id="customSectionBody" class="text-input" rows="4" maxlength="3000"
+                                      placeholder="Text. Each line becomes a paragraph."></textarea>
+                        </details>
+                    </div>
+
+                    <div class="download-group">
+                        <h4>Data</h4>
+                        <div class="download-buttons-grid">
+                            <button class="btn btn-secondary" onclick="exportData()">Full analysis (.xlsx)</button>
+                            <button class="btn btn-secondary" onclick="downloadDailySummaryCSV()">Daily summary (.csv)</button>
+                            <button class="btn btn-secondary" onclick="downloadHourlySummaryCSV()">Hourly summary (.csv)</button>
+                        </div>
+                    </div>
+                </section>
+
+                <div class="action-buttons">
+                    <button class="btn btn-tertiary" onclick="resetToUpload()">Analyze another record</button>
+                </div>
+
+                <div id="reportFormatModal" class="report-modal" aria-hidden="true" style="display:none;">
+                    <div class="report-modal-backdrop" onclick="closeReportFormatModal()"></div>
+                    <div class="report-modal-card" role="dialog" aria-modal="true" aria-labelledby="reportFormatTitle">
+                        <div class="report-modal-header">
+                            <h3 id="reportFormatTitle">Report format</h3>
+                            <button class="report-modal-close" onclick="closeReportFormatModal()" aria-label="Close">&times;</button>
+                        </div>
+                        <div class="report-modal-actions">
+                            <button class="btn btn-primary" onclick="chooseReportFormat('pdf')">PDF</button>
+                            <button class="btn btn-secondary" onclick="chooseReportFormat('docx')">Word (.docx)</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Comparison -->
+        <section id="compare-section" class="section section-hidden">
+            <div class="content-wrapper">
+                <div class="page-intro">
+                    <h2>Compare locations</h2>
+                    <p>Two to six records, one per location, evaluated with the same method and shown side by side.</p>
+                </div>
+
+                <div class="panel compare-clock">
+                    <div class="filter-date-row">
+                        <div class="filter-field">
+                            <label for="cmp-clock-source">Logger clocks were set to</label>
+                            <select id="cmp-clock-source" class="filter-input"></select>
+                        </div>
+                        <div class="filter-field">
+                            <label for="cmp-clock-target">Report results in</label>
+                            <select id="cmp-clock-target" class="filter-input"></select>
+                        </div>
+                    </div>
+                    <p class="section-note">Applied to every location, as in single-record analysis. Readings are converted through UTC using the official daylight-saving dates.</p>
+                </div>
+
+                <div class="compare-drop-zone" id="compareDropzone">
+                    <h3>Drop two or more files here, or click to select</h3>
+                    <p>CSV, XLSX, XLS, Parquet or CIL. Each file is treated as one location.</p>
+                    <input type="file" id="compareFileInput" accept=".csv,.xlsx,.xls,.parquet,.pq,.cil" multiple hidden>
+                </div>
+
+                <div class="compare-file-list" id="compareFileList" style="display:none;">
+                    <div class="compare-file-list-header">
+                        <span>Locations <span class="staged-count-badge" id="compareFileBadge">0</span></span>
+                        <button class="btn-add-more" onclick="document.getElementById('compareFileInput').click()">Add files</button>
+                    </div>
+                    <ul class="staged-file-list" id="compareFileListItems"></ul>
+                    <div class="compare-file-list-footer">
+                        <button class="btn btn-secondary btn-sm" onclick="clearCompareFiles()">Clear</button>
+                        <button class="btn btn-primary" id="compareAnalyzeBtn" onclick="runComparison()">Compare</button>
+                    </div>
+                </div>
+
+                <div id="compareError" class="alert alert-error" role="alert" style="display:none;"></div>
+
+                <div id="compareLoading" class="loading-container" style="display:none;">
+                    <div class="loading-spinner"></div>
+                    <h2>Comparing records</h2>
+                    <p>Each record is analysed independently with the same method.</p>
+                </div>
+
+                <div id="compareResults" style="display:none;">
+                    <div class="compare-verdict" id="compareVerdict" style="display:none;"></div>
+
+                    <section class="panel compare-results-card">
+                        <h3 class="panel-title">Lden and Lnight by location</h3>
+                        <p class="compare-results-note">Sorted from highest to lowest Lden. Compared with the WHO 2018 road-traffic guideline values (Lden 53 dB(A), Lnight 45 dB(A)).</p>
+                        <div id="compareStatusCards" class="compare-status-grid"></div>
+                    </section>
+
+                    <section class="panel compare-results-card">
+                        <h3 class="panel-title">Hourly LAeq by hour of day</h3>
+                        <p class="compare-results-note">Energy-average level for each clock hour, pooled across all days of each record. The 53 and 45 dB(A) lines are reference values; the guidelines apply to Lden and Lnight, not to individual hours.</p>
+                        <div id="compareDiurnalChart" class="compare-chart-box"></div>
+                    </section>
+
+                    <section class="panel compare-results-card">
+                        <h3 class="panel-title">Summary table</h3>
+                        <div class="compare-table-scroll" id="compareMetricsTable"></div>
+                    </section>
+
+                    <div class="compare-download-bar">
+                        <button class="btn btn-primary" onclick="downloadCompareReport()" id="compareReportBtn">Comparison report (PDF)</button>
+                        <button class="btn btn-secondary" onclick="clearCompareFiles()">New comparison</button>
+                    </div>
+                </div>
+
+                <div class="action-buttons">
+                    <button class="btn btn-tertiary" onclick="showSection('upload-section')">Back to single-record analysis</button>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <div class="footer-inner">
+            <div class="footer-credit">
+                <p><span class="footer-credit-name">Chandra Prakash Choudhary</span>, Graduate Student, Johns Hopkins University</p>
+                <p>Principal Investigator: <span class="footer-credit-name">Dr. Ana María Rule</span>, Associate Professor, Johns Hopkins University</p>
+            </div>
+            <div class="disclaimer-section">
+                <h3>Limitations</h3>
+                <dl class="disclaimer-grid">
+                    <div class="disclaimer-item">
+                        <dt class="disclaimer-label">Source attribution</dt>
+                        <dd>A sound level meter records total sound level and cannot identify the source. Source-specific guideline values (aircraft, railway) are shown for reference only.</dd>
+                    </div>
+                    <div class="disclaimer-item">
+                        <dt class="disclaimer-label">Health guidelines and legal limits</dt>
+                        <dd>WHO 2018 values are health-based guidelines; COMAR 26.02.03 values are regulatory limits for noise a person causes at a receiving property, with exempt sources such as road traffic, licensed airports and railroads. Being at or below a regulatory limit does not imply being at or below the health-based guideline.</dd>
+                    </div>
+                    <div class="disclaimer-item">
+                        <dt class="disclaimer-label">Instrument</dt>
+                        <dd>Results depend on microphone placement, windscreen use and calibration of the monitoring hardware.</dd>
+                    </div>
+                    <div class="disclaimer-item">
+                        <dt class="disclaimer-label">Intended use</dt>
+                        <dd>Environmental and epidemiological research. Not a clinical assessment or legal determination.</dd>
+                    </div>
+                </dl>
+            </div>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

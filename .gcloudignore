@@ -1,0 +1,36 @@
+# Build context for `gcloud run deploy --source .`
+# Allow-list: ignore everything, then add back what the Dockerfile needs.
+# gcloud uses this file instead of .gitignore.
+
+*
+!*/
+
+!/Dockerfile
+!/requirements.txt
+!/backend/**
+!/frontend/**
+
+# later rules win over the ones above
+backend/venv/
+**/__pycache__/
+*.pyc
+*.pyo
+
+.git/
+/artifacts/
+/uploads/
+/logs/
+/tools/
+/data/
+/reports/
+/tests/
+.vscode/
+
+*.xls
+*.xlsx
+*.csv
+*.wlg
+*.parquet
+*.docx
+*.pdf
+*.png

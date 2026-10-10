@@ -1,0 +1,19 @@
+# Allow-list for `docker build`, same idea as .gcloudignore
+*
+!Dockerfile
+!requirements.txt
+!backend
+!frontend
+
+backend/venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pdf
+**/*.xls
+**/*.xlsx
+**/*.csv
+**/*.wlg
+**/*.parquet
+**/*.docx
+**/*.png

@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.DS_Store
+.vscode/
+.idea/
+
+# runtime output
+uploads/
+artifacts/
+logs/
+
+# measurement data and generated reports stay out of the repo
+data/
+reports/
+*.xls
+*.xlsx
+*.wlg
+*.parquet
+*.pdf
+*.docx
+.pytest_cache/
+.coverage
+
+# synthetic example data and its report are meant to be public
+!examples/
+!examples/*.parquet
+!examples/*.pdf
